@@ -29,3 +29,6 @@ node_modules/
 *~
 .DS_Store
 Thumbs.db
+
+# Maintainer-local agent memory (history, research, contracts; may reference private projects)
+/.agent-memory/
