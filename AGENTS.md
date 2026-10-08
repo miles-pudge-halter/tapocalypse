@@ -63,4 +63,16 @@ Smoke a second instance without touching real data: `TAPOCALYPSE_PORT=43xx TAPOC
 
 ## Workflow that has worked here
 
-Plan → write a contract (types, signatures, routes, ownership per file) → fan out implementation to parallel subagents with disjoint file ownership → gates (`typecheck`, `test`, randomized tests, bundle) → concurrent reviewers split by concern (lifecycle / API+security / frontend) → one batched fix round → browser verification of every page in light + dark at 1100 and 1440 px → a real device smoke run → commit. Subagents never run gates or formatters; the orchestrator does, once.
+Research (`researcher`) or design (`designer`, uses Mobbin) when the question is open → plan → write a contract (types, signatures, routes, ownership per file) → fan out implementation to parallel `engineer` subagents with disjoint file ownership, each working test-first → gates (`typecheck`, `test`, randomized tests, bundle) → concurrent `code-reviewer` subagents split by concern (lifecycle / API+security / frontend) → one batched fix round → QA pass (`qa` subagent) when the change touches user-visible flows: every touched page in a real browser in light + dark at 1100 and 1440 px, HTTP/MCP/CLI surfaces against a sandboxed instance, and a real device smoke run when the runner or devices changed → fix defects → commit. Subagents never run the full gates or formatters; the orchestrator does, once.
+
+Project subagents live in `.omp/agents/` (omp picks them up automatically):
+
+|Agent|Model|Use for|
+|---|---|---|
+|`engineer`|Sonnet 5.5|every coding slice; mandatory TDD (one failing test → minimal code → green, repeat); runs only its own test file|
+|`code-reviewer`|Sonnet 5.5|read-only review of a change set, one instance per concern|
+|`designer`|Opus 5.5|UI/UX specs for a screen, with Mobbin references (`mobbin_url`)|
+|`researcher`|Opus 5.5|tool/library/approach evaluations and product audits, decision-ready report|
+|`qa`|Sonnet 5.5|hands-on QA of Tapocalypse on a sandboxed instance (browser, API, MCP, CLI, optional device run); report with screenshots and severities|
+
+Engineering and code review always run on Sonnet 5.5; design and research always on Opus 5.5.
