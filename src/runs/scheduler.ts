@@ -1,12 +1,16 @@
 import { EventEmitter } from "node:events";
+import { statSync } from "node:fs";
+import path from "node:path";
 import { z } from "zod";
+import { getBatchMeta, makeBatchId, pruneBatchMeta, saveBatchMeta } from "../batches";
 import { type Config, HttpError } from "../config";
 import { artemisAvailable } from "../doctor";
-import { getProject } from "../projects/registry";
+import { getProject, PACKAGE_RE } from "../projects/registry";
 import type { Device } from "../devices/devices";
+import { getSuite, MAX_BRIEF_LENGTH, MAX_TITLE_LENGTH, type Suite, type SuiteCheck } from "../suites";
 import { extractTickets, lookupPullRequest, resolveSource, type SourceInput, SourceInputSchema } from "./source";
-import { createRun, getRun, listRuns, saveRun } from "./store";
-import { ACTIVE, type Activity, type Backend, type DeviceRequest, type Platform, type Run, type RunSource } from "./types";
+import { createRun, deleteRun as deleteStoredRun, getRun, listRuns, type NewRun, saveRun } from "./store";
+import { ACTIVE, type Activity, type Backend, type Check, type DeviceRequest, type Platform, type Run, type RunSource } from "./types";
 
 export type StartTarget = { serial: string } | { bootTarget: { platform: Platform; target: string } };
 
@@ -15,7 +19,11 @@ export interface SchedulerDeps {
   listDevices(): Promise<Device[]>;
   /** Number of devices of this platform booted by this process (pool `booted` map). */
   bootedCount(platform: Platform): number;
+  /** Manual (Devices page / API) boots of this platform still in flight; they hold a `maxBooted` slot. */
+  manualBootCount(platform: Platform): number;
   isBootingSerial(serial: string): boolean;
+  /** An AVD name / simulator UDID with a boot in flight (scheduler-started or manual). */
+  isBootingTarget(target: string): boolean;
   markAssigned(serial: string): void;
   markReleased(serial: string): void;
   /** Starts the run detached; must eventually call `release(runId)`. */
@@ -27,28 +35,162 @@ export interface SchedulerDeps {
 /** Documented shape of an `enqueueRun` request; the method itself validates an `unknown` body against `EnqueueSchema`. */
 export interface EnqueueInput {
   projectId: string;
-  title: string;
-  brief: string;
+  /** Optional when `suiteId` is given (defaults to the suite title). */
+  title?: string;
+  /** Optional when `suiteId` is given (defaults to the suite body). */
+  brief?: string;
   device?: Partial<DeviceRequest>;
   backend?: Backend;
   packageId?: string;
   requestedBy?: string;
   source?: SourceInput;
+  model?: string;
+  thinking?: string;
+  suiteId?: string;
+  install?: { path: string };
+  /** Set by `enqueueBatch`; HTTP/MCP entry points must not forward it from clients. */
+  batchId?: string;
+}
+
+export interface BatchInput {
+  projectId: string;
+  title?: string;
+  brief?: string;
+  suiteId?: string;
+  devices: Partial<DeviceRequest>[];
+  backend?: Backend;
+  packageId?: string;
+  model?: string;
+  thinking?: string;
+  install?: { path: string };
+  source?: SourceInput;
+  requestedBy?: string;
 }
 
 /** Missing / non-string text fields count as empty so the "title and brief are required" check reports them. */
-const textOrEmpty = z.unknown().transform((v) => (typeof v === "string" ? v : ""));
+const textOrEmpty = z.unknown().optional().transform((v) => (typeof v === "string" ? v : ""));
+const optionalText = (max = 200) =>
+  z
+    .string()
+    .trim()
+    .max(max)
+    .optional()
+    .transform((v) => v || undefined);
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+const thinkingLevel = z
+  .string()
+  .trim()
+  .optional()
+  .transform((v) => v || undefined)
+  .refine((v) => v === undefined || (THINKING_LEVELS as readonly string[]).includes(v), {
+    message: `must be one of ${THINKING_LEVELS.join(", ")}`,
+  });
+/** Same shape the project registry enforces for `defaultPackage`; empty falls back to the project's package. */
+const packageId = z
+  .string()
+  .trim()
+  .max(200)
+  .refine((v) => v === "" || PACKAGE_RE.test(v), { message: "must look like com.example.app" })
+  .optional();
+const requestedBy = z.string().trim().max(200).optional();
+const deviceRequest = z.object({ serial: z.string().max(200).optional(), platform: z.enum(["android", "ios"]).optional() });
+const installRequest = z.object({ path: z.string().trim().min(1).max(4096) });
 
 const EnqueueSchema = z.object({
   projectId: z.string(),
   title: textOrEmpty,
   brief: textOrEmpty,
-  device: z.object({ serial: z.string().optional(), platform: z.enum(["android", "ios"]).optional() }).optional(),
+  device: deviceRequest.optional(),
   backend: z.enum(["mobile-mcp", "artemis"]).optional(),
-  packageId: z.string().optional(),
-  requestedBy: z.string().optional(),
+  packageId,
+  requestedBy,
   source: SourceInputSchema.optional(),
+  model: optionalText(),
+  thinking: thinkingLevel,
+  suiteId: optionalText(),
+  install: installRequest.optional(),
+  batchId: optionalText(),
 });
+
+const BatchSchema = z.object({
+  projectId: z.string(),
+  title: z.string().optional(),
+  brief: z.string().optional(),
+  suiteId: optionalText(),
+  devices: z.array(deviceRequest).min(1, "between 1 and 8 devices are required").max(8, "between 1 and 8 devices are required"),
+  backend: z.enum(["mobile-mcp", "artemis"]).optional(),
+  packageId,
+  requestedBy,
+  source: SourceInputSchema.optional(),
+  model: optionalText(),
+  thinking: thinkingLevel,
+  install: installRequest.optional(),
+});
+
+function parseOrThrow<T>(schema: z.ZodType<T>, body: unknown): T {
+  const parsed = schema.safeParse(body);
+  if (parsed.success) return parsed.data;
+  const issue = parsed.error.issues[0]!;
+  const where = issue.path.map(String).join(".");
+  throw new HttpError(400, where ? `${where}: ${issue.message}` : issue.message);
+}
+
+/** State carried over from an existing run by `rerun`; skips suite lookup and source resolution. */
+interface RerunCopy {
+  rerunOf: string;
+  suiteId: string | null;
+  suiteChecks: SuiteCheck[] | null;
+  source: RunSource | null;
+}
+
+interface PreparedRun {
+  fields: NewRun;
+  source: RunSource | null;
+}
+
+const RERUN_SUFFIX = " (re-run)";
+/** Cap on the appended "re-run only these checks" section, so a long check list cannot push the brief past its limit. */
+const RERUN_SECTION_MAX = 8000;
+/** AVD names that denote wearables / TVs / cars, which must never be auto-booted for a platform-only run. */
+const WEARABLE_AVD = /(^|[^a-z])(wear|watch|tv|automotive)([^a-z]|$)/i;
+
+/** Original brief + the failed checks with their previous status and note, within `MAX_BRIEF_LENGTH`. */
+function rerunBrief(brief: string, runId: string, failed: readonly Check[]): string {
+  const header = `\n\nRe-run ONLY these checks from run ${runId} (previous status + note):\n`;
+  const lines = failed.map((c) => `- ${c.id} ${oneLine(c.title, 200)} (${c.status}${c.note ? `: ${oneLine(c.note, 300)}` : ""})`);
+  const kept: string[] = [];
+  let used = header.length + 40; // room for the "… and N more" line
+  for (const line of lines) {
+    if (used + line.length + 1 > RERUN_SECTION_MAX) break;
+    kept.push(line);
+    used += line.length + 1;
+  }
+  if (kept.length < lines.length) kept.push(`- … and ${lines.length - kept.length} more`);
+  const section = header + kept.join("\n");
+  const room = MAX_BRIEF_LENGTH - section.length;
+  return `${brief.length > room ? `${brief.slice(0, room - 1)}…` : brief}${section}`;
+}
+
+/** Devices that can never host a QA run (wearables / TVs). */
+const UNSUPPORTED_DEVICE_TYPES = ["watch", "tv"];
+export const isQaDevice = (d: Pick<Device, "deviceType">) => !UNSUPPORTED_DEVICE_TYPES.includes(d.deviceType);
+
+function oneLine(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
+function validateInstall(install: { path: string }, platform: Platform): void {
+  if (!path.isAbsolute(install.path)) throw new HttpError(400, "install.path must be an absolute path");
+  const ext = path.extname(install.path).toLowerCase();
+  const allowed = platform === "android" ? [".apk"] : [".app", ".ipa"];
+  if (!allowed.includes(ext)) throw new HttpError(400, `install.path must be a ${allowed.join(" or ")} for ${platform}`);
+  try {
+    statSync(install.path);
+  } catch {
+    throw new HttpError(400, `install.path ${install.path} does not exist`);
+  }
+}
 
 export type ActivityEvent = Activity & { runId: string };
 
@@ -65,6 +207,8 @@ export class Scheduler {
   private prLookups = new Map<string, Promise<void>>();
   private rerunRequested = false;
   private stopped = false;
+  /** Why each queued run is still waiting, refreshed by every scheduling pass. */
+  private queueReasons = new Map<string, string>();
 
   constructor(private deps: SchedulerDeps) {
     this.bus.setMaxListeners(0);
@@ -107,47 +251,212 @@ export class Scheduler {
     return i < 0 ? null : i + 1;
   }
 
+  queueReason(id: string): string | null {
+    return this.queueReasons.get(id) ?? null;
+  }
+
   async enqueueRun(body: unknown): Promise<Run> {
-    const parsed = EnqueueSchema.safeParse(body);
-    if (!parsed.success) {
-      const issue = parsed.error.issues[0]!;
-      const where = issue.path.map(String).join(".");
-      throw new HttpError(400, where ? `${where}: ${issue.message}` : issue.message);
-    }
-    const input = parsed.data;
+    return this.commit(await this.prepare(body));
+  }
+
+  /** Validates a request and builds the run fields without creating anything, so batches can be all-or-nothing. */
+  private async prepare(body: unknown, copy?: RerunCopy): Promise<PreparedRun> {
+    const input = parseOrThrow(EnqueueSchema, body);
     const project = getProject(input.projectId);
     if (!project) throw new HttpError(400, `unknown project ${input.projectId}`);
-    const title = input.title.trim();
-    const brief = input.brief.trim();
+
+    let suite: Suite | null = null;
+    if (!copy && input.suiteId) {
+      suite = getSuite(project, input.suiteId);
+      if (!suite) throw new HttpError(400, `unknown suite ${input.suiteId}`);
+    }
+    const title = input.title.trim() || suite?.title || "";
+    const brief = input.brief.trim() || suite?.brief || "";
     if (!title || !brief) throw new HttpError(400, "title and brief are required");
+    if (title.length > MAX_TITLE_LENGTH) throw new HttpError(400, `title must be at most ${MAX_TITLE_LENGTH} characters`);
+    if (brief.length > MAX_BRIEF_LENGTH) throw new HttpError(400, `brief must be at most ${MAX_BRIEF_LENGTH} characters`);
+
     const platform = input.device?.platform ?? project.defaultPlatform;
+    if (suite?.platforms && !suite.platforms.includes(platform)) {
+      throw new HttpError(400, `suite ${suite.id} does not support ${platform}`);
+    }
     const backend = input.backend ?? "mobile-mcp";
     if (backend === "artemis" && platform === "ios") throw new HttpError(400, "Artemis backend is Android-only");
     if (backend === "artemis" && !artemisAvailable()) {
       throw new HttpError(400, "Artemis backend is not configured (set artemisPath in tapocalypse.config.json)");
     }
+    if (input.install) validateInstall(input.install, platform);
     const serial = input.device?.serial || undefined;
     if (serial) {
       const devices = await this.deps.listDevices();
-      if (!devices.some((d) => d.serial === serial && d.platform === platform)) {
-        throw new HttpError(400, `device ${serial} not connected`);
+      const device = devices.find((d) => d.serial === serial && d.platform === platform);
+      if (!device) throw new HttpError(400, `device ${serial} not connected`);
+      if (!isQaDevice(device)) {
+        throw new HttpError(400, `device ${serial} is a ${device.deviceType}; only phones and tablets can run QA`);
       }
       if (this.deps.config.devicePool.android.excludeSerials.includes(serial)) {
         throw new HttpError(400, `device ${serial} is excluded in config`);
       }
     }
-    const source = await resolveSource(project, input.source, title);
-    const run = createRun({
-      projectId: project.id,
-      title,
-      brief,
-      requestedBy: input.requestedBy || "web",
-      deviceRequest: serial ? { serial, platform } : { platform },
+    const source = copy ? structuredClone(copy.source) : await resolveSource(project, input.source, title);
+    const suiteChecks = copy ? copy.suiteChecks : suite?.checks?.length ? suite.checks.map((c) => ({ ...c })) : null;
+    return {
+      source,
+      fields: {
+        projectId: project.id,
+        title,
+        brief,
+        requestedBy: input.requestedBy || "web",
+        deviceRequest: serial ? { serial, platform } : { platform },
+        deviceSerial: null,
+        deviceLabel: null,
+        bootedByRun: false,
+        backend,
+        packageId: input.packageId?.trim() || project.defaultPackage,
+        status: "queued",
+        verdict: null,
+        summary: null,
+        reportPath: null,
+        checks: [],
+        error: null,
+        startedAt: null,
+        endedAt: null,
+        stats: null,
+        transcriptHtml: false,
+        source,
+        build: null,
+        batchId: input.batchId ?? null,
+        suiteId: copy ? copy.suiteId : (suite?.id ?? null),
+        suiteChecks,
+        model: input.model ?? suite?.model ?? null,
+        thinking: input.thinking ?? null,
+        rerunOf: copy?.rerunOf ?? null,
+        install: input.install ?? null,
+      },
+    };
+  }
+
+  /** Persists a prepared run, queues it, and kicks off the detached PR lookup + a scheduling pass. */
+  private commit({ fields, source }: PreparedRun): Run {
+    const run = createRun(fields);
+    this.queue.push(run.id);
+    this.update(run);
+    if (source && (source.prStatus === "pending" || (source.prStatus === "provided" && (!source.pr?.title || !source.pr.url)))) {
+      const lookup = this.fillPullRequest(run.id, source)
+        .catch((e: unknown) => console.error(`pull request lookup for ${run.id} failed:`, e))
+        .finally(() => this.prLookups.delete(run.id));
+      this.prLookups.set(run.id, lookup);
+    }
+    void this.schedule();
+    return run;
+  }
+
+  /** One run per entry of `devices` (titles get a device suffix), all validated before any is queued. */
+  async enqueueBatch(body: unknown): Promise<{ batchId: string; runs: Run[] }> {
+    const input = parseOrThrow(BatchSchema, body);
+    const project = getProject(input.projectId);
+    if (!project) throw new HttpError(400, `unknown project ${input.projectId}`);
+    const brief = input.brief?.trim() ?? "";
+    const base = input.title?.trim() || (input.suiteId && getSuite(project, input.suiteId)?.title) || oneLine(brief.split("\n")[0] ?? "", 60);
+    const baseTitle = oneLine(base, 150);
+
+    const batchId = makeBatchId();
+    const perPlatform = new Map<Platform, number>();
+    // Lane titles name the device ("iPhone 17"), not its UDID; fall back to the serial if it isn't listed.
+    const names = input.devices.some((d) => d.serial)
+      ? new Map((await this.deps.listDevices()).map((d) => [d.serial, d.name]))
+      : new Map<string, string>();
+    const prepared = await Promise.all(
+      input.devices.map((device, i) => {
+        const platform = device.platform ?? project.defaultPlatform;
+        const n = (perPlatform.get(platform) ?? 0) + 1;
+        if (!device.serial) perPlatform.set(platform, n);
+        const label = device.serial ? (names.get(device.serial) ?? device.serial) : `${platform} #${n}`;
+        return this.prepare({
+          projectId: input.projectId,
+          title: baseTitle ? `${baseTitle} · ${label}` : "",
+          brief: input.brief,
+          suiteId: input.suiteId,
+          device: { platform, serial: device.serial },
+          backend: input.backend,
+          packageId: input.packageId,
+          model: input.model,
+          thinking: input.thinking,
+          install: input.install,
+          source: input.source,
+          requestedBy: input.requestedBy,
+          batchId,
+        }).catch((e: unknown) => {
+          if (e instanceof HttpError && input.devices.length > 1) {
+            throw new HttpError(e.status, `devices.${i}: ${e.message}`);
+          }
+          throw e;
+        });
+      }),
+    );
+    saveBatchMeta({ id: batchId, projectId: project.id, title: baseTitle, createdAt: new Date().toISOString() });
+    return { batchId, runs: prepared.map((p) => this.commit(p)) };
+  }
+
+  /**
+   * Queues a new run from a finished one. `only: "failed"` re-tests the checks that did not pass or skip, with the
+   * previous status and note quoted in the brief; `"all"` repeats the whole brief.
+   */
+  async rerun(
+    runId: string,
+    opts: { only: "failed" | "all"; device?: Partial<DeviceRequest>; requestedBy?: string },
+  ): Promise<Run> {
+    if (opts.only !== "failed" && opts.only !== "all") throw new HttpError(400, "only must be failed or all");
+    const run = this.live.get(runId) ?? getRun(runId);
+    if (!run) throw new HttpError(404, `unknown run ${runId}`);
+    if (ACTIVE.includes(run.status)) throw new HttpError(409, `run ${runId} is still active`);
+
+    let brief = run.brief;
+    let suiteChecks = run.suiteChecks;
+    if (opts.only === "failed") {
+      const failed = run.checks.filter((c) => c.status !== "pass" && c.status !== "skipped");
+      if (failed.length === 0) throw new HttpError(400, `nothing to re-run: run ${runId} has no failed checks`);
+      brief = rerunBrief(run.brief, runId, failed);
+      if (suiteChecks) {
+        const ids = new Set(failed.map((c) => c.id));
+        suiteChecks = suiteChecks.filter((c) => ids.has(c.id));
+      }
+    }
+    const baseTitle = run.title.endsWith(RERUN_SUFFIX) ? run.title.slice(0, -RERUN_SUFFIX.length) : run.title;
+    const prepared = await this.prepare(
+      {
+        projectId: run.projectId,
+        title: `${baseTitle.slice(0, MAX_TITLE_LENGTH - RERUN_SUFFIX.length)}${RERUN_SUFFIX}`,
+        brief,
+        device: opts.device ?? run.deviceRequest,
+        backend: run.backend,
+        packageId: run.packageId,
+        model: run.model ?? undefined,
+        thinking: run.thinking ?? undefined,
+        requestedBy: opts.requestedBy ?? "web",
+      },
+      { rerunOf: run.id, suiteId: run.suiteId, suiteChecks, source: run.source },
+    );
+    return this.commit(prepared);
+  }
+
+  /**
+   * Infra auto-retry (called by the runner): queues a copy of `run` as the next attempt and links the two.
+   * Synchronous and unvalidated on purpose: the run was already accepted once, and a vanished explicit serial just
+   * leaves the retry queued with its reason shown.
+   */
+  retry(run: Run): Run {
+    const next = createRun({
+      projectId: run.projectId,
+      title: run.title,
+      brief: run.brief,
+      requestedBy: run.requestedBy,
+      deviceRequest: { ...run.deviceRequest },
       deviceSerial: null,
       deviceLabel: null,
       bootedByRun: false,
-      backend,
-      packageId: input.packageId?.trim() || project.defaultPackage,
+      backend: run.backend,
+      packageId: run.packageId,
       status: "queued",
       verdict: null,
       summary: null,
@@ -158,19 +467,40 @@ export class Scheduler {
       endedAt: null,
       stats: null,
       transcriptHtml: false,
-      source,
+      source: structuredClone(run.source),
       build: null,
+      batchId: run.batchId,
+      suiteId: run.suiteId,
+      suiteChecks: structuredClone(run.suiteChecks),
+      model: run.model,
+      thinking: run.thinking,
+      attempt: run.attempt + 1,
+      retryOf: run.id,
+      rerunOf: run.rerunOf,
+      install: run.install ? { ...run.install } : null,
     });
-    this.queue.push(run.id);
+    run.retriedBy = next.id;
     this.update(run);
-    if (source.prStatus === "pending" || (source.prStatus === "provided" && (!source.pr?.title || !source.pr.url))) {
-      const lookup = this.fillPullRequest(run.id, source)
-        .catch((e: unknown) => console.error(`pull request lookup for ${run.id} failed:`, e))
-        .finally(() => this.prLookups.delete(run.id));
-      this.prLookups.set(run.id, lookup);
-    }
+    this.queue.push(next.id);
+    this.update(next);
     void this.schedule();
-    return run;
+    return next;
+  }
+
+  /** Deletes a finished run (and its run dir); active runs must be cancelled first. */
+  removeRun(id: string): void {
+    const run = this.live.get(id) ?? getRun(id);
+    if (!run) throw new HttpError(404, `unknown run ${id}`);
+    if (ACTIVE.includes(run.status)) throw new HttpError(409, `run ${id} is still active; cancel it first`);
+    if (this.isHeld(id)) throw new HttpError(409, `run ${id} is still shutting down; try again in a moment`);
+    deleteStoredRun(id);
+    this.queueReasons.delete(id);
+    if (run.batchId) pruneBatchMeta(run.batchId);
+  }
+
+  /** True while the run still owns a device slot, i.e. its runner is working even if the run is already marked cancelled. */
+  isHeld(id: string): boolean {
+    return this.booting.has(id) || [...this.assigned.values()].includes(id);
   }
 
   /** Detached from enqueue so gh latency never delays a run; mutates the live run once the lookup settles. */
@@ -216,12 +546,31 @@ export class Scheduler {
     }
   }
 
-  private activeCount(): number {
+  /** Runs holding a slot: assigned to a device or booting one. */
+  activeCount(): number {
     return this.assigned.size + this.booting.size;
   }
 
+  private setReason(id: string, reason: string | null): void {
+    if ((this.queueReasons.get(id) ?? null) === reason) return;
+    if (reason === null) this.queueReasons.delete(id);
+    else this.queueReasons.set(id, reason);
+    const run = this.live.get(id);
+    if (run) this.bus.emit("run", run);
+  }
+
+  /** Every run still queued is waiting for a free run slot. */
+  private setCapReasons(): void {
+    const reason = `maxConcurrentRuns (${this.deps.config.maxConcurrentRuns}) reached`;
+    for (const id of this.queue) this.setReason(id, reason);
+  }
+
   private async pass(): Promise<void> {
-    if (this.queue.length === 0 || this.activeCount() >= this.deps.config.maxConcurrentRuns) return;
+    if (this.queue.length === 0) return;
+    if (this.activeCount() >= this.deps.config.maxConcurrentRuns) {
+      this.setCapReasons();
+      return;
+    }
     const devices = await this.deps.listDevices();
     if (this.stopped) return;
     const { excludeSerials, avds, maxBooted } = this.deps.config.devicePool.android;
@@ -229,7 +578,11 @@ export class Scheduler {
       d.state === "ready" && !this.assigned.has(d.serial) && !d.artemisOwner && !this.deps.isBootingSerial(d.serial);
 
     for (const id of [...this.queue]) {
-      if (this.stopped || this.activeCount() >= this.deps.config.maxConcurrentRuns) break;
+      if (this.stopped) break;
+      if (this.activeCount() >= this.deps.config.maxConcurrentRuns) {
+        this.setCapReasons();
+        break;
+      }
       const run = this.live.get(id);
       if (!run || run.status !== "queued") {
         this.removeFromQueue(id);
@@ -239,32 +592,47 @@ export class Scheduler {
       if (req.serial) {
         const d = devices.find((x) => x.serial === req.serial && x.platform === req.platform);
         if (d && usable(d)) this.assign(run, d.serial);
+        else if (!d) this.setReason(id, `${req.serial} is not connected`);
+        else if (this.assigned.has(d.serial)) this.setReason(id, `${d.serial} is busy`);
+        else if (d.artemisOwner) this.setReason(id, `${d.serial} is held by an Artemis task`);
+        else this.setReason(id, `${d.serial} is booting`);
         continue;
       }
-      const free = devices
-        .filter((d) => d.platform === req.platform && d.kind !== "physical" && !excludeSerials.includes(d.serial) && usable(d))
-        .sort((a, b) => a.serial.localeCompare(b.serial));
+      const candidates = devices.filter(
+        (d) => d.platform === req.platform && d.kind !== "physical" && isQaDevice(d) && !excludeSerials.includes(d.serial),
+      );
+      const free = candidates.filter(usable).sort((a, b) => a.serial.localeCompare(b.serial));
       if (run.backend === "artemis") free.sort((a, b) => Number(!!b.artemisHelper) - Number(!!a.artemisHelper));
       if (free[0]) {
         this.assign(run, free[0].serial);
         continue;
       }
       const bootingTargets = new Set([...this.booting.values()].map((b) => b.target));
+      const bootable = (name: string) => !bootingTargets.has(name) && !this.deps.isBootingTarget(name);
       let target: string | undefined;
+      let capped = false;
       if (req.platform === "android") {
-        const inFlight = [...this.booting.values()].filter((b) => b.platform === "android").length;
+        const inFlight = [...this.booting.values()].filter((b) => b.platform === "android").length + this.deps.manualBootCount("android");
         if (this.deps.bootedCount("android") + inFlight < maxBooted) {
           const running = new Set(devices.map((d) => d.avdName).filter(Boolean));
-          target = avds.find((a) => !running.has(a) && !bootingTargets.has(a));
+          target = avds.find((a) => !running.has(a) && bootable(a) && !WEARABLE_AVD.test(a));
+        } else {
+          capped = avds.length > 0;
         }
       } else {
         const up = new Set(devices.map((d) => d.serial));
-        target = this.deps.config.devicePool.ios.simulators.find((u) => !up.has(u) && !bootingTargets.has(u));
+        target = this.deps.config.devicePool.ios.simulators.find((u) => !up.has(u) && bootable(u));
       }
       if (target) {
         this.booting.set(run.id, { platform: req.platform, target });
         this.removeFromQueue(run.id);
         this.deps.startRun(run, { bootTarget: { platform: req.platform, target } });
+      } else if (capped) {
+        this.setReason(id, `maxBooted (${maxBooted}) reached`);
+      } else if (candidates.length > 0) {
+        this.setReason(id, `all ${req.platform} devices busy`);
+      } else {
+        this.setReason(id, `no ${req.platform} device available`);
       }
     }
   }
@@ -296,6 +664,7 @@ export class Scheduler {
   private removeFromQueue(id: string): void {
     const i = this.queue.indexOf(id);
     if (i >= 0) this.queue.splice(i, 1);
+    this.queueReasons.delete(id);
   }
 
   async cancelRun(id: string): Promise<Run> {
@@ -304,6 +673,7 @@ export class Scheduler {
     if (run.status === "queued") {
       this.removeFromQueue(id);
       run.status = "cancelled";
+      run.errorKind = "cancelled";
       run.endedAt = new Date().toISOString();
       this.update(run);
       void this.schedule();
@@ -326,8 +696,13 @@ export class Scheduler {
         platform: b.platform,
         kind: b.platform === "android" ? "emulator" : "simulator",
         model: b.target,
+        name: b.platform === "android" ? b.target.replace(/_/g, " ") : b.target,
+        osVersion: null,
+        screen: null,
+        deviceType: "unknown",
         state: "booting",
         busyRunId: runId,
+        idleShutdownAt: null,
       });
     }
     return out;

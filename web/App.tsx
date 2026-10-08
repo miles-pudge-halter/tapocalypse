@@ -1,119 +1,57 @@
-import { useEffect } from "react";
-import { ChevronDown, FileText, Smartphone } from "lucide-react";
-import { ThemeToggle } from "@/components/theme-toggle";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+import { useEffect, useState } from "react";
+import { AppSidebar } from "@/components/app-sidebar";
+import { CommandPalette } from "@/components/command-palette";
+import { NewRunSheet } from "@/components/new-run-sheet";
+import { Notifications } from "@/components/notifications";
+import { ShortcutsDialog } from "@/components/shortcuts-dialog";
 import { Toaster } from "@/components/ui/sonner";
+import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { navigate, useDoctor, useProjects, useRoute, useRuns } from "@/lib/hooks";
+import { navigate, type Route, useNewRun, useRoute, useShortcut } from "@/lib/hooks";
+import { readStorage, writeStorage } from "@/lib/storage";
+import { Batch } from "@/views/Batch";
 import { Dashboard } from "@/views/Dashboard";
+import { Devices } from "@/views/Devices";
 import { Projects } from "@/views/Projects";
 import { ReportList, ReportView } from "@/views/Reports";
 import { RunDetail } from "@/views/RunDetail";
+import { Setup } from "@/views/Setup";
 
-function LiveCounters() {
-  const { runs } = useRuns();
-  const running = runs.filter((r) => r.status === "preflight" || r.status === "running" || r.status === "finishing").length;
-  const queued = runs.filter((r) => r.status === "queued").length;
-  return (
-    <div className="flex items-center gap-2 text-xs tabular-nums">
-      <Badge variant="outline" className="gap-1.5 border-blue-500/30 text-blue-700 dark:text-blue-300">
-        <span className={running > 0 ? "size-2 animate-pulse rounded-full bg-blue-500" : "size-2 rounded-full bg-muted-foreground/40"} />
-        {running} running
-      </Badge>
-      <Badge variant="outline" className="gap-1.5 text-muted-foreground">
-        {queued} queued
-      </Badge>
-    </div>
-  );
-}
+const SIDEBAR_KEY = "tapocalypse-sidebar";
 
-function ReportsMenu() {
-  const { projects } = useProjects();
-  const ready = projects.filter((p) => p.status === "ok");
-  const route = useRoute();
-  const active = route.name === "reports" || route.name === "report";
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button variant={active ? "secondary" : "ghost"} size="sm" className="gap-1">
-          <FileText className="size-4" />
-          Reports
-          <ChevronDown className="size-3.5 opacity-60" />
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="start">
-        <DropdownMenuLabel>Project reports</DropdownMenuLabel>
-        {ready.length === 0 && <DropdownMenuItem disabled>No projects</DropdownMenuItem>}
-        {ready.map((p) => (
-          <DropdownMenuItem key={p.id} onSelect={() => navigate(`#/p/${encodeURIComponent(p.id)}/reports`)}>
-            {p.name}
-          </DropdownMenuItem>
-        ))}
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-}
-
-function TopBar() {
-  const route = useRoute();
-  const { blocked } = useDoctor();
-  return (
-    <header className="sticky top-0 z-40 border-b bg-background/80 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-      <div className="mx-auto flex h-14 max-w-7xl items-center gap-4 px-4 sm:px-6">
-        <a href="#/" className="flex items-center gap-2 font-semibold tracking-tight">
-          <span className="flex size-7 items-center justify-center rounded-md bg-primary text-primary-foreground">
-            <Smartphone className="size-4" />
-          </span>
-          Tapocalypse
-        </a>
-        <nav className="flex items-center gap-1">
-          <Button asChild variant={route.name === "dashboard" || route.name === "run" ? "secondary" : "ghost"} size="sm">
-            <a href="#/">Runs</a>
-          </Button>
-          <Button asChild variant={route.name === "projects" ? "secondary" : "ghost"} size="sm">
-            <a href="#/projects" className="relative">
-              Projects
-              {blocked && (
-                <span
-                  role="img"
-                  aria-label="Setup needed"
-                  title="A required prerequisite is missing — see Setup on the Projects page"
-                  className="absolute -right-0.5 -top-0.5 size-2 rounded-full bg-red-500"
-                />
-              )}
-            </a>
-          </Button>
-          <ReportsMenu />
-        </nav>
-        <div className="ml-auto flex items-center gap-3">
-          <LiveCounters />
-          <ThemeToggle />
-        </div>
-      </div>
-    </header>
-  );
+/** Identity of the page: filter edits on the Runs page must not count as navigation (no scroll reset, no remount). */
+function pageKey(route: Route): string {
+  switch (route.name) {
+    case "run":
+    case "batch":
+      return `${route.name}:${route.id}`;
+    case "reports":
+      return `reports:${route.projectId}`;
+    case "report":
+      return `report:${route.projectId}:${route.reportName}`;
+    default:
+      return route.name;
+  }
 }
 
 function View() {
   const route = useRoute();
-  const routeKey = JSON.stringify(route);
+  const key = pageKey(route);
   // Hash navigation keeps the document, so the previous page's scroll offset would carry over.
   useEffect(() => {
     window.scrollTo(0, 0);
-  }, [routeKey]);
+  }, [key]);
   switch (route.name) {
-    case "dashboard":
-      return <Dashboard rerunId={route.rerunId} />;
+    case "runs":
+      return <Dashboard />;
     case "run":
-      return <RunDetail key={route.id} id={route.id} />;
+      return <RunDetail key={route.id} id={route.id} check={route.check} />;
+    case "batch":
+      return <Batch key={route.id} id={route.id} />;
+    case "devices":
+      return <Devices />;
+    case "setup":
+      return <Setup />;
     case "projects":
       return <Projects openNew={route.openNew} />;
     case "reports":
@@ -123,15 +61,43 @@ function View() {
   }
 }
 
+function GlobalShortcuts() {
+  const { openNewRun } = useNewRun();
+  useShortcut("n", () => openNewRun());
+  useShortcut("g r", () => navigate("#/"));
+  useShortcut("g d", () => navigate("#/devices"));
+  useShortcut("g p", () => navigate("#/projects"));
+  useShortcut("g s", () => navigate("#/setup"));
+  return null;
+}
+
 export function App() {
+  const [sidebarOpen, setSidebarOpen] = useState(() => readStorage(SIDEBAR_KEY) !== "0");
   return (
     <TooltipProvider>
-      <div className="min-h-screen bg-background text-foreground">
-        <TopBar />
-        <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6">
-          <View />
-        </main>
-      </div>
+      <SidebarProvider
+        open={sidebarOpen}
+        onOpenChange={(open) => {
+          setSidebarOpen(open);
+          writeStorage(SIDEBAR_KEY, open ? "1" : "0");
+        }}
+      >
+        <AppSidebar />
+        <SidebarInset className="min-w-0">
+          <header className="sticky top-0 z-30 flex h-12 items-center gap-2 border-b bg-background/80 px-3 backdrop-blur md:hidden">
+            <SidebarTrigger />
+            <span className="text-sm font-semibold tracking-tight">Tapocalypse</span>
+          </header>
+          <main className="w-full max-w-none px-4 py-6 sm:px-6">
+            <View />
+          </main>
+        </SidebarInset>
+      </SidebarProvider>
+      <NewRunSheet />
+      <CommandPalette />
+      <ShortcutsDialog />
+      <Notifications />
+      <GlobalShortcuts />
       <Toaster richColors />
     </TooltipProvider>
   );

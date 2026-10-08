@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DATA_DIR } from "../src/config";
 import type { Project } from "../src/projects/registry";
 import {
   extractVerdict,
@@ -16,6 +17,7 @@ let tmp: string;
 let root: string;
 let outside: string;
 let project: Project;
+const RUN_ID = "20260101-120000-abcd-reports-test";
 
 beforeAll(() => {
   tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "tapocalypse-reports-")));
@@ -33,6 +35,32 @@ beforeAll(() => {
     path.join(root, "qa", "new.md"),
     "# New report\n\n**Verdict: PASS WITH ISSUES — two nits**\n\n![shot](screenshots/a.png)\n\n[old](old.md)\n",
   );
+  fs.writeFileSync(
+    path.join(root, "qa", "hostile.md"),
+    [
+      "# **Hostile** `report`",
+      "",
+      "<script>alert(1)</script>",
+      '<img src="shots/x.png" onerror="alert(1)">',
+      '<iframe src="https://evil.example"></iframe>',
+      "<style>body{display:none}</style>",
+      '<a href="javascript:alert(1)">js</a> <a href="https://ok.example">ok</a>',
+      '<p onclick="x()" style="color:red">text</p>',
+      "",
+      "## Summary",
+      "## Summary",
+      "### Café & Co",
+      '<h2 id="root" onclick="x()">Mine</h2>',
+      "",
+      "- [x] done",
+      "",
+      "![shot](shots/a.png)",
+    ].join("\n"),
+  );
+  fs.writeFileSync(path.join(root, "qa", `QA-REPORT-${RUN_ID}.md`), "# Run report\n\n## Findings\n");
+  fs.writeFileSync(path.join(root, "qa", "QA-REPORT-20200101-000000-dead-gone.md"), "# Gone run\n");
+  fs.mkdirSync(path.join(DATA_DIR, "runs", RUN_ID), { recursive: true });
+  fs.writeFileSync(path.join(DATA_DIR, "runs", RUN_ID, "run.json"), JSON.stringify({ id: RUN_ID, projectId: "pid" }));
   fs.utimesSync(path.join(root, "qa", "old.md"), new Date(2020, 0, 1), new Date(2020, 0, 1));
   project = {
     id: "pid",
@@ -46,6 +74,7 @@ beforeAll(() => {
 });
 
 afterAll(() => {
+  fs.rmSync(path.join(DATA_DIR, "runs", RUN_ID), { recursive: true, force: true });
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
@@ -102,9 +131,21 @@ describe("rewriteLinks", () => {
 describe("listReports", () => {
   test("lists top-level md newest first with title and verdict", () => {
     const list = listReports(project);
-    expect(list.map((r) => r.name)).toEqual(["new.md", "old.md"]);
-    expect(list[0]).toMatchObject({ title: "New report", verdict: "PASS WITH ISSUES" });
-    expect(list[1]).toMatchObject({ title: "Old report", verdict: null });
+    expect(list.map((r) => r.name).filter((n) => ["new.md", "old.md"].includes(n))).toEqual(["new.md", "old.md"]);
+    expect(list.find((r) => r.name === "new.md")).toMatchObject({ title: "New report", verdict: "PASS WITH ISSUES" });
+    expect(list.find((r) => r.name === "old.md")).toMatchObject({ title: "Old report", verdict: null });
+  });
+
+  test("runId is set only when QA-REPORT-<runId>.md names a run that exists in this project", () => {
+    const byName = Object.fromEntries(listReports(project).map((r) => [r.name, r.runId]));
+    expect(byName[`QA-REPORT-${RUN_ID}.md`]).toBe(RUN_ID);
+    expect(byName["QA-REPORT-20200101-000000-dead-gone.md"]).toBeNull();
+    expect(byName["new.md"]).toBeNull();
+    expect(listReports({ ...project, id: "other" }).find((r) => r.name === `QA-REPORT-${RUN_ID}.md`)?.runId).toBeNull();
+  });
+
+  test("titles are plain text", () => {
+    expect(listReports(project).find((r) => r.name === "hostile.md")?.title).toBe("Hostile report");
   });
 
   test("missing reports dir yields empty list", () => {
@@ -113,13 +154,65 @@ describe("listReports", () => {
 });
 
 describe("renderReport", () => {
-  test("renders heading, verdict and rewritten links", () => {
+  test("renders verdict and rewritten links; the h1 that repeats the title is dropped", () => {
     const r = renderReport(project, "new.md");
     expect(r.title).toBe("New report");
     expect(r.verdict).toBe("PASS WITH ISSUES");
-    expect(r.html).toContain("<h1");
+    expect(r.html).not.toContain("<h1");
     expect(r.html).toContain('src="/files/pid/screenshots/a.png"');
     expect(r.html).toContain('href="#/p/pid/reports/old.md"');
+  });
+
+  test("hostile raw HTML is reduced to inert markdown output", () => {
+    const { html } = renderReport(project, "hostile.md");
+    for (const bad of ["<script", "alert(1)</", "onerror", "onclick", "<iframe", "<style", "display:none", "javascript:", "style="]) {
+      expect(html).not.toContain(bad);
+    }
+    expect(html).toContain('href="https://ok.example"');
+    expect(html).toContain('<input type="checkbox" disabled="disabled" checked="checked" />');
+    expect(html).toContain('src="/files/pid/shots/x.png"');
+  });
+
+  test("external images become their alt text; relative images stay", () => {
+    fs.writeFileSync(
+      path.join(root, "qa", "external.md"),
+      '# E\n\n![remote](https://evil.example/x.png)\n\n<img src="//evil.example/y.png">\n\n![local](shots/a.png)\n',
+    );
+    const r = renderReport(project, "external.md");
+    expect(r.html).not.toContain("evil.example");
+    expect(r.html).toContain("[image: remote]");
+    expect(r.images).toEqual([{ src: "/files/pid/shots/a.png", alt: "local" }]);
+  });
+
+  test("an h1 that differs from the title is kept", () => {
+    fs.writeFileSync(path.join(root, "qa", "two-h1.md"), "# Title\n\n# Another\n");
+    const { html } = renderReport(project, "two-h1.md");
+    expect(html).not.toContain(">Title<");
+    expect(html).toContain('<h1 id="another">Another</h1>');
+  });
+
+  test("headings get unique slug ids and h2/h3 feed the table of contents; author ids are stripped", () => {
+    const r = renderReport(project, "hostile.md");
+    expect(r.headings).toEqual([
+      { level: 2, id: "summary", text: "Summary" },
+      { level: 2, id: "summary-2", text: "Summary" },
+      { level: 3, id: "cafe-co", text: "Café & Co" },
+      { level: 2, id: "mine", text: "Mine" },
+    ]);
+    expect(r.html).toContain('<h3 id="cafe-co">');
+    expect(r.html).not.toContain('id="root"');
+  });
+
+  test("images lists every rendered image with its rewritten src and alt", () => {
+    expect(renderReport(project, "hostile.md").images).toEqual([
+      { src: "/files/pid/shots/x.png", alt: "" },
+      { src: "/files/pid/shots/a.png", alt: "shot" },
+    ]);
+  });
+
+  test("runId links a QA-REPORT file to its run", () => {
+    expect(renderReport(project, `QA-REPORT-${RUN_ID}.md`).runId).toBe(RUN_ID);
+    expect(renderReport(project, "new.md").runId).toBeNull();
   });
 
   test("rejects traversal and missing reports with 404", () => {

@@ -3,72 +3,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { HttpError } from "../src/config";
-import type { Device } from "../src/devices/devices";
-import { Scheduler, type SchedulerDeps, type StartTarget } from "../src/runs/scheduler";
-import type { Platform, Run } from "../src/runs/types";
-
-const emulator = (serial: string, extra: Partial<Device> = {}): Device => ({
-  serial,
-  platform: "android",
-  kind: "emulator",
-  model: "sdk",
-  state: "ready",
-  ...extra,
-});
-
-interface Env {
-  scheduler: Scheduler;
-  devices: Device[];
-  started: [string, StartTarget][];
-  markedAssigned: string[];
-  markedReleased: string[];
-}
-
-function setup(opts: { devices?: Device[]; maxConcurrentRuns?: number; maxBooted?: number; booted?: number } = {}): Env {
-  const env: Env = {
-    scheduler: undefined as unknown as Scheduler,
-    devices: opts.devices ?? [],
-    started: [],
-    markedAssigned: [],
-    markedReleased: [],
-  };
-  const deps: SchedulerDeps = {
-    config: {
-      maxConcurrentRuns: opts.maxConcurrentRuns ?? 4,
-      devicePool: {
-        android: {
-          avds: ["AVD_A", "AVD_B"],
-          basePort: 5560,
-          maxBooted: opts.maxBooted ?? 3,
-          minSize: "720x1280",
-          minDensity: 320,
-          idleShutdownMinutes: 20,
-          excludeSerials: ["emulator-5999"],
-        },
-        ios: { simulators: [], idleShutdownMinutes: 20 },
-      },
-    },
-    listDevices: async () => env.devices,
-    bootedCount: (_platform: Platform) => opts.booted ?? 0,
-    isBootingSerial: () => false,
-    markAssigned: (s) => env.markedAssigned.push(s),
-    markReleased: (s) => env.markedReleased.push(s),
-    startRun: (run: Run, target: StartTarget) => {
-      env.started.push([run.id, target]);
-    },
-    cancelActive: async () => {},
-  };
-  env.scheduler = new Scheduler(deps);
-  return env;
-}
-
-/** Lets every pending scheduling pass (including coalesced reruns) finish; passes only await microtasks. */
-async function settle(s: Scheduler): Promise<void> {
-  await s.schedule();
-  const turn = Promise.withResolvers<void>();
-  setImmediate(turn.resolve);
-  await turn.promise;
-}
+import type { Scheduler } from "../src/runs/scheduler";
+import type { Platform } from "../src/runs/types";
+import { emulator, setup, settle } from "./support/scheduler-env";
 
 let counter = 0;
 const enqueue = (s: Scheduler, device: { serial?: string; platform?: Platform } = { platform: "android" }) =>
@@ -315,5 +252,245 @@ describe("enqueue validation", () => {
       deviceRequest: { platform: "android" },
       status: "queued",
     });
+  });
+});
+
+describe("device types", () => {
+  test("watches and TVs are never auto-assigned", async () => {
+    const env = setup({
+      devices: [emulator("emulator-5556", { deviceType: "watch" }), emulator("emulator-5558", { deviceType: "tv" })],
+      maxBooted: 0,
+    });
+    const r1 = await enqueue(env.scheduler);
+    await settle(env.scheduler);
+    expect(env.started).toEqual([]);
+    expect(env.scheduler.queuePosition(r1.id)).toBe(1);
+  });
+
+  test("tablets and unknown device types are still used", async () => {
+    const env = setup({ devices: [emulator("emulator-5556", { deviceType: "tablet" })] });
+    const r1 = await enqueue(env.scheduler);
+    await settle(env.scheduler);
+    expect(env.started).toEqual([[r1.id, { serial: "emulator-5556" }]]);
+  });
+
+  test("an explicit watch serial is rejected", async () => {
+    const env = setup({ devices: [emulator("emulator-5556", { deviceType: "watch" })] });
+    const err = await enqueue(env.scheduler, { serial: "emulator-5556", platform: "android" }).catch((e: unknown) => e);
+    expect(err).toMatchObject({ status: 400, message: "device emulator-5556 is a watch; only phones and tablets can run QA" });
+    expect(env.scheduler.queue).toEqual([]);
+  });
+});
+
+describe("queue reasons", () => {
+  test("explain why each queued run waits and clear once it starts", async () => {
+    const env = setup({ devices: [emulator("emulator-5556")], maxBooted: 1, booted: 1 });
+    const r1 = await enqueue(env.scheduler, { serial: "emulator-5556", platform: "android" });
+    const r2 = await enqueue(env.scheduler, { serial: "emulator-5556", platform: "android" });
+    const r3 = await enqueue(env.scheduler);
+    const r4 = await enqueue(env.scheduler, { serial: "emulator-5560", platform: "android" }).catch(() => null);
+    await settle(env.scheduler);
+
+    expect(env.scheduler.queueReason(r1.id)).toBeNull();
+    expect(env.scheduler.queueReason(r2.id)).toBe("emulator-5556 is busy");
+    expect(env.scheduler.queueReason(r3.id)).toBe("maxBooted (1) reached");
+    expect(r4).toBeNull();
+
+    env.scheduler.release(r1.id);
+    await settle(env.scheduler);
+    expect(env.scheduler.queueReason(r2.id)).toBeNull();
+    expect(env.scheduler.queueReason(r3.id)).toBe("maxBooted (1) reached");
+  });
+
+  test("with every AVD already running and busy the reason is that all devices are busy", async () => {
+    const env = setup({
+      devices: [emulator("emulator-5556", { avdName: "AVD_A" }), emulator("emulator-5558", { avdName: "AVD_B" })],
+      maxBooted: 3,
+    });
+    await enqueue(env.scheduler);
+    await enqueue(env.scheduler);
+    const r3 = await enqueue(env.scheduler);
+    await settle(env.scheduler);
+    expect(env.scheduler.queueReason(r3.id)).toBe("all android devices busy");
+  });
+
+  test("a full run slot count is reported for every queued run", async () => {
+    const env = setup({ devices: [emulator("emulator-5556"), emulator("emulator-5558")], maxConcurrentRuns: 1 });
+    await enqueue(env.scheduler);
+    const r2 = await enqueue(env.scheduler);
+    await settle(env.scheduler);
+    expect(env.scheduler.queueReason(r2.id)).toBe("maxConcurrentRuns (1) reached");
+  });
+
+  test("a queued run announces its reason change on the bus", async () => {
+    const env = setup({ devices: [emulator("emulator-5556")], maxBooted: 0 });
+    const seen: (string | null)[] = [];
+    env.scheduler.bus.on("run", (r: { id: string }) => seen.push(env.scheduler.queueReason(r.id)));
+    await enqueue(env.scheduler);
+    await enqueue(env.scheduler);
+    await settle(env.scheduler);
+    expect(seen).toContain("maxBooted (0) reached");
+  });
+});
+
+describe("enqueue limits and options", () => {
+  test("title over 200 characters and brief over 20000 characters are rejected", async () => {
+    const env = setup();
+    const longTitle = await env.scheduler
+      .enqueueRun({ projectId: "test-proj", title: "x".repeat(201), brief: "b" })
+      .catch((e: unknown) => e);
+    expect(longTitle).toMatchObject({ status: 400, message: "title must be at most 200 characters" });
+    const longBrief = await env.scheduler
+      .enqueueRun({ projectId: "test-proj", title: "t", brief: "x".repeat(20_001) })
+      .catch((e: unknown) => e);
+    expect(longBrief).toMatchObject({ status: 400, message: "brief must be at most 20000 characters" });
+    expect(env.scheduler.queue).toEqual([]);
+  });
+
+  test("model and thinking are stored; an invalid thinking level is rejected", async () => {
+    const env = setup();
+    const run = await env.scheduler.enqueueRun({ projectId: "test-proj", title: "t", brief: "b", model: "anthropic/x", thinking: "high" });
+    expect(run).toMatchObject({ model: "anthropic/x", thinking: "high" });
+    const err = await env.scheduler
+      .enqueueRun({ projectId: "test-proj", title: "t", brief: "b", thinking: "ludicrous" })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(HttpError);
+    expect((err as HttpError).message).toStartWith("thinking: ");
+  });
+
+  test("install must be an existing absolute file with the platform's extension", async () => {
+    const env = setup();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tapocalypse-install-"));
+    try {
+      const apk = path.join(dir, "app.apk");
+      fs.writeFileSync(apk, "x");
+      const base = { projectId: "test-proj", title: "t", brief: "b" };
+      const ok = await env.scheduler.enqueueRun({ ...base, install: { path: apk } });
+      expect(ok.install).toEqual({ path: apk });
+      const relative = await env.scheduler.enqueueRun({ ...base, install: { path: "app.apk" } }).catch((e: unknown) => e);
+      expect(relative).toMatchObject({ status: 400, message: "install.path must be an absolute path" });
+      const missing = await env.scheduler.enqueueRun({ ...base, install: { path: path.join(dir, "no.apk") } }).catch((e: unknown) => e);
+      expect(missing).toMatchObject({ status: 400 });
+      const wrongExt = await env.scheduler.enqueueRun({ ...base, install: { path: path.join(dir, "app.ipa") } }).catch((e: unknown) => e);
+      expect(wrongExt).toMatchObject({ status: 400, message: "install.path must be a .apk for android" });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("retry", () => {
+  test("queues the next attempt with the same parameters and links both runs", async () => {
+    const env = setup({ devices: [emulator("emulator-5556")] });
+    const first = await env.scheduler.enqueueRun({
+      projectId: "test-proj",
+      title: "flaky boot",
+      brief: "b",
+      model: "anthropic/x",
+      device: { platform: "android" },
+    });
+    await settle(env.scheduler);
+    first.status = "error";
+    first.errorKind = "infra";
+    env.scheduler.release(first.id);
+
+    const next = env.scheduler.retry(first);
+    expect(next).toMatchObject({
+      status: "queued",
+      attempt: 2,
+      retryOf: first.id,
+      retriedBy: null,
+      title: "flaky boot",
+      brief: "b",
+      model: "anthropic/x",
+      checks: [],
+      deviceSerial: null,
+    });
+    expect(first.retriedBy).toBe(next.id);
+    await settle(env.scheduler);
+    expect(env.started.at(-1)).toEqual([next.id, { serial: "emulator-5556" }]);
+  });
+});
+
+describe("run deletion", () => {
+  test("a run cancelled mid-preflight cannot be deleted until its runner released the device", async () => {
+    const env = setup({ devices: [emulator("emulator-5556")] });
+    const run = await enqueue(env.scheduler);
+    await settle(env.scheduler);
+    expect(env.started).toHaveLength(1);
+    // What the runner's cancel does while preflight is still working: terminal status, slot still held.
+    run.status = "cancelled";
+    env.scheduler.update(run);
+    expect(() => env.scheduler.removeRun(run.id)).toThrow(HttpError);
+    expect(() => env.scheduler.removeRun(run.id)).toThrow(/still shutting down/);
+    env.scheduler.release(run.id);
+    env.scheduler.removeRun(run.id);
+    expect(env.scheduler.getLive(run.id)).toBeUndefined();
+  });
+
+  test("a run that is still booting its device cannot be deleted either", async () => {
+    const env = setup();
+    const run = await enqueue(env.scheduler);
+    await settle(env.scheduler);
+    expect(env.started[0]![1]).toEqual({ bootTarget: { platform: "android", target: "AVD_A" } });
+    run.status = "cancelled";
+    env.scheduler.update(run);
+    expect(() => env.scheduler.removeRun(run.id)).toThrow(/still shutting down/);
+  });
+
+  test("cancelling a queued run records errorKind cancelled", async () => {
+    const env = setup({ maxConcurrentRuns: 0 });
+    const run = await enqueue(env.scheduler);
+    const cancelled = await env.scheduler.cancelRun(run.id);
+    expect(cancelled).toMatchObject({ status: "cancelled", errorKind: "cancelled" });
+  });
+});
+
+describe("input limits", () => {
+  const base = { projectId: "test-proj", title: "t", brief: "b" };
+
+  test("packageId must look like an application id (no shell metacharacters)", async () => {
+    const env = setup();
+    for (const bad of ["com.x; pm clear com.android.chrome", "com.x com.y", "$(id)", "nodots"]) {
+      const err = await env.scheduler.enqueueRun({ ...base, packageId: bad }).catch((e: unknown) => e);
+      expect(err).toMatchObject({ status: 400, message: "packageId: must look like com.example.app" });
+    }
+    expect((await env.scheduler.enqueueRun({ ...base, packageId: "com.example.app" })).packageId).toBe("com.example.app");
+    const blank = await env.scheduler.enqueueRun({ ...base, packageId: "" });
+    expect(blank.packageId).not.toBe("");
+  });
+
+  test("requester and model are length-capped", async () => {
+    const env = setup();
+    expect(await env.scheduler.enqueueRun({ ...base, requestedBy: "r".repeat(201) }).catch((e: unknown) => e)).toMatchObject({
+      status: 400,
+    });
+    expect(await env.scheduler.enqueueRun({ ...base, model: "m".repeat(201) }).catch((e: unknown) => e)).toMatchObject({ status: 400 });
+    expect((await env.scheduler.enqueueRun({ ...base, requestedBy: "r".repeat(200) })).requestedBy).toHaveLength(200);
+  });
+});
+
+describe("auto-boot targets", () => {
+  test("a wearable / TV AVD is never auto-booted for a platform-only run", async () => {
+    const env = setup({ avds: ["Wear_OS_Large_Round_API_34", "Android_TV_1080p", "Pixel_7"] });
+    await enqueue(env.scheduler);
+    await settle(env.scheduler);
+    expect(env.started[0]![1]).toEqual({ bootTarget: { platform: "android", target: "Pixel_7" } });
+  });
+
+  test("an AVD with a boot already in flight (manual boot) is not booted a second time", async () => {
+    const env = setup({ bootingTargets: ["AVD_A"] });
+    await enqueue(env.scheduler);
+    await settle(env.scheduler);
+    expect(env.started[0]![1]).toEqual({ bootTarget: { platform: "android", target: "AVD_B" } });
+  });
+
+  test("manual boots in flight count against maxBooted", async () => {
+    const env = setup({ maxBooted: 1, manualBoots: 1 });
+    const run = await enqueue(env.scheduler);
+    await settle(env.scheduler);
+    expect(env.started).toEqual([]);
+    expect(env.scheduler.queuePosition(run.id)).toBe(1);
+    expect(env.scheduler.queueReason(run.id)).toBe("maxBooted (1) reached");
   });
 });

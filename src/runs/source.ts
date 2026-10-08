@@ -6,20 +6,18 @@ import type { Project } from "../projects/registry";
 import { exec } from "../devices/devices";
 import type { PrStatus, PullRequestInfo, Run, RunSource } from "./types";
 
-const optionalText = z.string().trim().optional();
-
 /** Requester-supplied source metadata (POST /api/runs body, `qa_start_run`). */
 export const SourceInputSchema = z.object({
   /** Requester's working dir (worktree). Default: project.repoPath. */
-  path: optionalText,
-  branch: optionalText,
-  commit: optionalText,
+  path: z.string().trim().max(4096).optional(),
+  branch: z.string().trim().max(200).optional(),
+  commit: z.string().trim().max(200).optional(),
   prNumber: z.number().int().positive().optional(),
-  prTitle: optionalText,
-  prUrl: optionalText,
-  tickets: z.array(z.string().trim()).optional(),
+  prTitle: z.string().trim().max(200).optional(),
+  prUrl: z.string().trim().max(2000).optional(),
+  tickets: z.array(z.string().trim().max(64)).max(20).optional(),
   labels: z
-    .record(z.string(), z.string().trim().max(200))
+    .record(z.string().max(100), z.string().trim().max(200))
     .refine((l) => Object.keys(l).length <= 20, "at most 20 labels")
     .optional(),
 });

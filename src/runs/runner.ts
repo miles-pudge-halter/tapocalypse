@@ -1,17 +1,18 @@
-import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
-import { config, HttpError } from "../config";
-import { appVersion, artemisLockOwner, ensureArtemisHelper, mobileMcpDeviceId, stopMobileMcpDeviceServer } from "../devices/devices";
+import { config, HttpError, MAX_STEER_CHARS } from "../config";
+import { adb, appVersion, artemisLockOwner, type Device, ensureArtemisHelper, exec, listDevices, mobileMcpDeviceId, stopMobileMcpDeviceServer } from "../devices/devices";
 import { bootAndroid, bootIos } from "../devices/pool";
 import { mcpLaunchArgs, missingToolsMessage, resolveToolPrefixes } from "../omp/provision";
 import { type Frame, OmpRpc } from "../omp/rpc";
 import { getProject, type Project, resolvePersonaPath } from "../projects/registry";
 import { resolveUnder } from "../reports/reports";
-import { buildPrompt, frameToActivity, hostTools, loadPersona } from "./prompt";
-import type { Scheduler, StartTarget } from "./scheduler";
+import { type Outcome, classifyExit, deriveVerdict, hasResolvedCheck, normalizeUsage, parseDurationMs, UsageAccumulator } from "./outcome";
+import { buildPrompt, frameToActivity, hostTools, loadPersona, splitThinking, type ToolStarts } from "./prompt";
+import { isQaDevice, type Scheduler, type StartTarget } from "./scheduler";
 import { appendEvent, appendStderr, runDir } from "./store";
-import { type Activity, type Check, type Run, VERDICTS } from "./types";
+import { type Activity, type Check, type ErrorKind, type Run, VERDICTS } from "./types";
 
 export interface Runner {
   startRun(run: Run, target: StartTarget): void;
@@ -33,6 +34,14 @@ interface RunContext {
   /** `finalize` ran: terminal status set, device released. Exactly-once guard. */
   finalized: boolean;
   promptResult: { status: string; error: string | null } | null;
+  /** Tool calls seen so far, for `tool_end` pairing. */
+  starts: ToolStarts;
+  /** Fallback usage totals from live frames, for runs that end before `get_session_stats` can answer. */
+  usage: UsageAccumulator;
+  /** `Date.now()` when omp was spawned; null before. */
+  spawnedAt: number | null;
+  /** Parsed `config.runMaxTime`; null when unparseable. */
+  budgetMs: number | null;
   /** Pending timers (settle fallback, post-close kill); cleared by `finalize`. */
   timers: Set<NodeJS.Timeout>;
 }
@@ -54,6 +63,12 @@ const PR_LOOKUP_WAIT_MS = 15_000;
 const SETTLE_FALLBACK_MS = 30_000;
 /** After stdin closes, how long omp may take to exit before it is killed. */
 const DRAIN_KILL_MS = 60_000;
+/** omp enforces `--max-time` itself; if it still runs this long after the budget, Tapocalypse kills it. */
+const HARD_KILL_GRACE_MS = 5 * 60_000;
+/** Fraction of the time budget after which the agent is told to wrap up. */
+const WRAP_UP_AT = 0.8;
+const CANCEL_STATS_TIMEOUT_MS = 5_000;
+const INSTALL_TIMEOUT_MS = 180_000;
 
 function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -74,6 +89,10 @@ function promptResultError(frame: Frame): string | null {
   return null;
 }
 
+function failure(error: string, errorKind: ErrorKind = "infra"): Outcome {
+  return { status: "error", errorKind, error, derived: null };
+}
+
 function formatVersion(v: { versionName: string | null; versionCode: string | null }): string {
   return `${v.versionName ?? "unknown"} (${v.versionCode ?? "unknown"})`;
 }
@@ -84,38 +103,62 @@ export function createRunner(scheduler: Scheduler): Runner {
   let shuttingDown = false;
 
   function log(run: Run, kind: Activity["kind"], text: string): void {
-    appendEvent(run.id, { type: "_activity", kind, text });
-    scheduler.activity(run.id, { ts: new Date().toISOString(), kind, text });
+    const seq = appendEvent(run.id, { type: "_activity", kind, text });
+    scheduler.activity(run.id, { ts: new Date().toISOString(), seq, kind, text });
   }
 
-  /** Sets the terminal status, releases the device and persists — exactly once per run. */
-  function finalize(ctx: RunContext, outcome: { status: "done" | "error"; error?: string }): void {
+  /**
+   * Sets the terminal state, releases the device and persists — exactly once per run. `noRetry` opts an infra failure
+   * out of the automatic retry.
+   */
+  function finalize(ctx: RunContext, outcome: Outcome & { noRetry?: boolean }): void {
     if (ctx.finalized) return;
-    if (shuttingDown) {
-      // Server is going down: leave the persisted run.json untouched (restore() marks it interrupted) and
-      // do not release, which would start the next queued run.
-      ctx.finalized = true;
-      rpcByRun.delete(ctx.run.id);
-      contexts.delete(ctx.run.id);
-      for (const t of ctx.timers) clearTimeout(t);
-      ctx.timers.clear();
-      return;
-    }
     ctx.finalized = true;
     const { run } = ctx;
-    if (ctx.cancelRequested) {
-      run.status = "cancelled";
-    } else {
-      run.status = outcome.status;
-      if (outcome.status === "error") run.error = outcome.error ?? "run failed";
-    }
-    run.endedAt ??= new Date().toISOString();
     rpcByRun.delete(run.id);
     contexts.delete(run.id);
     for (const t of ctx.timers) clearTimeout(t);
     ctx.timers.clear();
+    if (shuttingDown) {
+      // Server is going down: leave the persisted run.json untouched (restore() marks it interrupted) and
+      // do not release, which would start the next queued run.
+      return;
+    }
+    if (ctx.cancelRequested) {
+      run.status = "cancelled";
+      run.errorKind = "cancelled";
+    } else {
+      run.status = outcome.status === "cancelled" ? "error" : outcome.status;
+      run.errorKind = outcome.errorKind;
+      if (outcome.error) run.error = outcome.error;
+      if (outcome.derived) {
+        run.verdict = outcome.derived.verdict;
+        run.verdictSource = "derived";
+        run.summary = outcome.derived.summary;
+      }
+      // The agent may have written its report before dying.
+      const report = `${ctx.project.reportsDir}/QA-REPORT-${run.id}.md`;
+      if (!run.reportPath && existsSync(path.join(ctx.project.repoPath, report))) run.reportPath = report;
+    }
+    run.usage ??= ctx.usage.snapshot(run.model);
+    run.endedAt ??= new Date().toISOString();
     try {
       scheduler.update(run);
+      const retriable =
+        run.status === "error" &&
+        run.errorKind === "infra" &&
+        !outcome.noRetry &&
+        !hasResolvedCheck(run.checks) &&
+        run.attempt <= config.retry.infra;
+      if (retriable) {
+        try {
+          const next = scheduler.retry(run);
+          log(run, "info", `infrastructure failure; retrying as ${next.id} (attempt ${next.attempt})`);
+          scheduler.update(run);
+        } catch (e) {
+          log(run, "warn", `retry not scheduled: ${errorMessage(e)}`);
+        }
+      }
     } finally {
       scheduler.release(run.id);
     }
@@ -150,6 +193,8 @@ export function createRunner(scheduler: Scheduler): Runner {
           run.checks.push(check);
         }
         check.status = a.status;
+        if (a.status === "running") check.startedAt ??= now;
+        else check.endedAt ??= now;
         if (a.note !== undefined) check.note = a.note;
         if (screenshot !== undefined) check.screenshot = screenshot;
         check.updatedAt = now;
@@ -160,6 +205,7 @@ export function createRunner(scheduler: Scheduler): Runner {
         if (run.verdict !== null) throw new Error("qa_finish already recorded");
         const reportPath = repoRelative(ctx, a.reportPath, "reportPath");
         run.verdict = a.verdict;
+        run.verdictSource = "agent";
         run.summary = a.summary;
         run.reportPath = reportPath;
         if (run.status === "running") run.status = "finishing";
@@ -206,15 +252,23 @@ export function createRunner(scheduler: Scheduler): Runner {
     }
   }
 
-  /** Post-settle housekeeping: stats, transcript, then let the process drain and exit. */
-  async function complete(ctx: RunContext, rpc: OmpRpc): Promise<void> {
+  /** Reads omp's session stats into `run.stats` (raw) and `run.usage` (normalized); never fails the run. */
+  async function captureStats(ctx: RunContext, rpc: OmpRpc, timeoutMs: number): Promise<void> {
     const { run } = ctx;
     try {
-      const stats = await withTimeout(rpc.send({ type: "get_session_stats" }), STEP_TIMEOUT_MS);
-      if (!ctx.finalized) run.stats = stats;
+      const stats = await withTimeout(rpc.send({ type: "get_session_stats" }), timeoutMs);
+      if (ctx.finalized) return;
+      run.stats = stats;
+      run.usage = normalizeUsage(stats, run.model) ?? run.usage;
     } catch (e) {
       log(run, "warn", `get_session_stats failed: ${errorMessage(e)}`);
     }
+  }
+
+  /** Post-settle housekeeping: stats, transcript, then let the process drain and exit. */
+  async function complete(ctx: RunContext, rpc: OmpRpc): Promise<void> {
+    const { run } = ctx;
+    await captureStats(ctx, rpc, STEP_TIMEOUT_MS);
     try {
       await withTimeout(rpc.send({ type: "export_html", outputPath: path.join(runDir(run.id), "transcript.html") }), STEP_TIMEOUT_MS);
       if (!ctx.finalized) run.transcriptHtml = true;
@@ -240,9 +294,12 @@ export function createRunner(scheduler: Scheduler): Runner {
       appendStderr(run.id, typeof frame.text === "string" ? frame.text : "");
       return;
     }
-    if (frame.type !== "message_update") appendEvent(run.id, frame);
-    const activity = frameToActivity(frame, run.backend);
-    if (activity) scheduler.activity(run.id, activity);
+    ctx.usage.add(frame);
+    if (frame.type !== "message_update") {
+      const seq = appendEvent(run.id, frame);
+      const activity = frameToActivity(frame, run.backend, seq, ctx.starts);
+      if (activity) scheduler.activity(run.id, activity);
+    }
 
     if (frame.type === "prompt_result") {
       ctx.promptResult = { status: typeof frame.status === "string" ? frame.status : "", error: promptResultError(frame) };
@@ -262,14 +319,49 @@ export function createRunner(scheduler: Scheduler): Runner {
 
   function onExit(ctx: RunContext, code: number): void {
     const { run } = ctx;
-    if (run.verdict !== null) return finalize(ctx, { status: "done" });
-    if (ctx.promptResult?.status === "error") {
-      return finalize(ctx, { status: "error", error: ctx.promptResult.error ?? "agent run failed" });
+    finalize(
+      ctx,
+      classifyExit({
+        cancelled: ctx.cancelRequested,
+        verdictRecorded: run.verdict !== null,
+        checks: run.checks,
+        promptResult: ctx.promptResult,
+        exitCode: code,
+        settled: ctx.settled,
+        elapsedMs: ctx.spawnedAt === null ? null : Date.now() - ctx.spawnedAt,
+        budgetMs: ctx.budgetMs,
+        budgetLabel: config.runMaxTime,
+      }),
+    );
+  }
+
+  /** Installs `run.install` on the assigned device; throws with the tool's last output line on failure. */
+  async function installApp(ctx: RunContext, serial: string): Promise<void> {
+    const { run } = ctx;
+    if (!run.install) return;
+    const file = run.install.path;
+    const name = path.basename(file);
+    if (!existsSync(file)) throw new Error(`install failed: ${file} does not exist`);
+    log(run, "info", `installing ${name} on ${serial}`);
+    const r =
+      run.deviceRequest.platform === "android"
+        ? await adb(serial, ["install", "-r", "-d", file], INSTALL_TIMEOUT_MS)
+        : await exec(["xcrun", "simctl", "install", serial, file], { timeoutMs: INSTALL_TIMEOUT_MS });
+    const output = `${r.text}\n${r.stderr}`.trim();
+    if (r.code !== 0 || /\bFailure\b/.test(output)) {
+      const last = output.split("\n").map((l) => l.trim()).filter(Boolean).at(-1) ?? `exit code ${r.code}`;
+      throw new Error(`install failed: ${last}`);
     }
-    if (!ctx.settled && code !== 0) {
-      return finalize(ctx, { status: "error", error: `omp exited with code ${code}; see stderr.log` });
+    log(run, "info", `installed ${name}`);
+  }
+
+  /** The listed device behind `serial` (for its friendly name and type); undefined when it cannot be listed. */
+  async function findDevice(serial: string): Promise<Device | undefined> {
+    try {
+      return (await listDevices()).find((d) => d.serial === serial);
+    } catch {
+      return undefined;
     }
-    finalize(ctx, { status: "error", error: "agent ended without qa_finish" });
   }
 
   async function preflight(ctx: RunContext, target: StartTarget): Promise<boolean> {
@@ -284,7 +376,7 @@ export function createRunner(scheduler: Scheduler): Runner {
       try {
         serial = platform === "android" ? await bootAndroid(name, (m) => log(run, "info", m)) : await bootIos(name);
       } catch (e) {
-        finalize(ctx, { status: "error", error: errorMessage(e) });
+        finalize(ctx, failure(errorMessage(e)));
         return false;
       }
       scheduler.bootComplete(run.id, serial);
@@ -294,20 +386,29 @@ export function createRunner(scheduler: Scheduler): Runner {
       serial = target.serial;
     }
     if (ctx.cancelRequested) {
-      finalize(ctx, { status: "error" });
+      finalize(ctx, failure("cancelled", "cancelled"));
       return false;
     }
     run.deviceSerial = serial;
+    const device = await findDevice(serial);
+    run.deviceName = device?.name ?? null;
     scheduler.update(run);
+    if (device && !isQaDevice(device)) {
+      finalize(ctx, { ...failure(`device ${serial} is a ${device.deviceType}; only phones and tablets can run QA`), noRetry: true });
+      return false;
+    }
 
+    try {
+      await installApp(ctx, serial);
+    } catch (e) {
+      finalize(ctx, { ...failure(errorMessage(e)), noRetry: true });
+      return false;
+    }
     await captureBuild(ctx, serial);
 
     const owner = artemisLockOwner(serial);
     if (owner) {
-      finalize(ctx, {
-        status: "error",
-        error: `Artemis task ${owner.sessionId ?? owner.pid} holds ${serial}; stop it in the Artemis console first`,
-      });
+      finalize(ctx, failure(`Artemis task ${owner.sessionId ?? owner.pid} holds ${serial}; stop it in the Artemis console first`));
       return false;
     }
 
@@ -322,10 +423,34 @@ export function createRunner(scheduler: Scheduler): Runner {
       log(run, "info", `mobile-mcp device id: ${run.deviceLabel}`);
     }
     if (ctx.cancelRequested) {
-      finalize(ctx, { status: "error" });
+      finalize(ctx, failure("cancelled", "cancelled"));
       return false;
     }
     return true;
+  }
+
+  /** Tells the agent to wrap up at 80% of the time budget, and kills omp if it outlives the budget by `HARD_KILL_GRACE_MS`. */
+  function watchTimeBudget(ctx: RunContext, rpc: OmpRpc): void {
+    const { budgetMs } = ctx;
+    if (budgetMs === null) return;
+    const { run } = ctx;
+    ctx.timers.add(
+      setTimeout(() => {
+        if (ctx.finalized || ctx.settled || ctx.cancelRequested || run.status !== "running") return;
+        const message = `Time is almost up (80% of ${config.runMaxTime} used): stop testing now, write the report with the results you have and call qa_finish.`;
+        rpc.send({ type: "steer", message }).then(
+          () => log(run, "info", `80% of the ${config.runMaxTime} time budget used; asked the agent to wrap up`),
+          (e: unknown) => log(run, "warn", `time budget steer failed: ${errorMessage(e)}`),
+        );
+      }, budgetMs * WRAP_UP_AT),
+    );
+    ctx.timers.add(
+      setTimeout(() => {
+        if (ctx.finalized) return;
+        log(run, "warn", `omp still running ${HARD_KILL_GRACE_MS / 60_000} min past the ${config.runMaxTime} time budget; stopping it`);
+        rpc.kill();
+      }, budgetMs + HARD_KILL_GRACE_MS),
+    );
   }
 
   async function execute(ctx: RunContext, target: StartTarget): Promise<void> {
@@ -334,8 +459,11 @@ export function createRunner(scheduler: Scheduler): Runner {
 
     const dir = runDir(run.id);
     const persona = loadPersona(resolvePersonaPath(project));
-    const model = persona.model ?? config.agent?.model ?? null;
-    const thinking = persona.thinking ?? config.agent?.thinking ?? null;
+    const requested = run.model ? splitThinking(run.model) : null;
+    const model = requested?.model ?? persona.model ?? config.agent?.model ?? null;
+    const thinking = run.thinking ?? requested?.thinking ?? persona.thinking ?? config.agent?.thinking ?? null;
+    run.model = model;
+    run.thinking = thinking;
     mkdirSync(path.join(dir, "session"), { recursive: true });
     mkdirSync(path.join(project.repoPath, project.reportsDir), { recursive: true });
     writeFileSync(path.join(dir, "brief.md"), run.brief);
@@ -343,12 +471,12 @@ export function createRunner(scheduler: Scheduler): Runner {
     writeFileSync(personaFile, persona.body);
 
     if (ctx.cancelRequested) {
-      finalize(ctx, { status: "error" });
+      finalize(ctx, failure("cancelled", "cancelled"));
       return;
     }
     // Shutting down: leave run.json as-is (preflight) so restore() marks it interrupted; never spawn omp.
     if (shuttingDown) {
-      finalize(ctx, { status: "error" });
+      finalize(ctx, failure("shutting down"));
       return;
     }
 
@@ -376,7 +504,9 @@ export function createRunner(scheduler: Scheduler): Runner {
       onExit: (code) => onExit(ctx, code),
     });
     ctx.rpc = rpc;
+    ctx.spawnedAt = Date.now();
     rpcByRun.set(run.id, rpc);
+    watchTimeBudget(ctx, rpc);
     rpc.setHostToolHandler(async (name, args) => handleHostTool(ctx, name, args));
 
     await rpc.ready();
@@ -392,13 +522,14 @@ export function createRunner(scheduler: Scheduler): Runner {
       const live = scheduler.getLive(run.id);
       if (live && live !== run && live.source) run.source = live.source;
     }
-    await rpc.send({ type: "prompt", message: buildPrompt(run, project, prefixes) });
+    await rpc.send({ type: "prompt", message: buildPrompt(run, project, prefixes, config.runMaxTime) });
   }
 
   function startRun(run: Run, target: StartTarget): void {
     const project = getProject(run.projectId);
     if (!project) {
       run.status = "error";
+      run.errorKind = "infra";
       run.error = `unknown project ${run.projectId}`;
       run.endedAt = new Date().toISOString();
       scheduler.update(run);
@@ -414,15 +545,27 @@ export function createRunner(scheduler: Scheduler): Runner {
       settled: false,
       finalized: false,
       promptResult: null,
+      starts: new Map(),
+      usage: new UsageAccumulator(),
+      spawnedAt: null,
+      budgetMs: parseDurationMs(config.runMaxTime),
       timers: new Set(),
     };
     contexts.set(run.id, ctx);
-    void execute(ctx, target).catch((e: unknown) => {
-      const message = errorMessage(e);
-      if (!ctx.finalized && !ctx.cancelRequested && !shuttingDown) log(run, "error", message);
-      finalize(ctx, { status: "error", error: message });
-      ctx.rpc?.kill();
-    });
+    void execute(ctx, target)
+      .catch((e: unknown) => {
+        const message = errorMessage(e);
+        if (!ctx.finalized && !ctx.cancelRequested && !shuttingDown) log(run, "error", message);
+        const derived = deriveVerdict(run.checks);
+        finalize(ctx, derived ? { status: "done", errorKind: "agent", error: message, derived } : failure(message));
+        ctx.rpc?.kill();
+      })
+      .catch((e: unknown) => {
+        // Last resort: a failure while recording a failure must never become an unhandled rejection that kills the server.
+        console.error(`run ${run.id}: finalize failed:`, e);
+        scheduler.release(run.id);
+        ctx.rpc?.kill();
+      });
   }
 
   async function cancelActive(id: string): Promise<void> {
@@ -436,11 +579,14 @@ export function createRunner(scheduler: Scheduler): Runner {
       // Preflight (possibly mid-boot): the startRun flow notices the flag, releases the device and stops.
       if (alreadyRequested) return;
       run.status = "cancelled";
+      run.errorKind = "cancelled";
       run.endedAt = new Date().toISOString();
       scheduler.update(run);
       return;
     }
     log(run, "info", "cancelling run");
+    // Usage must survive the abort: read the stats while the session still answers.
+    await captureStats(ctx, rpc, CANCEL_STATS_TIMEOUT_MS);
     rpc.send({ type: "abort" }).catch(() => {});
     rpc.closeStdin();
     const exited = await Promise.race([rpc.exited.then(() => true), Bun.sleep(CANCEL_GRACE_MS).then(() => false)]);
@@ -453,6 +599,7 @@ export function createRunner(scheduler: Scheduler): Runner {
   async function steerRun(id: string, message: string): Promise<void> {
     const ctx = contexts.get(id);
     if (!ctx || !ctx.rpc || ctx.run.status !== "running") throw new HttpError(409, `run ${id} is not running`);
+    if (message.length > MAX_STEER_CHARS) throw new HttpError(400, `message must be at most ${MAX_STEER_CHARS} characters`);
     await ctx.rpc.send({ type: "steer", message });
     log(ctx.run, "user", message);
   }

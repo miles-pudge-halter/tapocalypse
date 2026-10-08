@@ -1,40 +1,119 @@
-import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { type DependencyList, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { toast } from "sonner";
 import {
+  ACTIVE_STATUSES,
   type Activity,
   api,
+  type BatchView,
   type Device,
   type DoctorReport,
+  type McpStatus,
+  type Platform,
+  type PoolView,
   type ProjectStatus,
   type ReportDoc,
   type ReportEntry,
+  type RunStats,
+  type RunStatus,
   type RunView,
+  type Suite,
+  type Template,
+  type Verdict,
+  type Backend,
 } from "./api";
+import { readStorage, writeStorage } from "./storage";
+
+// --- routing ---
+
+export type RunGroup = "day" | "batch" | "none";
+
+/** Every field optional; absent = no constraint. Mirrored in the hash as `#/runs?status=a,b&verdict=..&project=..&q=..&group=..`. */
+export interface RunFilters {
+  status?: RunStatus[];
+  verdict?: Verdict[];
+  project?: string;
+  q?: string;
+  group?: RunGroup;
+}
 
 export type Route =
-  | { name: "dashboard"; rerunId?: string }
-  | { name: "run"; id: string }
+  | { name: "runs"; filters: RunFilters }
+  | { name: "run"; id: string; check?: string }
+  | { name: "batch"; id: string }
+  | { name: "devices" }
+  | { name: "setup" }
   | { name: "projects"; openNew: boolean }
   | { name: "reports"; projectId: string }
   | { name: "report"; projectId: string; reportName: string };
+
+const RUN_STATUSES: readonly RunStatus[] = [
+  "queued",
+  "preflight",
+  "running",
+  "finishing",
+  "done",
+  "error",
+  "cancelled",
+  "interrupted",
+];
+const VERDICTS: readonly Verdict[] = ["PASS", "FAIL", "PASS WITH ISSUES", "BLOCKED", "PARTIAL"];
+const GROUPS: readonly RunGroup[] = ["day", "batch", "none"];
 
 function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+function csv<T extends string>(raw: string | null, allowed: readonly T[]): T[] | undefined {
+  if (!raw) return undefined;
+  const out = raw.split(",").filter((v): v is T => (allowed as readonly string[]).includes(v));
+  return out.length > 0 ? out : undefined;
+}
+
+function parseFilters(params: URLSearchParams): RunFilters {
+  const filters: RunFilters = {};
+  const status = csv(params.get("status"), RUN_STATUSES);
+  if (status) filters.status = status;
+  const verdict = csv(params.get("verdict"), VERDICTS);
+  if (verdict) filters.verdict = verdict;
+  const project = params.get("project");
+  if (project) filters.project = project;
+  const q = params.get("q");
+  if (q) filters.q = q;
+  const group = params.get("group");
+  if (group && (GROUPS as readonly string[]).includes(group)) filters.group = group as RunGroup;
+  return filters;
+}
+
+/** Hash for the Runs page carrying `filters`; `#/` when there are none. */
+export function runsHash(filters: RunFilters): string {
+  const q = new URLSearchParams();
+  if (filters.status?.length) q.set("status", filters.status.join(","));
+  if (filters.verdict?.length) q.set("verdict", filters.verdict.join(","));
+  if (filters.project) q.set("project", filters.project);
+  if (filters.q) q.set("q", filters.q);
+  if (filters.group) q.set("group", filters.group);
+  const qs = q.toString();
+  return qs ? `#/runs?${qs}` : "#/";
+}
+
 function parseHash(hash: string): Route {
   const [pathPart = "", query = ""] = hash.replace(/^#/, "").split("?");
+  const params = new URLSearchParams(query);
   const parts = pathPart.split("/").filter(Boolean);
   try {
     const seg = parts.map(decodeURIComponent);
-    if (seg[0] === "runs" && seg[1]) return { name: "run", id: seg[1] };
-    if (seg[0] === "projects") return { name: "projects", openNew: new URLSearchParams(query).get("new") === "1" };
+    if (seg[0] === "runs" && seg[1]) return { name: "run", id: seg[1], check: params.get("check") ?? undefined };
+    if ((seg[0] === "batches" || seg[0] === "batch") && seg[1]) return { name: "batch", id: seg[1] };
+    if (seg[0] === "devices") return { name: "devices" };
+    if (seg[0] === "setup") return { name: "setup" };
+    if (seg[0] === "projects") return { name: "projects", openNew: params.get("new") === "1" };
     if (seg[0] === "p" && seg[1] && seg[2] === "reports") {
       return seg[3] ? { name: "report", projectId: seg[1], reportName: seg[3] } : { name: "reports", projectId: seg[1] };
     }
   } catch {
-    // malformed escape sequence: fall through to the dashboard
+    // malformed escape sequence: fall through to the runs page
   }
-  return { name: "dashboard", rerunId: new URLSearchParams(query).get("rerun") ?? undefined };
+  return { name: "runs", filters: parseFilters(params) };
 }
 
 function subscribeHash(listener: () => void): () => void {
@@ -50,6 +129,96 @@ export function useRoute(): Route {
 export function navigate(hash: string): void {
   window.location.hash = hash.startsWith("#") ? hash : `#${hash}`;
 }
+
+/** Updates the Runs-page hash in place (no history entry per keystroke). */
+export function setRunFilters(filters: RunFilters): void {
+  window.location.replace(runsHash(filters));
+}
+
+// --- the shared global EventSource (`/api/events`), ref counted ---
+
+let eventSource: EventSource | null = null;
+let eventSourceUsers = 0;
+let sourceConnected = false;
+const connectionListeners = new Set<() => void>();
+
+function setConnected(next: boolean): void {
+  if (sourceConnected === next) return;
+  sourceConnected = next;
+  for (const l of connectionListeners) l();
+}
+
+function onSourceOpen(): void {
+  setConnected(true);
+}
+function onSourceError(): void {
+  setConnected(false);
+}
+
+/** Subscribes to a named event (or the synthetic "open", fired on every (re)connect) on the shared stream. */
+export function listenEvent(name: string, handler: (e: Event) => void): () => void {
+  if (!eventSource) {
+    eventSource = new EventSource("/api/events");
+    eventSource.addEventListener("open", onSourceOpen);
+    eventSource.addEventListener("error", onSourceError);
+  }
+  const source = eventSource;
+  eventSourceUsers++;
+  source.addEventListener(name, handler);
+  return () => {
+    source.removeEventListener(name, handler);
+    if (--eventSourceUsers === 0) {
+      source.removeEventListener("open", onSourceOpen);
+      source.removeEventListener("error", onSourceError);
+      source.close();
+      eventSource = null;
+      setConnected(false);
+    }
+  };
+}
+
+function parseRunEvent(e: Event): RunView | null {
+  try {
+    const data: unknown = JSON.parse((e as MessageEvent<string>).data);
+    if (data && typeof data === "object" && "id" in data && "status" in data) return data as RunView;
+  } catch {
+    // malformed payload
+  }
+  return null;
+}
+
+/** True while the global event stream is open ("Live"); false while (re)connecting. */
+export function useLiveConnection(): boolean {
+  return useSyncExternalStore(
+    (listener) => {
+      connectionListeners.add(listener);
+      return () => void connectionListeners.delete(listener);
+    },
+    () => sourceConnected,
+  );
+}
+
+/** Calls `cb` (debounced) with the run payload of every global `run` event, and once after each reconnect. */
+function useRunsChanged(cb: (run: RunView | null) => void, delayMs = 400): void {
+  const ref = useRef(cb);
+  ref.current = cb;
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const fire = (run: RunView | null) => {
+      clearTimeout(timer);
+      timer = setTimeout(() => ref.current(run), delayMs);
+    };
+    const offRun = listenEvent("run", (e) => fire(parseRunEvent(e)));
+    const offOpen = listenEvent("open", () => fire(null));
+    return () => {
+      clearTimeout(timer);
+      offRun();
+      offOpen();
+    };
+  }, [delayMs]);
+}
+
+// --- generic fetch hook ---
 
 interface AsyncState<T> {
   data: T | null;
@@ -127,14 +296,12 @@ let stopProjectsFeed: (() => void) | null = null;
 
 function startProjectsFeed(): () => void {
   refreshProjects();
-  const { source, release } = acquireEventSource();
-  source.addEventListener("projects", onProjectsEvent);
+  const offProjects = listenEvent("projects", onProjectsEvent);
   // After a reconnect events may have been missed.
-  source.addEventListener("open", refreshProjects);
+  const offOpen = listenEvent("open", refreshProjects);
   return () => {
-    source.removeEventListener("projects", onProjectsEvent);
-    source.removeEventListener("open", refreshProjects);
-    release();
+    offProjects();
+    offOpen();
   };
 }
 
@@ -155,6 +322,33 @@ export function useProjects(): { projects: ProjectStatus[]; loading: boolean; er
   return { ...state, refresh: refreshProjects };
 }
 
+// --- project scope (sidebar project switcher) ---
+
+const SCOPE_KEY = "tapocalypse-project";
+const scopeListeners = new Set<() => void>();
+let scopeProjectId: string | null = readStorage(SCOPE_KEY);
+
+function setScopeProjectId(id: string | null): void {
+  if (scopeProjectId === id) return;
+  scopeProjectId = id;
+  writeStorage(SCOPE_KEY, id);
+  for (const l of scopeListeners) l();
+}
+
+/** The project picked in the sidebar switcher (null = all projects); persisted in localStorage. Views default their project filter to it. */
+export function useProjectScope(): { projectId: string | null; setProjectId(id: string | null): void } {
+  const projectId = useSyncExternalStore(
+    (listener) => {
+      scopeListeners.add(listener);
+      return () => void scopeListeners.delete(listener);
+    },
+    () => scopeProjectId,
+  );
+  return { projectId, setProjectId: setScopeProjectId };
+}
+
+// --- devices, doctor, reports ---
+
 export function useDevices(intervalMs = 10_000): {
   devices: Device[];
   loading: boolean;
@@ -165,7 +359,13 @@ export function useDevices(intervalMs = 10_000): {
   return { devices: data ?? [], loading, error, refresh };
 }
 
-// --- useDoctor: one shared report so a Re-check anywhere updates the top bar dot too ---
+export function usePool(intervalMs = 5_000): { pool: PoolView | null; loading: boolean; error: string | null; refresh(): void } {
+  const { data, loading, error, refresh } = useAsync(api.pool, "pool", intervalMs);
+  useRunsChanged(refresh, 600);
+  return { pool: data, loading, error, refresh };
+}
+
+// --- useDoctor: one shared report so a Re-check anywhere updates the sidebar dot too ---
 
 interface DoctorState {
   report: DoctorReport | null;
@@ -217,106 +417,447 @@ export function useReport(
   return { report: data, loading, error };
 }
 
-// --- useRuns: one global EventSource shared by every consumer (ref counted) ---
+// --- runs ---
+
+const PAGE_SIZE = 100;
+
+export interface RunQuery extends RunFilters {
+  batch?: string;
+  branch?: string;
+  pr?: number;
+  ticket?: string;
+  commit?: string;
+  limit?: number;
+}
 
 interface RunsState {
   runs: RunView[];
+  hasMore: boolean;
   loading: boolean;
+  loadingMore: boolean;
   error: string | null;
 }
 
-const REFETCH_DEBOUNCE_MS = 300;
-const runsListeners = new Set<() => void>();
-let runsState: RunsState = { runs: [], loading: true, error: null };
-let runsDebounce: ReturnType<typeof setTimeout> | undefined;
-
-function setRunsState(next: Partial<RunsState>): void {
-  runsState = { ...runsState, ...next };
-  for (const l of runsListeners) l();
+function runQueryKey(f: RunQuery): string {
+  return JSON.stringify([f.status, f.verdict, f.project, f.q, f.batch, f.branch, f.pr, f.ticket, f.commit, f.limit]);
 }
 
-function refreshRuns(): void {
-  api.runs().then(
-    (runs) => setRunsState({ runs, loading: false, error: null }),
-    (e: unknown) => setRunsState({ loading: false, error: errorMessage(e) }),
+function mergeRun(existing: RunView, incoming: RunView): RunView {
+  return { ...existing, ...incoming };
+}
+
+/**
+ * Server-filtered run list. Live `run` events upsert rows already in the list immediately and trigger a
+ * debounced refetch (which also pulls in newly created matching runs and drops rows that stopped matching).
+ */
+export function useRuns(filters: RunQuery = {}): {
+  runs: RunView[];
+  hasMore: boolean;
+  loading: boolean;
+  loadingMore: boolean;
+  error: string | null;
+  loadMore(): Promise<void>;
+  refresh(): void;
+} {
+  const key = runQueryKey(filters);
+  const filtersRef = useRef(filters);
+  filtersRef.current = filters;
+  const [state, setState] = useState<RunsState>({ runs: [], hasMore: false, loading: true, loadingMore: false, error: null });
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const generation = useRef(0);
+
+  const fetchList = useCallback((fresh = false) => {
+    const gen = generation.current;
+    const f = filtersRef.current;
+    const limit = fresh ? (f.limit ?? PAGE_SIZE) : Math.max(f.limit ?? PAGE_SIZE, stateRef.current.runs.length);
+    return api.runs({ ...f, limit }).then(
+      ({ runs, hasMore }) => {
+        if (gen === generation.current) setState((s) => ({ ...s, runs, hasMore, loading: false, error: null }));
+      },
+      (e: unknown) => {
+        if (gen === generation.current) setState((s) => ({ ...s, loading: false, error: errorMessage(e) }));
+      },
+    );
+  }, []);
+
+  useEffect(() => {
+    generation.current++;
+    setState({ runs: [], hasMore: false, loading: true, loadingMore: false, error: null });
+    void fetchList(true);
+  }, [key, fetchList]);
+
+  useRunsChanged((run) => {
+    if (run) {
+      setState((s) =>
+        s.runs.some((r) => r.id === run.id) ? { ...s, runs: s.runs.map((r) => (r.id === run.id ? mergeRun(r, run) : r)) } : s,
+      );
+    }
+    void fetchList();
+  });
+
+  const loadMore = useCallback(async () => {
+    const { runs, hasMore, loadingMore } = stateRef.current;
+    const last = runs[runs.length - 1];
+    if (!hasMore || loadingMore || !last) return;
+    const gen = generation.current;
+    setState((s) => ({ ...s, loadingMore: true }));
+    try {
+      const page = await api.runs({ ...filtersRef.current, limit: filtersRef.current.limit ?? PAGE_SIZE, before: last.createdAt });
+      if (gen !== generation.current) return;
+      setState((s) => {
+        const seen = new Set(s.runs.map((r) => r.id));
+        return { ...s, runs: [...s.runs, ...page.runs.filter((r) => !seen.has(r.id))], hasMore: page.hasMore, loadingMore: false };
+      });
+    } catch (e) {
+      if (gen === generation.current) setState((s) => ({ ...s, loadingMore: false, error: errorMessage(e) }));
+    }
+  }, []);
+
+  return { ...state, loadMore, refresh: () => void fetchList() };
+}
+
+// --- active runs: one app-wide store (sidebar badge, notifications seed) ---
+
+interface ActiveRunsState {
+  runs: RunView[];
+  loading: boolean;
+}
+
+const activeListeners = new Set<() => void>();
+let activeState: ActiveRunsState = { runs: [], loading: true };
+let activeDebounce: ReturnType<typeof setTimeout> | undefined;
+
+function setActiveState(next: ActiveRunsState): void {
+  activeState = next;
+  for (const l of activeListeners) l();
+}
+
+function refreshActiveRuns(): void {
+  api.runs({ status: ACTIVE_STATUSES, limit: PAGE_SIZE }).then(
+    ({ runs }) => setActiveState({ runs, loading: false }),
+    () => setActiveState({ runs: activeState.runs, loading: false }),
   );
 }
 
-function scheduleRunsRefresh(): void {
-  clearTimeout(runsDebounce);
-  runsDebounce = setTimeout(refreshRuns, REFETCH_DEBOUNCE_MS);
+function onActiveRunEvent(e: Event): void {
+  const run = parseRunEvent(e);
+  if (run) {
+    const active = ACTIVE_STATUSES.includes(run.status);
+    const others = activeState.runs.filter((r) => r.id !== run.id);
+    setActiveState({ runs: active ? [...others, run] : others, loading: false });
+  }
+  clearTimeout(activeDebounce);
+  activeDebounce = setTimeout(refreshActiveRuns, 800);
 }
 
-/** One `/api/events` connection shared by every global store; closed when the last store unsubscribes. */
-let eventSource: EventSource | null = null;
-let eventSourceUsers = 0;
+let stopActiveFeed: (() => void) | null = null;
 
-function acquireEventSource(): { source: EventSource; release(): void } {
-  eventSource ??= new EventSource("/api/events");
-  const source = eventSource;
-  eventSourceUsers++;
-  return {
-    source,
-    release() {
-      if (--eventSourceUsers === 0) {
-        source.close();
-        eventSource = null;
-      }
-    },
+function startActiveFeed(): () => void {
+  refreshActiveRuns();
+  const offRun = listenEvent("run", onActiveRunEvent);
+  const offOpen = listenEvent("open", refreshActiveRuns);
+  return () => {
+    clearTimeout(activeDebounce);
+    offRun();
+    offOpen();
   };
 }
 
-let stopRunsFeed: (() => void) | null = null;
-
-function startRunsFeed(): () => void {
-  refreshRuns();
-  const { source, release } = acquireEventSource();
-  source.addEventListener("run", scheduleRunsRefresh);
-  // After a reconnect events may have been missed.
-  source.addEventListener("open", scheduleRunsRefresh);
+function subscribeActive(listener: () => void): () => void {
+  activeListeners.add(listener);
+  if (activeListeners.size === 1) stopActiveFeed = startActiveFeed();
   return () => {
-    source.removeEventListener("run", scheduleRunsRefresh);
-    source.removeEventListener("open", scheduleRunsRefresh);
-    release();
-    clearTimeout(runsDebounce);
-  };
-}
-
-function subscribeRuns(listener: () => void): () => void {
-  runsListeners.add(listener);
-  if (runsListeners.size === 1) stopRunsFeed = startRunsFeed();
-  return () => {
-    runsListeners.delete(listener);
-    if (runsListeners.size === 0) {
-      stopRunsFeed?.();
-      stopRunsFeed = null;
+    activeListeners.delete(listener);
+    if (activeListeners.size === 0) {
+      stopActiveFeed?.();
+      stopActiveFeed = null;
     }
   };
 }
 
-export function useRuns(): { runs: RunView[]; loading: boolean; error: string | null; refresh(): void } {
-  const state = useSyncExternalStore(subscribeRuns, () => runsState);
-  return { ...state, refresh: refreshRuns };
+/** Queued + in-flight runs across all projects, live. */
+export function useActiveRuns(): ActiveRunsState {
+  return useSyncExternalStore(subscribeActive, () => activeState);
+}
+
+// --- aggregated reads ---
+
+export function useBatch(id: string): { batch: BatchView | null; loading: boolean; error: string | null; refresh(): void } {
+  const { data, loading, error, refresh } = useAsync(() => api.batch(id), `batch:${id}`);
+  useRunsChanged((run) => {
+    if (!run || run.batchId === id) refresh();
+  });
+  return { batch: data, loading, error, refresh };
+}
+
+export function useStats(
+  project?: string | null,
+  days = 7,
+): { stats: RunStats | null; loading: boolean; error: string | null; refresh(): void } {
+  const { data, loading, error, refresh } = useAsync(() => api.stats(project, days), `stats:${project ?? ""}:${days}`);
+  useRunsChanged((run) => {
+    if (!run || !ACTIVE_STATUSES.includes(run.status)) refresh();
+  }, 1500);
+  return { stats: data, loading, error, refresh };
+}
+
+export function useModels(): { models: string[]; loading: boolean; error: string | null } {
+  const { data, loading, error } = useAsync(api.models, "models");
+  return { models: data ?? [], loading, error };
+}
+
+export function useTemplates(): { templates: Template[]; loading: boolean; error: string | null } {
+  const { data, loading, error } = useAsync(api.templates, "templates");
+  return { templates: data ?? [], loading, error };
+}
+
+export function useSuites(projectId: string): { suites: Suite[]; loading: boolean; error: string | null; refresh(): void } {
+  const { data, loading, error, refresh } = useAsync(
+    () => (projectId ? api.suites(projectId) : Promise.resolve<Suite[]>([])),
+    `suites:${projectId}`,
+  );
+  return { suites: data ?? [], loading, error, refresh };
+}
+
+export function useMcpStatus(intervalMs = 5_000): { status: McpStatus | null; loading: boolean; error: string | null } {
+  const { data, loading, error } = useAsync(api.mcpStatus, "mcp-status", intervalMs);
+  return { status: data, loading, error };
+}
+
+// --- New run sheet store ---
+
+export interface NewRunPrefill {
+  projectId?: string;
+  title?: string;
+  brief?: string;
+  device?: { platform: Platform; serial?: string };
+  devices?: { platform: Platform; serial?: string }[];
+  backend?: Backend;
+  packageId?: string;
+  model?: string;
+  suiteId?: string;
+  sourcePath?: string;
+}
+
+interface NewRunState {
+  open: boolean;
+  prefill: NewRunPrefill | null;
+}
+
+const newRunListeners = new Set<() => void>();
+let newRunState: NewRunState = { open: false, prefill: null };
+
+function setNewRunState(next: NewRunState): void {
+  newRunState = next;
+  for (const l of newRunListeners) l();
+}
+
+function openNewRun(prefill?: NewRunPrefill): void {
+  setNewRunState({ open: true, prefill: prefill ?? null });
+}
+
+function closeNewRun(): void {
+  // Keep the prefill until the sheet's exit animation is done; the next open replaces it.
+  setNewRunState({ open: false, prefill: newRunState.prefill });
+}
+
+/** Global store behind the "New run" sheet; any view can open it (optionally prefilled). */
+export function useNewRun(): { open: boolean; prefill: NewRunPrefill | null; openNewRun(prefill?: NewRunPrefill): void; close(): void } {
+  const state = useSyncExternalStore(
+    (listener) => {
+      newRunListeners.add(listener);
+      return () => void newRunListeners.delete(listener);
+    },
+    () => newRunState,
+  );
+  return { ...state, openNewRun, close: closeNewRun };
+}
+
+// --- notifications preference ---
+
+type NotificationPermissionState = NotificationPermission | "unsupported";
+
+const NOTIFY_KEY = "tapocalypse-notify";
+const notifyListeners = new Set<() => void>();
+
+function readPermission(): NotificationPermissionState {
+  return typeof Notification === "undefined" ? "unsupported" : Notification.permission;
+}
+
+interface NotifyState {
+  permission: NotificationPermissionState;
+  enabled: boolean;
+}
+
+function computeNotify(): NotifyState {
+  const permission = readPermission();
+  return { permission, enabled: permission === "granted" && readStorage(NOTIFY_KEY) === "1" };
+}
+
+let notifyState = computeNotify();
+
+function refreshNotify(): void {
+  const next = computeNotify();
+  if (next.permission === notifyState.permission && next.enabled === notifyState.enabled) return;
+  notifyState = next;
+  for (const l of notifyListeners) l();
+}
+
+async function setNotificationsEnabled(enabled: boolean): Promise<void> {
+  if (!enabled) {
+    writeStorage(NOTIFY_KEY, null);
+    refreshNotify();
+    return;
+  }
+  if (typeof Notification === "undefined") {
+    toast.error("This browser does not support desktop notifications");
+    return;
+  }
+  let permission = Notification.permission;
+  if (permission === "default") permission = await Notification.requestPermission();
+  if (permission !== "granted") {
+    toast.error("Notifications are blocked — allow them for this site in your browser settings");
+    refreshNotify();
+    return;
+  }
+  writeStorage(NOTIFY_KEY, "1");
+  refreshNotify();
+}
+
+/** Browser-notification preference; `enabled` is only true while permission is granted. */
+export function useNotifications(): { permission: NotificationPermissionState; enabled: boolean; setEnabled(enabled: boolean): Promise<void> } {
+  const state = useSyncExternalStore(
+    (listener) => {
+      notifyListeners.add(listener);
+      return () => void notifyListeners.delete(listener);
+    },
+    () => notifyState,
+  );
+  return { ...state, setEnabled: setNotificationsEnabled };
+}
+
+// --- keyboard shortcuts ---
+
+interface ShortcutEntry {
+  keys: string;
+  handler: () => void;
+}
+
+const shortcuts = new Set<ShortcutEntry>();
+const SEQUENCE_TIMEOUT_MS = 1000;
+let pendingKey: string | null = null;
+let pendingTimer: ReturnType<typeof setTimeout> | undefined;
+let shortcutListenerAttached = false;
+
+/** Text-entry fields, where plain-key shortcuts must not fire. */
+function isEditable(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName);
+}
+
+const OVERLAY_ROLES = '[role="dialog"],[role="alertdialog"],[role="menu"],[role="listbox"]';
+const OPEN_OVERLAYS = ["dialog", "alertdialog", "menu", "listbox"].map((r) => `[role="${r}"][data-state="open"]`).join(",");
+
+/**
+ * True when a plain-key shortcut must stay inert: the key was already handled (Radix preventDefaults Escape),
+ * the user is typing, or a dialog / alert dialog / menu / listbox owns the keyboard.
+ */
+export function keyboardClaimed(e: KeyboardEvent): boolean {
+  if (e.defaultPrevented || isEditable(e.target)) return true;
+  if (e.target instanceof Element && e.target.closest(OVERLAY_ROLES)) return true;
+  return document.querySelector(OPEN_OVERLAYS) !== null;
+}
+
+function onShortcutKeydown(e: KeyboardEvent): void {
+  if (e.key === "Shift" || e.key === "Control" || e.key === "Meta" || e.key === "Alt") return;
+  const mod = e.metaKey || e.ctrlKey;
+  if (!mod && e.altKey) return;
+  // Plain-key shortcuts must not fire while typing or while a dialog owns the keyboard.
+  if (!mod && keyboardClaimed(e)) return;
+  const base = e.key.toLowerCase();
+  const token = mod ? `mod+${base}` : base;
+  if (pendingKey) {
+    const combo = `${pendingKey} ${token}`;
+    pendingKey = null;
+    clearTimeout(pendingTimer);
+    for (const s of shortcuts) {
+      if (s.keys === combo) {
+        e.preventDefault();
+        s.handler();
+        return;
+      }
+    }
+  }
+  const starts = [...shortcuts].some((s) => s.keys.startsWith(`${token} `));
+  if (starts) {
+    pendingKey = token;
+    clearTimeout(pendingTimer);
+    pendingTimer = setTimeout(() => {
+      pendingKey = null;
+    }, SEQUENCE_TIMEOUT_MS);
+    return;
+  }
+  for (const s of shortcuts) {
+    if (s.keys === token) {
+      e.preventDefault();
+      s.handler();
+      return;
+    }
+  }
+}
+
+/**
+ * Registers a global shortcut. `keys`: a single key ("n", "?", "/"), `mod+<key>` (⌘ on macOS, Ctrl elsewhere)
+ * or a two-key sequence ("g r"). Plain keys are ignored while typing in a field or while a dialog is open.
+ */
+export function useShortcut(keys: string, handler: () => void, deps: DependencyList = []): void {
+  useEffect(() => {
+    const entry: ShortcutEntry = { keys, handler };
+    shortcuts.add(entry);
+    if (!shortcutListenerAttached) {
+      window.addEventListener("keydown", onShortcutKeydown);
+      shortcutListenerAttached = true;
+    }
+    return () => {
+      shortcuts.delete(entry);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [keys, ...deps]);
 }
 
 // --- useRunEvents ---
 
-const ACTIVITY_CAP = 1000;
+const ACTIVITY_CAP = 5000;
+const EARLIER_PAGE = 200;
 
 export function useRunEvents(id: string): {
   run: RunView | null;
   activity: Activity[];
+  hasMoreActivity: boolean;
+  loadEarlier(): Promise<void>;
   error: string | null;
   connected: boolean;
 } {
   const [run, setRun] = useState<RunView | null>(null);
   const [activity, setActivity] = useState<Activity[]>([]);
+  const [hasMoreActivity, setHasMoreActivity] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
+  const activityRef = useRef<Activity[]>([]);
+  const loadingEarlier = useRef(false);
+  const idRef = useRef(id);
+  idRef.current = id;
+
+  const commit = useCallback((next: Activity[]) => {
+    activityRef.current = next;
+    setActivity(next);
+  }, []);
 
   useEffect(() => {
     setRun(null);
-    setActivity([]);
+    commit([]);
+    setHasMoreActivity(false);
     setError(null);
     setConnected(false);
     const source = new EventSource(`/api/runs/${encodeURIComponent(id)}/events`);
@@ -326,14 +867,19 @@ export function useRunEvents(id: string): {
       setError(null);
     });
     source.addEventListener("snapshot", (e) => {
-      const snap = parse<{ run: RunView; activity: Activity[] }>(e);
+      const snap = parse<{ run: RunView; activity: Activity[]; hasMoreActivity?: boolean }>(e);
       setRun(snap.run);
-      setActivity(snap.activity.slice(-ACTIVITY_CAP));
+      commit(snap.activity);
+      setHasMoreActivity(snap.hasMoreActivity ?? false);
     });
     source.addEventListener("run", (e) => setRun(parse<RunView>(e)));
     source.addEventListener("activity", (e) => {
       const a = parse<Activity>(e);
-      setActivity((prev) => [...prev, a].slice(-ACTIVITY_CAP));
+      const prev = activityRef.current;
+      const last = prev[prev.length - 1];
+      // A reconnect re-sends a snapshot; ignore events already covered by it.
+      if (last && a.seq <= last.seq) return;
+      commit([...prev, a].slice(-ACTIVITY_CAP));
     });
     source.addEventListener("error", () => {
       setConnected(false);
@@ -341,9 +887,26 @@ export function useRunEvents(id: string): {
       if (source.readyState === EventSource.CLOSED) setError("Connection to run stream lost");
     });
     return () => source.close();
-  }, [id]);
+  }, [id, commit]);
 
-  return { run, activity, error, connected };
+  const loadEarlier = useCallback(async () => {
+    const first = activityRef.current[0];
+    if (!first || loadingEarlier.current) return;
+    loadingEarlier.current = true;
+    const requested = idRef.current;
+    try {
+      const page = await api.activity(requested, first.seq, EARLIER_PAGE);
+      if (requested !== idRef.current) return;
+      commit([...page.items, ...activityRef.current]);
+      setHasMoreActivity(page.hasMore);
+    } catch (e) {
+      toast.error(`Could not load earlier activity: ${errorMessage(e)}`);
+    } finally {
+      loadingEarlier.current = false;
+    }
+  }, [commit]);
+
+  return { run, activity, hasMoreActivity, loadEarlier, error, connected };
 }
 
 export function useNow(intervalMs = 1000): number {

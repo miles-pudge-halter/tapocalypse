@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from "react";
+import { readStorage, writeStorage } from "./storage";
 
 export type Theme = "light" | "dark" | "system";
 
@@ -7,7 +8,7 @@ const listeners = new Set<() => void>();
 const media = window.matchMedia("(prefers-color-scheme: dark)");
 
 function readTheme(): Theme {
-  const stored = localStorage.getItem(STORAGE_KEY);
+  const stored = readStorage(STORAGE_KEY);
   return stored === "light" || stored === "dark" ? stored : "system";
 }
 
@@ -23,8 +24,7 @@ media.addEventListener("change", apply);
 
 export function setTheme(theme: Theme): void {
   current = theme;
-  if (theme === "system") localStorage.removeItem(STORAGE_KEY);
-  else localStorage.setItem(STORAGE_KEY, theme);
+  writeStorage(STORAGE_KEY, theme === "system" ? null : theme);
   apply();
   for (const l of listeners) l();
 }

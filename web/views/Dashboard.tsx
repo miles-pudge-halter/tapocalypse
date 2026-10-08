@@ -1,101 +1,175 @@
-import { AlertCircle, CheckCircle2, ChevronsUpDown, Clock, FolderOpen, Inbox, Loader2, Play, Plus, RotateCcw, Search, Smartphone } from "lucide-react";
-import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { toast } from "sonner";
-import { EmptyState } from "@/components/empty-state";
-import { CheckStatusIcon } from "@/components/check-status-icon";
-import { SourceChips } from "@/components/source-chips";
+import { AlertCircle, ChevronDown, FolderOpen, Inbox, Loader2, Plus, Search, SearchX, X } from "lucide-react";
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
+import { BatchRow, RunActions, RunRow } from "@/components/run-row";
+import { RunStatusIcon } from "@/components/run-status-icon";
+import { SegmentedProgress } from "@/components/segmented-progress";
+import { SetupBanner } from "@/components/setup-checklist";
 import { DeviceFrame } from "@/components/device-frame";
+import { EmptyState } from "@/components/empty-state";
 import { PageHeader } from "@/components/page-header";
-import { StatusBadge } from "@/components/status-badge";
-import { VerdictBadge } from "@/components/verdict-badge";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
-import { Card, CardContent } from "@/components/ui/card";
-import { SetupChecklist } from "@/components/setup-checklist";
+import { Card } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Progress } from "@/components/ui/progress";
-import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectLabel,
-  SelectSeparator,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Textarea } from "@/components/ui/textarea";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { api, isActive, type Backend, type Device, type Platform, type ProjectStatus, type RunView, type StartRunSource } from "@/lib/api";
-import { formatDuration, formatTime } from "@/lib/format";
-import { navigate, useDevices, useDoctor, useNow, useProjects, useRuns } from "@/lib/hooks";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { isActive, runHash, type Device, type RunStatus, type RunView, type Verdict } from "@/lib/api";
+import { deviceDisplayName, formatCost, formatDuration } from "@/lib/format";
+import {
+  setRunFilters,
+  useActiveRuns,
+  useDevices,
+  useNewRun,
+  useNow,
+  useProjects,
+  useProjectScope,
+  useRoute,
+  useRuns,
+  useShortcut,
+  useStats,
+  useTemplates,
+  type RunFilters,
+} from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 
-const HISTORY_LIMIT = 50;
-const PASS_RATE_WINDOW = 20;
+const TERMINAL_STATUSES: RunStatus[] = ["done", "error", "cancelled", "interrupted"];
+const ALL_STATUSES: RunStatus[] = ["queued", "preflight", "running", "finishing", ...TERMINAL_STATUSES];
+const RUNNING_STATUSES: RunStatus[] = ["preflight", "running", "finishing"];
+const ALL_VERDICTS: Verdict[] = ["PASS", "PASS WITH ISSUES", "FAIL", "BLOCKED", "PARTIAL"];
 const ALL_PROJECTS = "all";
+const SEARCH_DEBOUNCE_MS = 250;
+const GROUPS = [
+  { value: "day", label: "Day" },
+  { value: "batch", label: "Batch" },
+  { value: "none", label: "None" },
+] as const;
 
-/** Initial values of the New run form. `device` is a Select value: `any:<platform>` or `dev:<serial>`. */
-interface Draft {
-  projectId: string;
-  device: string;
-  platform: Platform;
-  backend: Backend;
-  packageId: string;
-  title: string;
-  brief: string;
-  /** Source working directory; empty means the project repo root. */
-  sourcePath: string;
-  /** PR number as typed; empty means auto-detect. */
-  prNumber: string;
+const STATUS_DOT: Record<RunStatus, string> = {
+  queued: "bg-slate-400",
+  preflight: "bg-blue-500",
+  running: "bg-blue-500",
+  finishing: "bg-violet-500",
+  done: "bg-emerald-500",
+  error: "bg-red-500",
+  cancelled: "bg-zinc-500",
+  interrupted: "bg-amber-500",
+};
+
+const VERDICT_DOT: Record<Verdict, string> = {
+  PASS: "bg-emerald-500",
+  "PASS WITH ISSUES": "bg-amber-500",
+  FAIL: "bg-red-500",
+  BLOCKED: "bg-rose-800",
+  PARTIAL: "bg-amber-500/40 ring-1 ring-amber-500",
+};
+
+type Item = { kind: "run"; run: RunView } | { kind: "batch"; id: string; runs: RunView[] };
+
+/**
+ * Collapses runs sharing a batchId into one item at the position of the batch's newest run. Batches that still
+ * have an active lane stay as individual runs: history only holds their finished lanes, so a rolled-up row would
+ * count too few lanes and report a verdict that ignores the running one.
+ */
+function toItems(runs: RunView[], activeBatchIds: ReadonlySet<string>): Item[] {
+  const items: Item[] = [];
+  const batches = new Map<string, Extract<Item, { kind: "batch" }>>();
+  for (const run of runs) {
+    if (!run.batchId || activeBatchIds.has(run.batchId)) {
+      items.push({ kind: "run", run });
+      continue;
+    }
+    const existing = batches.get(run.batchId);
+    if (existing) {
+      existing.runs.push(run);
+      continue;
+    }
+    const batch: Extract<Item, { kind: "batch" }> = { kind: "batch", id: run.batchId, runs: [run] };
+    batches.set(run.batchId, batch);
+    items.push(batch);
+  }
+  return items;
 }
 
-interface SheetState {
-  open: boolean;
-  draft: Draft | null;
-  /** Bumped on every open so the form remounts with fresh initial values. */
-  nonce: number;
+function itemRuns(item: Item): RunView[] {
+  return item.kind === "run" ? [item.run] : item.runs;
 }
 
-/** Re-run copies the working directory, and the PR number only when the requester gave it explicitly. */
-function draftFromRun(run: RunView): Draft {
-  const { serial, platform } = run.deviceRequest;
-  return {
-    projectId: run.projectId,
-    device: serial ? `dev:${serial}` : `any:${platform}`,
-    platform,
-    backend: run.backend,
-    packageId: run.packageId,
-    title: run.title,
-    brief: run.brief,
-    sourcePath: run.source?.path ?? "",
-    prNumber: run.source?.prStatus === "provided" && run.source.pr ? String(run.source.pr.number) : "",
-  };
+function dayLabel(iso: string, now: number): string {
+  const date = new Date(iso);
+  const today = new Date(now);
+  const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const diffDays = Math.round((startOfDay(today) - startOfDay(date)) / 86_400_000);
+  if (diffDays === 0) return "Today";
+  if (diffDays === 1) return "Yesterday";
+  return date.toLocaleDateString(undefined, {
+    weekday: diffDays < 7 ? "long" : undefined,
+    month: "short",
+    day: "numeric",
+    year: date.getFullYear() === today.getFullYear() ? undefined : "numeric",
+  });
 }
 
-/** Matches title, branch, PR number (`609` or `#609`), ticket, or commit prefix. */
-function matchesSearch(run: RunView, query: string): boolean {
-  const q = query.trim().toLowerCase();
-  if (!q) return true;
-  const { source } = run;
-  return (
-    run.title.toLowerCase().includes(q) ||
-    Boolean(source?.branch?.toLowerCase().includes(q)) ||
-    (source?.pr?.number !== undefined && String(source.pr.number) === q.replace(/^#/, "")) ||
-    Boolean(source?.tickets?.some((t) => t.toLowerCase().includes(q))) ||
-    Boolean(source?.commit?.toLowerCase().startsWith(q))
-  );
+function groupByDay(items: Item[], now: number): { label: string; items: Item[] }[] {
+  const groups: { label: string; items: Item[] }[] = [];
+  for (const item of items) {
+    const first = itemRuns(item)[0];
+    if (!first) continue;
+    const label = dayLabel(first.createdAt, now);
+    const last = groups.at(-1);
+    if (last?.label === label) last.items.push(item);
+    else groups.push({ label, items: [item] });
+  }
+  return groups;
 }
 
-export function Dashboard({ rerunId }: { rerunId?: string }) {
+function describeFilters(filters: RunFilters, projectName: string | null): string {
+  const parts: string[] = [];
+  if (filters.status?.length) parts.push(`status: ${filters.status.join(", ")}`);
+  if (filters.verdict?.length) parts.push(`verdict: ${filters.verdict.join(", ")}`);
+  if (projectName) parts.push(`project: ${projectName}`);
+  if (filters.q) parts.push(`search: “${filters.q}”`);
+  return parts.join(" · ");
+}
+
+export function Dashboard() {
+  const route = useRoute();
+  const filters: RunFilters = useMemo(() => (route.name === "runs" ? route.filters : {}), [route]);
   const { projects, loading: projectsLoading, error: projectsError } = useProjects();
+  const { projectId: scopeProject } = useProjectScope();
+  const { devices } = useDevices();
+  const { openNewRun } = useNewRun();
+  const now = useNow();
+  const searchRef = useRef<HTMLInputElement>(null);
+
   const ready = useMemo(() => projects.filter((p) => p.status === "ok"), [projects]);
+  const project = filters.project ?? scopeProject ?? undefined;
+  const projectName = useMemo(() => new Map(projects.map((p) => [p.id, p.name])), [projects]);
+  const deviceNames = useMemo(() => new Map(devices.map((d) => [d.serial, deviceDisplayName(d)])), [devices]);
+
+  const showsActive = filters.status?.some(isActive) ?? false;
+  const historyFilters = useMemo<RunFilters>(
+    () => ({
+      project,
+      status: filters.status?.length ? filters.status : TERMINAL_STATUSES,
+      verdict: filters.verdict,
+      q: filters.q,
+    }),
+    [project, filters.status, filters.verdict, filters.q],
+  );
+  const activeStore = useActiveRuns();
+  const activeBatchIds = useMemo(() => new Set(activeStore.runs.flatMap((r) => (r.batchId ? [r.batchId] : []))), [activeStore.runs]);
+  const activeRuns = useMemo(
+    () => ({ ...activeStore, runs: project ? activeStore.runs.filter((r) => r.projectId === project) : activeStore.runs }),
+    [activeStore, project],
+  );
+  const history = useRuns(historyFilters);
+  const refreshAll = history.refresh;
+
+  useShortcut("/", () => searchRef.current?.focus());
+
   const newRunHint = projectsLoading
     ? "Loading projects…"
     : projects.length === 0
@@ -103,93 +177,36 @@ export function Dashboard({ rerunId }: { rerunId?: string }) {
       : ready.length === 0
         ? "No project is ready — fix a project on the Projects page"
         : null;
-  const { devices } = useDevices();
-  const { report: doctorReport, blocked: doctorBlocked } = useDoctor();
-  const { runs, loading: runsLoading, error: runsError } = useRuns();
-  const [filter, setFilter] = useState(ALL_PROJECTS);
-  const [showAll, setShowAll] = useState(false);
-  const [query, setQuery] = useState("");
-  const [sheet, setSheet] = useState<SheetState>({ open: false, draft: null, nonce: 0 });
-  const handledRerun = useRef<string | null>(null);
 
-  const projectName = useMemo(() => new Map(projects.map((p) => [p.id, p.name])), [projects]);
+  const newRunButton =
+    newRunHint === null ? (
+      <Button onClick={() => openNewRun({ projectId: project })}>
+        <Plus />
+        New run
+      </Button>
+    ) : (
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span tabIndex={0} className="inline-flex rounded-md">
+            <Button disabled className="pointer-events-none">
+              <Plus />
+              New run
+            </Button>
+          </span>
+        </TooltipTrigger>
+        <TooltipContent>{newRunHint}</TooltipContent>
+      </Tooltip>
+    );
 
-  useEffect(() => {
-    if (!rerunId || handledRerun.current === rerunId) return;
-    handledRerun.current = rerunId;
-    api
-      .run(rerunId)
-      .then((run) => setSheet((s) => ({ open: true, draft: draftFromRun(run), nonce: s.nonce + 1 })))
-      .catch((err: unknown) => toast.error(err instanceof Error ? err.message : String(err)))
-      .finally(() => navigate("#/"));
-  }, [rerunId]);
-
-  const visible = useMemo(
-    () => runs.filter((r) => filter === ALL_PROJECTS || r.projectId === filter),
-    [runs, filter],
+  const header = (
+    <PageHeader title="Runs" description="Parallel, agent-driven QA runs across your devices." actions={newRunButton} />
   );
-  const active = useMemo(
-    () => visible.filter((r) => isActive(r.status)).sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
-    [visible],
-  );
-  const history = useMemo(
-    () =>
-      visible
-        .filter((r) => !isActive(r.status) && matchesSearch(r, query))
-        .sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
-    [visible, query],
-  );
-
-  const stats = useMemo(() => {
-    const running = visible.filter((r) => r.status === "running" || r.status === "preflight" || r.status === "finishing");
-    const queued = visible.filter((r) => r.status === "queued");
-    const free = devices.filter((d) => d.state === "ready" && !d.busyRunId).length;
-    const judged = visible
-      .filter((r) => r.verdict !== null)
-      .sort((a, b) => (b.endedAt ?? b.createdAt).localeCompare(a.endedAt ?? a.createdAt))
-      .slice(0, PASS_RATE_WINDOW);
-    const passed = judged.filter((r) => r.verdict === "PASS").length;
-    return { running: running.length, queued: queued.length, free, passed, judged: judged.length };
-  }, [visible, devices]);
-
-  function openNewRun() {
-    const project = ready.find((p) => p.id === filter) ?? ready[0];
-    if (!project) return;
-    setSheet((s) => ({
-      open: true,
-      nonce: s.nonce + 1,
-      draft: {
-        projectId: project.id,
-        device: `any:${project.defaultPlatform}`,
-        platform: project.defaultPlatform,
-        backend: "mobile-mcp",
-        packageId: project.defaultPackage,
-        title: "",
-        brief: "",
-        sourcePath: "",
-        prNumber: "",
-      },
-    }));
-  }
-
-  const shown = showAll ? history : history.slice(0, HISTORY_LIMIT);
-
-  const needsSetup = doctorBlocked || (!projectsLoading && !projectsError && projects.length === 0);
-  const artemisAvailable = doctorReport?.backends.includes("artemis") ?? false;
 
   if (!projectsLoading && !projectsError && projects.length === 0) {
     return (
       <div>
-        <PageHeader
-          title="Runs"
-          description="Parallel, agent-driven QA runs across your devices."
-          actions={<NewRunButton onClick={openNewRun} hint={newRunHint} />}
-        />
-        {needsSetup && (
-          <div className="mb-6">
-            <SetupChecklist dismissible />
-          </div>
-        )}
+        <SetupBanner />
+        {header}
         <EmptyState
           icon={FolderOpen}
           title="Add your first project"
@@ -207,30 +224,13 @@ export function Dashboard({ rerunId }: { rerunId?: string }) {
     );
   }
 
+  const active = [...activeRuns.runs].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  const filtered = Boolean(filters.status?.length || filters.verdict?.length || filters.q || filters.project);
+
   return (
-    <div className="space-y-8">
-      <PageHeader
-        title="Runs"
-        description="Parallel, agent-driven QA runs across your devices."
-        actions={
-          <div className="flex items-center gap-2">
-            <Select value={filter} onValueChange={setFilter}>
-              <SelectTrigger className="w-44" aria-label="Filter by project">
-                <SelectValue placeholder="All projects" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={ALL_PROJECTS}>All projects</SelectItem>
-                {projects.map((p) => (
-                  <SelectItem key={p.id} value={p.id}>
-                    {p.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <NewRunButton onClick={openNewRun} hint={newRunHint} />
-          </div>
-        }
-      />
+    <div className="space-y-5">
+      <SetupBanner />
+      {header}
 
       {projectsError && (
         <Alert variant="destructive">
@@ -240,554 +240,587 @@ export function Dashboard({ rerunId }: { rerunId?: string }) {
         </Alert>
       )}
 
-      {needsSetup && <SetupChecklist dismissible />}
-      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
-        <StatCard icon={Play} label="Running" value={String(stats.running)} loading={runsLoading && runs.length === 0} />
-        <StatCard icon={Clock} label="Queued" value={String(stats.queued)} loading={runsLoading && runs.length === 0} />
-        <StatCard icon={Smartphone} label="Devices free" value={String(stats.free)} loading={false} />
-        <StatCard
-          icon={CheckCircle2}
-          label={`Pass rate · last ${PASS_RATE_WINDOW}`}
-          value={stats.judged ? `${Math.round((stats.passed / stats.judged) * 100)}%` : "—"}
-          hint={stats.judged ? `${stats.passed} of ${stats.judged} PASS` : "no finished runs"}
-          loading={runsLoading && runs.length === 0}
-        />
-      </div>
+      <LiveStrip
+        project={project}
+        filters={filters}
+        running={activeRuns.runs.filter((r) => RUNNING_STATUSES.includes(r.status)).length}
+        queued={activeRuns.runs.filter((r) => r.status === "queued").length}
+        devices={devices}
+        loading={activeRuns.loading && activeRuns.runs.length === 0}
+      />
 
-      {runsError && (
-        <Alert variant="destructive">
-          <AlertCircle />
-          <AlertTitle>Could not load runs</AlertTitle>
-          <AlertDescription>{runsError}</AlertDescription>
-        </Alert>
-      )}
-
-      <section className="space-y-3">
-        <h2 className="text-lg font-semibold tracking-tight">Active</h2>
-        {runsLoading && runs.length === 0 ? (
-          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-            <Skeleton className="h-44 w-full" />
-            <Skeleton className="h-44 w-full" />
-          </div>
-        ) : active.length === 0 ? (
-          <EmptyState icon={Play} title="No active runs" description="Start a new run to see it here live." />
-        ) : (
-          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+      {!showsActive && active.length > 0 && (
+        <section aria-label="Active runs" className="space-y-2">
+          <h2 className="text-sm font-semibold text-muted-foreground">Active · {active.length}</h2>
+          <div className="grid gap-3 md:grid-cols-2 2xl:grid-cols-3">
             {active.map((run) => (
-              <ActiveCard key={run.id} run={run} projectName={projectName.get(run.projectId) ?? run.projectId} />
+              <ActiveCard
+                key={run.id}
+                run={run}
+                projectName={projectName.get(run.projectId) ?? run.projectId}
+                deviceName={run.deviceName ?? (run.deviceSerial ? (deviceNames.get(run.deviceSerial) ?? run.deviceSerial) : null)}
+                now={now}
+                onChanged={refreshAll}
+              />
             ))}
           </div>
-        )}
-      </section>
-
-      <section className="space-y-3">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <h2 className="text-lg font-semibold tracking-tight">History</h2>
-          <div className="relative w-full sm:w-72">
-            <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              type="search"
-              className="pl-8"
-              placeholder="Search title, branch, PR, ticket, commit"
-              aria-label="Search history"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              autoComplete="off"
-            />
-          </div>
+        </section>
+      )}
+      {!showsActive && activeRuns.loading && activeRuns.runs.length === 0 && (
+        <div className="grid gap-3 md:grid-cols-2 2xl:grid-cols-3">
+          <Skeleton className="h-36 w-full" />
+          <Skeleton className="hidden h-36 w-full md:block" />
         </div>
-        {runsLoading && runs.length === 0 ? (
-          <Card>
-            <CardContent className="space-y-2">
-              <Skeleton className="h-8 w-full" />
-              <Skeleton className="h-8 w-full" />
-              <Skeleton className="h-8 w-full" />
-            </CardContent>
-          </Card>
-        ) : visible.every((r) => isActive(r.status)) ? (
-          <EmptyState icon={Inbox} title="No finished runs yet" description="Completed runs and their verdicts appear here." />
-        ) : history.length === 0 ? (
-          <EmptyState icon={Search} title="No matching runs" description="No finished run matches your search." />
-        ) : (
-          <Card className="py-0">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Title</TableHead>
-                  <TableHead>Project</TableHead>
-                  <TableHead>Source</TableHead>
-                  <TableHead>Requester</TableHead>
-                  <TableHead>Device</TableHead>
-                  <TableHead>Backend</TableHead>
-                  <TableHead>Result</TableHead>
-                  <TableHead>Started</TableHead>
-                  <TableHead className="text-right">Duration</TableHead>
-                  <TableHead className="w-24" />
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {shown.map((run) => (
-                  <TableRow key={run.id}>
-                    <TableCell className="max-w-64 truncate font-medium">
-                      <a href={`#/runs/${encodeURIComponent(run.id)}`} className="hover:underline">
-                        {run.title}
-                      </a>
-                    </TableCell>
-                    <TableCell>{projectName.get(run.projectId) ?? run.projectId}</TableCell>
-                    <TableCell className="max-w-72">
-                      <SourceChips source={run.source} build={run.build} compact />
-                    </TableCell>
-                    <TableCell className="text-muted-foreground">{run.requestedBy}</TableCell>
-                    <TableCell className="font-mono text-xs">{run.deviceSerial ?? "—"}</TableCell>
-                    <TableCell className="text-muted-foreground">{run.backend}</TableCell>
-                    <TableCell>
-                      {run.verdict ? <VerdictBadge verdict={run.verdict} /> : <StatusBadge status={run.status} />}
-                    </TableCell>
-                    <TableCell className="whitespace-nowrap text-muted-foreground">
-                      {formatTime(run.startedAt ?? run.createdAt)}
-                    </TableCell>
-                    <TableCell className="text-right tabular-nums">
-                      {run.endedAt ? formatDuration(run.startedAt, run.endedAt, Date.parse(run.endedAt)) : "—"}
-                    </TableCell>
-                    <TableCell className="text-right">
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => setSheet((s) => ({ open: true, draft: draftFromRun(run), nonce: s.nonce + 1 }))}
-                      >
-                        <RotateCcw />
-                        Re-run
-                      </Button>
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-            {history.length > HISTORY_LIMIT && (
-              <div className="flex justify-center border-t p-3">
-                <Button variant="ghost" size="sm" onClick={() => setShowAll((v) => !v)}>
-                  {showAll ? `Show newest ${HISTORY_LIMIT}` : `Show all (${history.length})`}
-                </Button>
-              </div>
-            )}
-          </Card>
-        )}
-      </section>
+      )}
 
-      <Sheet open={sheet.open} onOpenChange={(open) => setSheet((s) => ({ ...s, open }))}>
-        <SheetContent side="right" className="w-full gap-0 overflow-y-auto sm:max-w-xl">
-          <SheetHeader>
-            <SheetTitle>New run</SheetTitle>
-            <SheetDescription>Pick a project and device, then describe what the QA agent should verify.</SheetDescription>
-          </SheetHeader>
-          {sheet.draft && (
-            <NewRunForm key={sheet.nonce} projects={ready} devices={devices} initial={sheet.draft} artemisAvailable={artemisAvailable} />
-          )}
-        </SheetContent>
-      </Sheet>
+      <FilterBar
+        filters={filters}
+        projectValue={project ?? ALL_PROJECTS}
+        searchRef={searchRef}
+        projects={projects.map((p) => ({ id: p.id, name: p.name }))}
+      />
+
+      <HistorySection
+        runs={history.runs}
+        loading={history.loading}
+        error={history.error}
+        hasMore={history.hasMore}
+        loadingMore={history.loadingMore}
+        loadMore={history.loadMore}
+        group={filters.group ?? "day"}
+        filtered={filtered}
+        filterText={describeFilters(filters, filters.project ? (projectName.get(filters.project) ?? filters.project) : null)}
+        hasActive={active.length > 0}
+        projectName={projectName}
+        activeBatchIds={activeBatchIds}
+        deviceNames={deviceNames}
+        now={now}
+        onChanged={refreshAll}
+        newRunProject={project}
+        ready={ready.length > 0}
+      />
     </div>
   );
 }
 
-/** `hint` is why the button is unavailable; null enables it. */
-function NewRunButton({ onClick, hint }: { onClick(): void; hint: string | null }) {
-  if (hint === null) {
-    return (
-      <Button onClick={onClick}>
-        <Plus />
-        New run
-      </Button>
-    );
-  }
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <span tabIndex={0} className="inline-flex rounded-md">
-          <Button disabled className="pointer-events-none">
-            <Plus />
-            New run
-          </Button>
-        </span>
-      </TooltipTrigger>
-      <TooltipContent>{hint}</TooltipContent>
-    </Tooltip>
-  );
-}
-
-function StatCard({
-  icon: Icon,
-  label,
-  value,
-  hint,
+function LiveStrip({
+  project,
+  filters,
+  running,
+  queued,
+  devices,
   loading,
 }: {
-  icon: typeof Play;
-  label: string;
-  value: string;
-  hint?: string;
+  project: string | undefined;
+  filters: RunFilters;
+  running: number;
+  queued: number;
+  devices: Device[];
   loading: boolean;
 }) {
+  const { stats, loading: statsLoading } = useStats(project, 7);
+  const usable = devices.filter((d) => d.state === "ready" && d.deviceType !== "watch" && d.deviceType !== "tv");
+  const busy = usable.filter((d) => d.busyRunId).length;
+  const judged = stats ? stats.pass + stats.fail + stats.issues : 0;
+
+  const segment = "flex items-center gap-1.5 rounded-md px-2 py-1 text-sm hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
+  const divider = <span aria-hidden="true" className="hidden h-4 w-px bg-border sm:block" />;
+
   return (
-    <Card className="gap-2 py-4">
-      <CardContent className="space-y-1 px-4">
-        <div className="flex items-center justify-between text-sm text-muted-foreground">
-          <span>{label}</span>
-          <Icon className="size-4" />
-        </div>
-        {loading ? (
-          <Skeleton className="h-8 w-16" />
-        ) : (
-          <div className="text-2xl font-semibold tabular-nums">{value}</div>
-        )}
-        {hint && <div className="text-xs text-muted-foreground tabular-nums">{hint}</div>}
-      </CardContent>
-    </Card>
+    <div className="flex flex-wrap items-center gap-x-1 gap-y-1 rounded-lg border bg-card px-2 py-1.5 tabular-nums">
+      {loading ? (
+        <Skeleton className="h-6 w-64" />
+      ) : (
+        <>
+          <button
+            type="button"
+            className={segment}
+            onClick={() => setRunFilters({ ...filters, status: RUNNING_STATUSES })}
+            title="Show running runs"
+          >
+            <span className={cn("size-2 rounded-full", running > 0 ? "animate-pulse bg-blue-500" : "bg-muted-foreground/40")} />
+            <strong className="font-semibold">{running}</strong> running
+          </button>
+          {divider}
+          <button type="button" className={segment} onClick={() => setRunFilters({ ...filters, status: ["queued"] })} title="Show queued runs">
+            <strong className="font-semibold">{queued}</strong> queued
+          </button>
+          {divider}
+          <a href="#/devices" className={segment} title="Open Devices">
+            <strong className="font-semibold">
+              {busy}/{usable.length}
+            </strong>{" "}
+            devices busy
+          </a>
+        </>
+      )}
+      {divider}
+      {statsLoading && !stats ? (
+        <Skeleton className="mx-2 h-5 w-40" />
+      ) : (
+        <>
+          <button
+            type="button"
+            className={segment}
+            onClick={() => setRunFilters({ ...filters, verdict: ["PASS"] })}
+            title="Show passing runs"
+          >
+            Pass rate{" "}
+            <strong className="font-semibold">{judged > 0 && stats ? `${Math.round((stats.pass / judged) * 100)}%` : "—"}</strong>
+            {judged > 0 && stats && (
+              <span className="text-muted-foreground">
+                ({stats.pass}/{judged}) · 7d
+              </span>
+            )}
+          </button>
+          {divider}
+          <span className={cn(segment, "cursor-default hover:bg-transparent")}>
+            Spend <strong className="font-semibold">{formatCost(stats?.cost ?? null)}</strong>
+            <span className="text-muted-foreground">· 7d</span>
+          </span>
+        </>
+      )}
+    </div>
   );
 }
 
-function ActiveCard({ run, projectName }: { run: RunView; projectName: string }) {
-  const now = useNow();
-  const total = run.checks.length;
-  const done = run.checks.filter((c) => c.status !== "pending" && c.status !== "running").length;
-  const pct = total ? Math.round((done / total) * 100) : 0;
-  const failing = run.checks.some((c) => c.status === "fail" || c.status === "blocked");
-  const where = run.deviceSerial ? (
-    <span className="font-mono text-xs">{run.deviceSerial}</span>
-  ) : run.status === "queued" ? (
-    <span>queue #{run.queuePosition ?? "?"}</span>
-  ) : (
-    <span>assigning device…</span>
-  );
+function ActiveCard({
+  run,
+  projectName,
+  deviceName,
+  now,
+  onChanged,
+}: {
+  run: RunView;
+  projectName: string;
+  deviceName: string | null;
+  now: number;
+  onChanged(): void;
+}) {
+  const current = run.checks.find((c) => c.status === "running");
+  const queued = run.status === "queued";
+  const reason =
+    run.queueReason ??
+    (run.deviceRequest.serial ? `waiting for ${run.deviceRequest.serial}` : `waiting for a free ${run.deviceRequest.platform} device`);
 
   return (
-    <Card className="py-4">
-      <CardContent className="flex gap-4 px-4">
-        <div className="min-w-0 flex-1 space-y-3">
-          <div className="space-y-1.5">
-            <StatusBadge status={run.status} />
-            <a
-              href={`#/runs/${encodeURIComponent(run.id)}`}
-              className="block truncate font-medium leading-tight hover:underline"
-              title={run.title}
-            >
-              {run.title}
-            </a>
-            <div className="truncate text-xs text-muted-foreground">
-              {projectName} · {run.backend} · by {run.requestedBy}
-            </div>
-            <div className="text-xs text-muted-foreground">{where}</div>
-            <SourceChips source={run.source} build={run.build} compact />
+    <Card className="relative flex-row gap-3 p-3">
+      <div className="w-[120px] shrink-0">
+        <DeviceFrame serial={run.deviceSerial} live className="w-[120px]" />
+      </div>
+      <div className="flex min-w-0 flex-1 flex-col gap-2">
+        <div className="flex items-start gap-2">
+          <RunStatusIcon status={run.status} verdict={run.verdict} className="mt-0.5 size-4 shrink-0" />
+          <a
+            href={runHash(run.id)}
+            className="min-w-0 flex-1 truncate text-sm font-medium after:absolute after:inset-0 hover:underline focus-visible:outline-none"
+            title={run.title}
+          >
+            {run.title}
+          </a>
+          <RunActions run={run} onChanged={onChanged} />
+        </div>
+        <div className="truncate text-xs text-muted-foreground">
+          {[projectName, deviceName ?? (queued ? null : "assigning device…"), run.requestedBy].filter(Boolean).join(" · ")}
+        </div>
+        {queued ? (
+          <div className="text-xs">
+            <span className="font-medium">Queue #{run.queuePosition ?? "?"}</span>
+            <span className="text-muted-foreground"> · {reason}</span>
           </div>
-
-          <div className="space-y-1.5">
-            <div className="flex items-center gap-2">
-              <Progress value={pct} className={cn("h-1.5", failing && "[&>*]:bg-red-500")} />
-              <span className="text-xs tabular-nums text-muted-foreground">
-                {done}/{total}
-              </span>
-            </div>
-            {total > 0 && (
-              <div className="flex flex-wrap gap-1">
-                {run.checks.map((c) => (
-                  <span key={c.id} title={`${c.id}: ${c.title}`}>
-                    <CheckStatusIcon status={c.status} className="size-3.5" />
-                  </span>
-                ))}
-              </div>
-            )}
+        ) : current ? (
+          <div className="flex min-w-0 items-center gap-1.5 text-xs">
+            <Loader2 className="size-3 shrink-0 animate-spin text-blue-500" />
+            <span className="truncate">
+              <span className="font-mono">{current.id}</span> · {current.title}
+            </span>
           </div>
-
+        ) : (
+          <div className="text-xs capitalize text-muted-foreground">{run.status}…</div>
+        )}
+        <div className="mt-auto space-y-1.5">
+          <SegmentedProgress checks={run.checks} size="md" />
           <div className="text-xs tabular-nums text-muted-foreground">
             {run.startedAt
               ? `elapsed ${formatDuration(run.startedAt, null, now)}`
               : `waiting ${formatDuration(run.createdAt, null, now)}`}
           </div>
         </div>
-        {run.deviceSerial && <DeviceFrame serial={run.deviceSerial} live size="sm" />}
-      </CardContent>
+      </div>
     </Card>
   );
 }
 
-function platformOf(value: string, devices: Device[], fallback: Platform): Platform {
-  if (value.startsWith("any:")) return value.slice(4) === "ios" ? "ios" : "android";
-  const serial = value.slice(4);
-  return devices.find((d) => d.serial === serial)?.platform ?? fallback;
+function FilterBar({
+  filters,
+  projectValue,
+  projects,
+  searchRef,
+}: {
+  filters: RunFilters;
+  projectValue: string;
+  projects: { id: string; name: string }[];
+  searchRef: RefObject<HTMLInputElement | null>;
+}) {
+  const { setProjectId } = useProjectScope();
+  const [q, setQ] = useState(filters.q ?? "");
+  const group = filters.group ?? "day";
+  const filterCount = (filters.status?.length ?? 0) + (filters.verdict?.length ?? 0) + (filters.q ? 1 : 0) + (filters.project ? 1 : 0);
+
+  useEffect(() => setQ(filters.q ?? ""), [filters.q]);
+  useEffect(() => {
+    if (q.trim() === (filters.q ?? "")) return;
+    const timer = setTimeout(() => setRunFilters({ ...filters, q: q.trim() || undefined }), SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [q, filters]);
+
+  function changeProject(value: string) {
+    if (value === ALL_PROJECTS) {
+      setProjectId(null);
+      setRunFilters({ ...filters, project: undefined });
+    } else {
+      setRunFilters({ ...filters, project: value });
+    }
+  }
+
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <div className="relative w-full sm:w-64">
+        <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          ref={searchRef}
+          type="search"
+          className="h-8 pl-8"
+          placeholder="Search title, branch, PR, ticket…  ( / )"
+          aria-label="Search runs"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          autoComplete="off"
+        />
+      </div>
+      <MultiFilter
+        label="Status"
+        options={ALL_STATUSES}
+        selected={filters.status ?? []}
+        dot={(s) => STATUS_DOT[s]}
+        text={(s) => s.charAt(0).toUpperCase() + s.slice(1)}
+        onChange={(status) => setRunFilters({ ...filters, status })}
+        hint="None selected shows finished runs"
+      />
+      <MultiFilter
+        label="Verdict"
+        options={ALL_VERDICTS}
+        selected={filters.verdict ?? []}
+        dot={(v) => VERDICT_DOT[v]}
+        text={(v) => v}
+        onChange={(verdict) => setRunFilters({ ...filters, verdict })}
+      />
+      <Select value={projectValue} onValueChange={changeProject}>
+        <SelectTrigger size="sm" className="w-40" aria-label="Filter by project">
+          <SelectValue placeholder="All projects" />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value={ALL_PROJECTS}>All projects</SelectItem>
+          {projects.map((p) => (
+            <SelectItem key={p.id} value={p.id}>
+              {p.name}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      <div role="radiogroup" aria-label="Group by" className="ml-auto flex items-center gap-1 text-xs text-muted-foreground">
+        <span className="mr-1">Group by</span>
+        {GROUPS.map((g) => (
+          <Button
+            key={g.value}
+            type="button"
+            role="radio"
+            aria-checked={group === g.value}
+            variant={group === g.value ? "secondary" : "ghost"}
+            size="sm"
+            className="h-7 px-2"
+            onClick={() => setRunFilters({ ...filters, group: g.value })}
+          >
+            {g.label}
+          </Button>
+        ))}
+      </div>
+      {filterCount > 0 && (
+        <Button type="button" variant="ghost" size="sm" className="h-7" onClick={() => setRunFilters({ group: filters.group })}>
+          <X />
+          Clear ({filterCount})
+        </Button>
+      )}
+    </div>
+  );
 }
 
-function DeviceTag({ children }: { children: string }) {
+function MultiFilter<T extends string>({
+  label,
+  options,
+  selected,
+  dot,
+  text,
+  onChange,
+  hint,
+}: {
+  label: string;
+  options: readonly T[];
+  selected: T[];
+  dot(option: T): string;
+  text(option: T): string;
+  onChange(next: T[]): void;
+  hint?: string;
+}) {
+  function toggle(option: T, on: boolean) {
+    onChange(on ? [...selected, option] : selected.filter((s) => s !== option));
+  }
   return (
-    <span className="rounded border bg-muted px-1 py-px text-[10px] font-normal leading-none text-muted-foreground">
-      {children}
+    <Popover>
+      <PopoverTrigger asChild>
+        <Button variant="outline" size="sm" className={cn("h-8", selected.length > 0 && "border-primary/50")}>
+          {label}
+          {selected.length > 0 && (
+            <span className="rounded-full bg-primary px-1.5 text-[10px] font-semibold leading-4 text-primary-foreground">{selected.length}</span>
+          )}
+          <ChevronDown className="opacity-60" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-56 p-1">
+        {options.map((option) => (
+          <label key={option} className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent">
+            <Checkbox checked={selected.includes(option)} onCheckedChange={(v) => toggle(option, v === true)} />
+            <span className={cn("size-2 shrink-0 rounded-full", dot(option))} />
+            {text(option)}
+          </label>
+        ))}
+        {hint && <p className="px-2 pb-1 pt-1.5 text-xs text-muted-foreground">{hint}</p>}
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+function VerdictStack({ runs }: { runs: RunView[] }) {
+  const pass = runs.filter((r) => r.verdict === "PASS").length;
+  const issues = runs.filter((r) => r.verdict === "PASS WITH ISSUES" || r.verdict === "PARTIAL").length;
+  const fail = runs.filter((r) => r.verdict === "FAIL" || r.verdict === "BLOCKED").length;
+  const other = runs.length - pass - issues - fail;
+  return (
+    <span className="flex items-center gap-2 tabular-nums">
+      {pass > 0 && <span className="text-emerald-600 dark:text-emerald-400">{pass} ✓</span>}
+      {issues > 0 && <span className="text-amber-600 dark:text-amber-400">{issues} ⚠</span>}
+      {fail > 0 && <span className="text-red-600 dark:text-red-400">{fail} ✗</span>}
+      {other > 0 && <span>{other} ⊘</span>}
     </span>
   );
 }
 
-function NewRunForm({
-  projects,
-  devices,
-  initial,
-  artemisAvailable,
-}: {
-  projects: ProjectStatus[];
-  devices: Device[];
-  initial: Draft;
-  artemisAvailable: boolean;
-}) {
-  const [projectId, setProjectId] = useState(initial.projectId);
-  const [device, setDevice] = useState(initial.device);
-  const [backend, setBackend] = useState<Backend>(initial.backend);
-  const [packageId, setPackageId] = useState(initial.packageId);
-  const [title, setTitle] = useState(initial.title);
-  const [brief, setBrief] = useState(initial.brief);
-  const [sourcePath, setSourcePath] = useState(initial.sourcePath);
-  const [prNumber, setPrNumber] = useState(initial.prNumber);
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const platform = platformOf(device, devices, initial.platform);
-  const artemisDisabled = platform === "ios";
-  const effectiveBackend: Backend = artemisAvailable && !artemisDisabled ? backend : "mobile-mcp";
-
-  function changeProject(id: string) {
-    setProjectId(id);
-    const project = projects.find((p) => p.id === id);
-    if (!project) return;
-    setPackageId(project.defaultPackage);
-    if (device.startsWith("any:")) setDevice(`any:${project.defaultPlatform}`);
-    setSourcePath("");
-  }
-
-  async function submit(e: FormEvent) {
-    e.preventDefault();
-    setError(null);
-    const prText = prNumber.trim().replace(/^#/, "");
-    if (prText && !/^[1-9]\d*$/.test(prText)) {
-      setError("PR number must be a positive integer");
-      return;
-    }
-    setSubmitting(true);
-    try {
-      const project = projects.find((p) => p.id === projectId);
-      const serial = device.startsWith("dev:") ? device.slice(4) : undefined;
-      const path = sourcePath.trim();
-      const source: StartRunSource = {};
-      if (path) source.path = path;
-      if (prText) source.prNumber = Number(prText);
-      const run = await api.startRun({
-        projectId,
-        title: title.trim(),
-        brief: brief.trim(),
-        device: serial ? { platform, serial } : { platform },
-        backend: effectiveBackend,
-        packageId: packageId.trim() || project?.defaultPackage || "",
-        ...(Object.keys(source).length > 0 ? { source } : {}),
-      });
-      toast.success(`Run queued: ${run.title}`);
-      navigate(`#/runs/${encodeURIComponent(run.id)}`);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
+function GroupHeader({ label, runs }: { label: string; runs: RunView[] }) {
   return (
-    <form onSubmit={submit} className="flex flex-col gap-5 p-4 pt-0">
-      {error && (
-        <Alert variant="destructive">
-          <AlertCircle />
-          <AlertTitle>Could not start run</AlertTitle>
-          <AlertDescription>{error}</AlertDescription>
-        </Alert>
-      )}
-
-      <div className="space-y-2">
-        <Label htmlFor="nr-project">Project</Label>
-        <Select value={projectId} onValueChange={changeProject}>
-          <SelectTrigger id="nr-project" className="w-full">
-            <SelectValue placeholder="Select a project" />
-          </SelectTrigger>
-          <SelectContent>
-            {projects.map((p) => (
-              <SelectItem key={p.id} value={p.id}>
-                {p.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
-
-      <div className="space-y-2">
-        <Label htmlFor="nr-device">Device</Label>
-        <Select value={device} onValueChange={setDevice}>
-          <SelectTrigger id="nr-device" className="w-full">
-            <SelectValue placeholder="Select a device" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectGroup>
-              <SelectLabel>Any available</SelectLabel>
-              <SelectItem value="any:android">Any android</SelectItem>
-              <SelectItem value="any:ios">Any ios</SelectItem>
-            </SelectGroup>
-            {devices.length > 0 && <SelectSeparator />}
-            {devices.length > 0 && (
-              <SelectGroup>
-                <SelectLabel>Connected devices</SelectLabel>
-                {devices.map((d) => (
-                  <SelectItem key={d.serial} value={`dev:${d.serial}`} disabled={d.state === "booting"}>
-                    <span className="flex flex-wrap items-center gap-1.5">
-                      <span className="font-mono text-xs">{d.serial}</span>
-                      {d.state === "booting" ? (
-                        <DeviceTag>booting…</DeviceTag>
-                      ) : (
-                        <>
-                          <span className="text-muted-foreground">
-                            · {d.model || d.kind} · {d.screen || "?"}
-                          </span>
-                          {d.busyRunId && <DeviceTag>busy</DeviceTag>}
-                          {artemisAvailable && d.artemisOwner && <DeviceTag>Artemis task</DeviceTag>}
-                          {artemisAvailable && d.artemisHelper && <DeviceTag>helper on</DeviceTag>}
-                          {d.bootedByTapocalypse && <DeviceTag>booted by tapocalypse</DeviceTag>}
-                        </>
-                      )}
-                    </span>
-                  </SelectItem>
-                ))}
-              </SelectGroup>
-            )}
-          </SelectContent>
-        </Select>
-      </div>
-
-      {artemisAvailable && (
-        <div className="space-y-2">
-          <Label>Backend</Label>
-          <TooltipProvider>
-            <RadioGroup
-              value={effectiveBackend}
-              onValueChange={(v) => setBackend(v === "artemis" ? "artemis" : "mobile-mcp")}
-              className="grid grid-cols-2 gap-3"
-            >
-              <BackendOption value="mobile-mcp" title="mobile-mcp" description="Android and iOS" />
-              <BackendOption
-                value="artemis"
-                title="artemis"
-                description="Android only"
-                disabled={artemisDisabled}
-                disabledReason="Artemis is Android-only"
-              />
-            </RadioGroup>
-          </TooltipProvider>
-        </div>
-      )}
-
-      <div className="space-y-2">
-        <Label htmlFor="nr-package">Package</Label>
-        <Input
-          id="nr-package"
-          className="font-mono"
-          value={packageId}
-          onChange={(e) => setPackageId(e.target.value)}
-          autoComplete="off"
-        />
-      </div>
-
-      <div className="space-y-2">
-        <Label htmlFor="nr-title">Title</Label>
-        <Input
-          id="nr-title"
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-          required
-          autoComplete="off"
-        />
-      </div>
-
-      <div className="space-y-2">
-        <Label htmlFor="nr-brief">Brief</Label>
-        <Textarea id="nr-brief" rows={12} value={brief} onChange={(e) => setBrief(e.target.value)} required />
-      </div>
-
-      <Collapsible defaultOpen={Boolean(initial.sourcePath || initial.prNumber)} className="space-y-3">
-        <CollapsibleTrigger asChild>
-          <Button type="button" variant="ghost" size="sm" className="-ml-2">
-            <ChevronsUpDown />
-            Source (optional)
-          </Button>
-        </CollapsibleTrigger>
-        <CollapsibleContent className="space-y-4">
-          <div className="space-y-2">
-            <Label htmlFor="nr-source-path">Working directory</Label>
-            <Input
-              id="nr-source-path"
-              className="font-mono"
-              placeholder="project repo root"
-              value={sourcePath}
-              onChange={(e) => setSourcePath(e.target.value)}
-              autoComplete="off"
-            />
-            <p className="text-xs text-muted-foreground">
-              Absolute path of a git worktree of the project, to record its branch, commit and PR.
-            </p>
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="nr-source-pr">PR number</Label>
-            <Input
-              id="nr-source-pr"
-              className="font-mono"
-              inputMode="numeric"
-              placeholder="auto-detect from branch"
-              value={prNumber}
-              onChange={(e) => setPrNumber(e.target.value)}
-              autoComplete="off"
-            />
-          </div>
-        </CollapsibleContent>
-      </Collapsible>
-
-      <Button type="submit" disabled={submitting || !projectId}>
-        {submitting ? <Loader2 className="animate-spin" /> : <Play />}
-        {submitting ? "Starting…" : "Start run"}
-      </Button>
-    </form>
+    <div className="flex items-center gap-3 border-b bg-muted/40 px-3 py-1.5 text-xs font-medium text-muted-foreground">
+      <span className="text-foreground">{label}</span>
+      <span>
+        {runs.length} run{runs.length === 1 ? "" : "s"}
+      </span>
+      <VerdictStack runs={runs} />
+    </div>
   );
 }
 
-function BackendOption({
-  value,
-  title,
-  description,
-  disabled,
-  disabledReason,
-}: {
-  value: Backend;
-  title: string;
-  description: string;
-  disabled?: boolean;
-  disabledReason?: string;
-}) {
-  const id = `nr-backend-${value}`;
+interface HistoryProps {
+  runs: RunView[];
+  loading: boolean;
+  error: string | null;
+  hasMore: boolean;
+  loadingMore: boolean;
+  loadMore(): Promise<void>;
+  group: "day" | "batch" | "none";
+  filtered: boolean;
+  filterText: string;
+  hasActive: boolean;
+  projectName: Map<string, string>;
+  activeBatchIds: ReadonlySet<string>;
+  deviceNames: Map<string, string>;
+  now: number;
+  onChanged(): void;
+  newRunProject: string | undefined;
+  ready: boolean;
+}
+
+function HistorySection(props: HistoryProps) {
+  const { runs, loading, error, group, now } = props;
+  const items = useMemo(() => toItems(runs, props.activeBatchIds), [runs, props.activeBatchIds]);
+  const { openNewRun } = useNewRun();
+  const { templates } = useTemplates();
+
+  if (loading && runs.length === 0) {
+    return (
+      <Card className="@container gap-0 divide-y py-0">
+        {Array.from({ length: 8 }, (_, i) => (
+          <div key={i} className="flex items-center gap-3 px-3 py-2">
+            <Skeleton className="size-4 rounded-full" />
+            <div className="flex-1 space-y-1.5">
+              <Skeleton className="h-4 w-1/2" />
+              <Skeleton className="h-3 w-3/4" />
+            </div>
+            <Skeleton className="hidden h-3 w-28 @2xl:block" />
+            <Skeleton className="h-3 w-12" />
+          </div>
+        ))}
+      </Card>
+    );
+  }
+
+  if (error && runs.length === 0) {
+    return (
+      <Alert variant="destructive">
+        <AlertCircle />
+        <AlertTitle>Could not load runs</AlertTitle>
+        <AlertDescription>{error}</AlertDescription>
+      </Alert>
+    );
+  }
+
+  if (runs.length === 0) {
+    if (props.filtered) {
+      return (
+        <EmptyState
+          icon={SearchX}
+          title="No runs match your filters"
+          description={props.filterText}
+          action={
+            <Button variant="outline" onClick={() => setRunFilters({ group })}>
+              <X />
+              Clear filters
+            </Button>
+          }
+        />
+      );
+    }
+    if (props.hasActive) {
+      return <EmptyState icon={Inbox} title="No finished runs yet" description="Completed runs and their verdicts appear here." />;
+    }
+    const smoke = templates.find((t) => t.id === "smoke");
+    const quickStart = (platform: "android" | "ios") => (
+      <Button
+        key={platform}
+        variant="outline"
+        size="sm"
+        disabled={!props.ready}
+        onClick={() =>
+          openNewRun({
+            projectId: props.newRunProject,
+            device: { platform },
+            ...(smoke ? { title: smoke.title, brief: smoke.brief } : {}),
+          })
+        }
+      >
+        Smoke test on Any {platform === "ios" ? "iOS" : "Android"}
+      </Button>
+    );
+    return (
+      <EmptyState
+        icon={Inbox}
+        title="No runs yet"
+        description={
+          <>
+            Start one here, or let an agent start one through MCP (<code className="font-mono text-xs">qa_start_run</code>).
+          </>
+        }
+        action={
+          <div className="flex flex-wrap items-center justify-center gap-2">
+            <Button disabled={!props.ready} onClick={() => openNewRun({ projectId: props.newRunProject })}>
+              <Plus />
+              New run
+            </Button>
+            {quickStart("android")}
+            {quickStart("ios")}
+          </div>
+        }
+      />
+    );
+  }
+
+  const row = (item: Item, nested = false): ReactNode => {
+    if (item.kind === "batch") {
+      return (
+        <BatchRow
+          key={item.id}
+          batchId={item.id}
+          runs={item.runs}
+          projectName={props.projectName.get(item.runs[0]?.projectId ?? "") ?? ""}
+          now={now}
+          onChanged={props.onChanged}
+        />
+      );
+    }
+    const run = item.run;
+    return (
+      <RunRow
+        key={run.id}
+        run={run}
+        projectName={props.projectName.get(run.projectId) ?? run.projectId}
+        deviceName={run.deviceSerial ? (props.deviceNames.get(run.deviceSerial) ?? null) : null}
+        now={now}
+        onChanged={props.onChanged}
+        nested={nested}
+      />
+    );
+  };
+
+  let body: ReactNode;
+  if (group === "day") {
+    body = groupByDay(items, now).map((g) => (
+      <Fragment key={g.label}>
+        <GroupHeader label={g.label} runs={g.items.flatMap(itemRuns)} />
+        <div className="divide-y border-b last:border-b-0">{g.items.map((item) => row(item))}</div>
+      </Fragment>
+    ));
+  } else if (group === "batch") {
+    const batches: Extract<Item, { kind: "batch" }>[] = [];
+    const singles: Item[] = [];
+    for (const item of items) {
+      if (item.kind === "batch") batches.push(item);
+      else singles.push(item);
+    }
+    body = (
+      <>
+        {batches.map((batch) => (
+          <div key={batch.id} className="divide-y border-b">
+            {row(batch)}
+            {batch.runs.map((r) => row({ kind: "run", run: r }, true))}
+          </div>
+        ))}
+        {singles.length > 0 && (
+          <Fragment>
+            <GroupHeader label="Single runs" runs={singles.flatMap(itemRuns)} />
+            <div className="divide-y">{singles.map((item) => row(item))}</div>
+          </Fragment>
+        )}
+      </>
+    );
+  } else {
+    body = <div className="divide-y">{items.map((item) => row(item))}</div>;
+  }
+
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <div>
-          <Label
-            htmlFor={id}
-            className={cn(
-              "flex items-start gap-3 rounded-lg border p-3 has-[[data-state=checked]]:border-primary has-[[data-state=checked]]:bg-accent",
-              disabled ? "cursor-not-allowed opacity-50" : "cursor-pointer",
-            )}
-          >
-            <RadioGroupItem id={id} value={value} disabled={disabled} className="mt-0.5" />
-            <span className="space-y-0.5">
-              <span className="block text-sm font-medium">{title}</span>
-              <span className="block text-xs font-normal text-muted-foreground">{description}</span>
-            </span>
-          </Label>
+    <section className="space-y-3" aria-label="Run history">
+      <Card className="@container gap-0 py-0">{body}</Card>
+      {error && (
+        <Alert variant="destructive">
+          <AlertCircle />
+          <AlertTitle>Could not refresh runs</AlertTitle>
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
+      {props.hasMore && (
+        <div className="flex justify-center">
+          <Button variant="outline" size="sm" disabled={props.loadingMore} onClick={() => void props.loadMore()}>
+            {props.loadingMore && <Loader2 className="animate-spin" />}
+            Load more
+          </Button>
         </div>
-      </TooltipTrigger>
-      {disabled && disabledReason && <TooltipContent>{disabledReason}</TooltipContent>}
-    </Tooltip>
+      )}
+    </section>
   );
 }

@@ -47,6 +47,10 @@ fs.writeFileSync(
   }),
 );
 
+// Tests must never reach a real emulator or adb server: an unrunnable binary fails fast (ENOENT) instead.
+process.env.EMULATOR_BIN = path.join(root, "no-emulator");
+process.env.ADB_BIN = path.join(root, "no-adb");
+
 process.env.TAPOCALYPSE_CONFIG = configFile;
 process.env.TAPOCALYPSE_DATA_DIR = path.join(root, "data");
 

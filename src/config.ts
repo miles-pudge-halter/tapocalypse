@@ -14,6 +14,12 @@ const ConfigSchema = z.object({
   projects: z.array(z.record(z.string(), z.unknown())),
   /** Fallback model/thinking when a project persona has no `model:`; neither set = omp's own default. */
   agent: z.object({ model: z.string().min(1).optional(), thinking: z.string().min(1).optional() }).optional(),
+  /** Automatic re-queue of runs that die from infrastructure causes (boot failure, omp crash) before any check resolved. */
+  retry: z.object({ infra: z.number().int().nonnegative().default(1) }).default({ infra: 1 }),
+  /** Run-history cleanup; unset = keep everything. Only run directories under the data dir are ever deleted. */
+  retention: z
+    .object({ days: z.number().positive().optional(), maxRuns: z.number().int().positive().optional() })
+    .default({}),
   devicePool: z.object({
     android: z.object({
       avds: z.array(z.string()),
@@ -33,7 +39,30 @@ const ConfigSchema = z.object({
 
 export type Config = z.infer<typeof ConfigSchema>;
 
-export const CONFIG_PATH = process.env.TAPOCALYPSE_CONFIG ?? path.join(REPO_ROOT, "tapocalypse.config.json");
+/** Config/data locations: the legacy in-repo files keep winning when they exist; fresh installs use XDG directories. */
+export function resolveConfigPath(
+  env: Record<string, string | undefined> = process.env,
+  exists: (p: string) => boolean = existsSync,
+  home: string = os.homedir(),
+): string {
+  if (env.TAPOCALYPSE_CONFIG) return env.TAPOCALYPSE_CONFIG;
+  const legacy = path.join(REPO_ROOT, "tapocalypse.config.json");
+  if (exists(legacy)) return legacy;
+  return path.join(env.XDG_CONFIG_HOME || path.join(home, ".config"), "tapocalypse", "config.json");
+}
+
+export function resolveDataDir(
+  env: Record<string, string | undefined> = process.env,
+  exists: (p: string) => boolean = existsSync,
+  home: string = os.homedir(),
+): string {
+  if (env.TAPOCALYPSE_DATA_DIR) return env.TAPOCALYPSE_DATA_DIR;
+  const legacy = path.join(REPO_ROOT, "data");
+  if (exists(legacy)) return legacy;
+  return path.join(env.XDG_DATA_HOME || path.join(home, ".local", "share"), "tapocalypse");
+}
+
+export const CONFIG_PATH = resolveConfigPath();
 
 const STARTER_CONFIG = {
   port: 4310,
@@ -88,23 +117,32 @@ function deepFreeze<T>(o: T): T {
 
 export const config: Config = loadConfig();
 
-export const DATA_DIR = process.env.TAPOCALYPSE_DATA_DIR ?? path.join(REPO_ROOT, "data");
+export const DATA_DIR = resolveDataDir();
 export const OMP_BIN = process.env.OMP_BIN ?? "omp";
 export const ADB_BIN = process.env.ADB_BIN ?? "adb";
 export const GIT_BIN = process.env.GIT_BIN ?? "git";
 export const GH_BIN = process.env.GH_BIN ?? "gh";
 export const ARTEMIS_LOCK_DIR = path.join(os.tmpdir(), "artemis", "device-locks");
 
-function findEmulator(): string | null {
-  if (process.env.EMULATOR_BIN) return process.env.EMULATOR_BIN;
+/** Android emulator binary: explicit env, then the SDK locations Android Studio uses on macOS and Linux. */
+export function findEmulator(
+  env: Record<string, string | undefined> = process.env,
+  exists: (p: string) => boolean = existsSync,
+  home: string = os.homedir(),
+): string | null {
+  if (env.EMULATOR_BIN) return env.EMULATOR_BIN;
   const candidates = [
-    process.env.ANDROID_HOME && path.join(process.env.ANDROID_HOME, "emulator", "emulator"),
-    process.env.ANDROID_SDK_ROOT && path.join(process.env.ANDROID_SDK_ROOT, "emulator", "emulator"),
-    path.join(os.homedir(), "Library", "Android", "sdk", "emulator", "emulator"),
+    env.ANDROID_HOME && path.join(env.ANDROID_HOME, "emulator", "emulator"),
+    env.ANDROID_SDK_ROOT && path.join(env.ANDROID_SDK_ROOT, "emulator", "emulator"),
+    path.join(home, "Library", "Android", "sdk", "emulator", "emulator"),
+    path.join(home, "Android", "Sdk", "emulator", "emulator"),
   ].filter((c): c is string => !!c);
-  return candidates.find((c) => existsSync(c)) ?? null;
+  return candidates.find((c) => exists(c)) ?? null;
 }
 export const EMULATOR_BIN = findEmulator();
+
+/** Longest message accepted by the steer endpoint and the `qa_steer_run` MCP tool. */
+export const MAX_STEER_CHARS = 4000;
 
 export class HttpError extends Error {
   constructor(public status: number, message: string) {

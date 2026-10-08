@@ -2,33 +2,50 @@ import {
   AlertCircle,
   Apple,
   ArrowLeft,
+  Atom,
   Bot,
+  Boxes,
   Check,
-  Copy,
+  CheckCircle2,
+  ChevronDown,
   FileText,
+  Feather,
   FolderGit2,
   FolderOpen,
+  ListChecks,
   Loader2,
+  MoreHorizontal,
   Pencil,
+  Play,
   Plus,
   RefreshCw,
   ScanSearch,
+  Search,
   Sparkles,
   Trash2,
   TriangleAlert,
+  Wrench,
+  type LucideIcon,
 } from "lucide-react";
 import { type FormEvent, type ReactNode, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
+import { CopyButton } from "@/components/copy-button";
 import { EmptyState } from "@/components/empty-state";
 import { PageHeader } from "@/components/page-header";
-import { SetupChecklist } from "@/components/setup-checklist";
-import { StatusBadge } from "@/components/status-badge";
-import { VerdictBadge } from "@/components/verdict-badge";
+import { useStartSmokeRun } from "@/components/setup-checklist";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
@@ -40,15 +57,16 @@ import {
   api,
   type Detection,
   type Framework,
-  isActive,
   type Platform,
   type Project,
   type ProjectInput,
   type ProjectStatus,
+  type ProjectSuggestion,
   type RunView,
+  runHash,
 } from "@/lib/api";
-import { formatRelative } from "@/lib/format";
-import { navigate, useNow, useProjects, useRuns } from "@/lib/hooks";
+import { formatCost, formatRelative } from "@/lib/format";
+import { navigate, useActiveRuns, useNewRun, useNow, useProjects, useRuns, useStats, useSuites } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 
 const FRAMEWORK_LABEL: Record<Framework, string> = {
@@ -61,10 +79,23 @@ const FRAMEWORK_LABEL: Record<Framework, string> = {
   unknown: "Unknown framework",
 };
 
+const FRAMEWORK_ICON: Record<Framework, LucideIcon> = {
+  flutter: Feather,
+  "react-native": Atom,
+  expo: Atom,
+  android: Bot,
+  ios: Apple,
+  kmp: Boxes,
+  unknown: FolderGit2,
+};
+
 const PLATFORM_LABEL: Record<Platform, string> = { android: "Android", ios: "iOS" };
+const PLATFORM_ICON: Record<Platform, LucideIcon> = { android: Bot, ios: Apple };
 const PLATFORMS: Platform[] = ["android", "ios"];
+const PACKAGE_EXAMPLE: Record<Platform, string> = { android: "com.example.myapp.dev", ios: "com.example.myapp" };
 
 const VALIDATE_DEBOUNCE_MS = 400;
+const STRIP_RUNS = 12;
 /** Select / radio sentinels; real values (packages, repo-relative paths) never start with ":". */
 const CUSTOM = ":custom";
 const BUILTIN = ":builtin";
@@ -86,49 +117,63 @@ function slugify(text: string): string {
     .replace(/-+$/, "");
 }
 
-interface ProjectRunStats {
-  total: number;
-  activeIds: string[];
-  last: RunView | null;
+/** Detection is cheap but not free; every card for the same repo shares one request for the page's lifetime. */
+const detections = new Map<string, Promise<Detection | null>>();
+
+function loadDetection(repoPath: string): Promise<Detection | null> {
+  let pending = detections.get(repoPath);
+  if (!pending) {
+    pending = api.detectProject(repoPath).catch(() => null);
+    detections.set(repoPath, pending);
+  }
+  return pending;
 }
 
-function collectStats(runs: RunView[]): Map<string, ProjectRunStats> {
-  const stats = new Map<string, ProjectRunStats>();
-  for (const run of runs) {
-    const s = stats.get(run.projectId) ?? { total: 0, activeIds: [], last: null };
-    s.total++;
-    if (isActive(run.status)) s.activeIds.push(run.id);
-    else if (!s.last || run.createdAt > s.last.createdAt) s.last = run;
-    stats.set(run.projectId, s);
-  }
-  return stats;
+function useDetection(project: ProjectStatus): Detection | null {
+  const [detection, setDetection] = useState<Detection | null>(null);
+  const { repoPath, status } = project;
+  useEffect(() => {
+    if (status !== "ok") return;
+    let cancelled = false;
+    void loadDetection(repoPath).then((d) => {
+      if (!cancelled) setDetection(d);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [repoPath, status]);
+  return detection;
 }
 
 interface SheetState {
   open: boolean;
   /** null = add flow. */
   project: ProjectStatus | null;
+  /** Set once the add flow saved; the sheet then shows next steps instead of the form. */
+  created: ProjectStatus | null;
   /** Bumped on every open so the form remounts with fresh state. */
   nonce: number;
 }
 
 export function Projects({ openNew }: { openNew: boolean }) {
   const { projects, loading, error, refresh } = useProjects();
-  const { runs } = useRuns();
+  const { runs: activeRuns } = useActiveRuns();
   const now = useNow(30_000);
-  const [sheet, setSheet] = useState<SheetState>({ open: false, project: null, nonce: 0 });
+  const [sheet, setSheet] = useState<SheetState>({ open: false, project: null, created: null, nonce: 0 });
   const [deleting, setDeleting] = useState<ProjectStatus | null>(null);
-  const stats = useMemo(() => collectStats(runs), [runs]);
 
   function openSheet(project: ProjectStatus | null) {
-    setSheet((s) => ({ open: true, project, nonce: s.nonce + 1 }));
+    setSheet((s) => ({ open: true, project, created: null, nonce: s.nonce + 1 }));
   }
 
-  // `#/projects?new=1` is a one-shot request from elsewhere in the app; consume it so a reload doesn't reopen the sheet.
+  const activeCount = (projectId: string) => activeRuns.filter((r) => r.projectId === projectId).length;
+
+  // `#/projects?new=1` is a one-shot request from elsewhere in the app; consume it so a reload doesn't reopen the
+  // sheet. Replace (not push) the entry so Back never lands on `?new=1` again.
   useEffect(() => {
     if (!openNew) return;
     openSheet(null);
-    navigate("#/projects");
+    window.location.replace("#/projects");
   }, [openNew]);
 
   return (
@@ -153,29 +198,36 @@ export function Projects({ openNew }: { openNew: boolean }) {
       )}
 
       {loading && projects.length === 0 ? (
-        <div className="grid gap-4 lg:grid-cols-2">
-          <Skeleton className="h-64 w-full" />
-          <Skeleton className="h-64 w-full" />
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3" aria-busy>
+          <Skeleton className="h-72 w-full" />
+          <Skeleton className="h-72 w-full" />
+          <Skeleton className="h-72 w-full" />
         </div>
       ) : projects.length === 0 && !error ? (
         <EmptyState
           icon={FolderOpen}
           title="Add your first project"
-          description="Point Tapocalypse at your app's repository folder. It detects the framework, package name and QA persona, so adding a project takes about a minute."
+          description="Pick your app's repository folder. Tapocalypse detects the framework, package name and QA persona, so adding a project takes about a minute."
           action={
-            <Button onClick={() => openSheet(null)}>
-              <Plus />
-              Add your first project
-            </Button>
+            <div className="flex flex-wrap justify-center gap-2">
+              <Button onClick={() => openSheet(null)}>
+                <Plus />
+                Add your first project
+              </Button>
+              <Button variant="outline" onClick={() => navigate("#/setup")}>
+                <ListChecks />
+                Open setup guide
+              </Button>
+            </div>
           }
         />
       ) : (
-        <div className="grid gap-4 lg:grid-cols-2">
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
           {projects.map((p) => (
             <ProjectCard
               key={p.id}
               project={p}
-              stats={stats.get(p.id)}
+              activeCount={activeCount(p.id)}
               now={now}
               onEdit={() => openSheet(p)}
               onDelete={() => setDeleting(p)}
@@ -183,10 +235,6 @@ export function Projects({ openNew }: { openNew: boolean }) {
           ))}
         </div>
       )}
-
-      <section className="mt-10" aria-label="Setup">
-        <SetupChecklist />
-      </section>
 
       <Sheet open={sheet.open} onOpenChange={(open) => setSheet((s) => ({ ...s, open }))}>
         <SheetContent
@@ -196,27 +244,37 @@ export function Projects({ openNew }: { openNew: boolean }) {
           onOpenAutoFocus={(e) => e.preventDefault()}
         >
           <SheetHeader>
-            <SheetTitle>{sheet.project ? `Edit ${sheet.project.name}` : "Add a project"}</SheetTitle>
+            <SheetTitle>{sheet.created ? `${sheet.created.name} added` : sheet.project ? `Edit ${sheet.project.name}` : "Add a project"}</SheetTitle>
             <SheetDescription>
-              {sheet.project
-                ? "Changes apply to new runs straight away; runs already in progress are not affected."
-                : "Two quick steps: tell us where the app lives, then check what we detected."}
+              {sheet.created
+                ? "Your project is ready. Here is what to do next."
+                : sheet.project
+                  ? "Changes apply to new runs straight away; runs already in progress are not affected."
+                  : "Two quick steps: tell us where the app lives, then check what we detected."}
             </SheetDescription>
           </SheetHeader>
-          <ProjectForm
-            key={sheet.nonce}
-            project={sheet.project}
-            onSaved={() => {
-              setSheet((s) => ({ ...s, open: false }));
-              refresh();
-            }}
-          />
+          {sheet.created ? (
+            <AddedSuccess project={sheet.created} onClose={() => setSheet((s) => ({ ...s, open: false }))} />
+          ) : (
+            <ProjectForm
+              key={sheet.nonce}
+              project={sheet.project}
+              onCreated={(created) => {
+                setSheet((s) => ({ ...s, created }));
+                refresh();
+              }}
+              onUpdated={() => {
+                setSheet((s) => ({ ...s, open: false }));
+                refresh();
+              }}
+            />
+          )}
         </SheetContent>
       </Sheet>
 
       <DeleteDialog
         project={deleting}
-        activeCount={deleting ? (stats.get(deleting.id)?.activeIds.length ?? 0) : 0}
+        activeCount={deleting ? activeCount(deleting.id) : 0}
         onClose={() => setDeleting(null)}
         onDeleted={refresh}
       />
@@ -226,47 +284,205 @@ export function Projects({ openNew }: { openNew: boolean }) {
 
 // --- Project card ---
 
+/** Dot colour for the verdict strip: the verdict when there is one, else the status. */
+function dotClass(run: RunView): string {
+  switch (run.verdict) {
+    case "PASS":
+      return "bg-emerald-500";
+    case "FAIL":
+      return "bg-red-500";
+    case "PASS WITH ISSUES":
+      return "bg-amber-500";
+    case "BLOCKED":
+      return "bg-rose-800 dark:bg-rose-700";
+    case "PARTIAL":
+      return "border-2 border-amber-500 bg-transparent";
+    case null:
+      break;
+  }
+  if (run.status === "queued" || run.status === "preflight" || run.status === "running" || run.status === "finishing") {
+    return "animate-pulse bg-blue-500";
+  }
+  if (run.status === "error") return "border-2 border-red-500/60 bg-transparent";
+  return "bg-zinc-400 dark:bg-zinc-600";
+}
+
+function VerdictStrip({ runs }: { runs: RunView[] }) {
+  // The list is newest first; the strip reads oldest to newest, left to right.
+  const dots = runs.slice(0, STRIP_RUNS).reverse();
+  return (
+    <div className="flex items-center gap-1" role="list" aria-label="Most recent runs">
+      {dots.map((run) => (
+        <Tooltip key={run.id}>
+          <TooltipTrigger asChild>
+            <a
+              role="listitem"
+              href={runHash(run.id)}
+              aria-label={`${run.title}: ${run.verdict ?? run.status}`}
+              className={cn("size-3 rounded-full outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring", dotClass(run))}
+            />
+          </TooltipTrigger>
+          <TooltipContent>
+            {run.title} · {run.verdict ?? run.status}
+          </TooltipContent>
+        </Tooltip>
+      ))}
+    </div>
+  );
+}
+
+function SuitesCount({ projectId }: { projectId: string }) {
+  const { suites, loading } = useSuites(projectId);
+  if (loading) return null;
+  return <span className="ml-auto text-xs tabular-nums text-muted-foreground">{suites.length}</span>;
+}
+
+function SuitesDialog({ project, open, onClose }: { project: ProjectStatus; open: boolean; onClose(): void }) {
+  const { suites, loading, error } = useSuites(project.id);
+  const { openNewRun } = useNewRun();
+  return (
+    <Dialog open={open} onOpenChange={(o) => !o && onClose()}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{project.name} suites</DialogTitle>
+          <DialogDescription>
+            A suite is a saved brief with a fixed list of checks. Run one to get comparable results every time.
+          </DialogDescription>
+        </DialogHeader>
+        {error && (
+          <Alert variant="destructive">
+            <AlertCircle />
+            <AlertTitle>Could not load suites</AlertTitle>
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
+        {loading ? (
+          <Skeleton className="h-16 w-full" />
+        ) : suites.length === 0 && !error ? (
+          <p className="text-sm text-muted-foreground">
+            No suites yet. Save one from the New run sheet, or add a markdown file at{" "}
+            <code className="rounded bg-muted px-1 text-xs">.tapocalypse/suites/&lt;id&gt;.md</code> in the repository.
+          </p>
+        ) : (
+          <ul className="divide-y rounded-md border">
+            {suites.map((suite) => (
+              <li key={suite.id} className="flex items-center gap-3 px-3 py-2">
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-medium">{suite.title}</p>
+                  <p className="truncate font-mono text-xs text-muted-foreground">{suite.id}</p>
+                </div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    onClose();
+                    openNewRun({ projectId: project.id, suiteId: suite.id, device: { platform: project.defaultPlatform } });
+                  }}
+                >
+                  <Play />
+                  Run
+                </Button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function ProjectCard({
   project,
-  stats,
+  activeCount,
   now,
   onEdit,
   onDelete,
 }: {
   project: ProjectStatus;
-  stats: ProjectRunStats | undefined;
+  activeCount: number;
   now: number;
   onEdit(): void;
   onDelete(): void;
 }) {
   const ok = project.status === "ok";
-  const activeCount = stats?.activeIds.length ?? 0;
-  const last = stats?.last ?? null;
-  const PlatformIcon = project.defaultPlatform === "ios" ? Apple : Bot;
-  const deleteHint =
-    activeCount === 0 ? null : `${activeCount} active run${activeCount === 1 ? "" : "s"} — cancel or wait for ${activeCount === 1 ? "it" : "them"} to finish first`;
+  const detection = useDetection(project);
+  const { runs } = useRuns({ project: project.id, limit: STRIP_RUNS });
+  const { stats } = useStats(project.id, 7);
+  const { openNewRun } = useNewRun();
+  const startSmokeRun = useStartSmokeRun();
+  const [suitesOpen, setSuitesOpen] = useState(false);
+
+  const FrameworkGlyph = FRAMEWORK_ICON[detection?.framework ?? "unknown"];
+  const platforms = detection && detection.platforms.length > 0 ? detection.platforms : [project.defaultPlatform];
+  const conclusive = stats ? stats.pass + stats.fail + stats.issues : 0;
+  const passRate = stats && conclusive > 0 ? Math.round((stats.pass / conclusive) * 100) : null;
+  const last = runs[0];
 
   return (
-    <Card className="gap-4">
-      <CardHeader>
-        <CardTitle className="truncate text-base">{project.name}</CardTitle>
-        <CardDescription className="font-mono text-xs">{project.id}</CardDescription>
+    <Card className="gap-4 py-5">
+      <CardHeader className="px-5">
+        <CardTitle className="flex min-w-0 items-center gap-2 text-base">
+          <FrameworkGlyph className="size-4 shrink-0 text-muted-foreground" aria-hidden />
+          <span className="truncate">{project.name}</span>
+        </CardTitle>
+        <CardDescription className="truncate font-mono text-xs">{project.id}</CardDescription>
         <CardAction>
-          <Badge
-            variant="outline"
-            className={cn(
-              ok
-                ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-                : "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300",
-            )}
-          >
-            {ok ? <Check /> : <TriangleAlert />}
-            {ok ? "Ready" : "Needs attention"}
-          </Badge>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="ghost" size="icon-sm" aria-label={`Actions for ${project.name}`}>
+                <MoreHorizontal />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onSelect={onEdit}>
+                <Pencil />
+                Edit
+              </DropdownMenuItem>
+              <DropdownMenuItem asChild disabled={!ok}>
+                <a href={`#/p/${encodeURIComponent(project.id)}/reports`}>
+                  <FileText />
+                  Reports
+                </a>
+              </DropdownMenuItem>
+              <DropdownMenuItem disabled={!ok} onSelect={() => setSuitesOpen(true)}>
+                <ListChecks />
+                Suites
+                {ok && <SuitesCount projectId={project.id} />}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem variant="destructive" disabled={activeCount > 0} onSelect={onDelete}>
+                <Trash2 />
+                {activeCount > 0 ? `Delete (${activeCount} active run${activeCount === 1 ? "" : "s"})` : "Delete"}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </CardAction>
       </CardHeader>
 
-      <CardContent className="space-y-3">
+      <CardContent className="space-y-4 px-5">
+        <div className="flex flex-wrap items-center gap-1.5">
+          {detection && (
+            <Badge variant="secondary" className="gap-1">
+              <FrameworkGlyph />
+              {FRAMEWORK_LABEL[detection.framework]}
+            </Badge>
+          )}
+          {platforms.map((platform) => {
+            const Icon = PLATFORM_ICON[platform];
+            return (
+              <Badge key={platform} variant={platform === project.defaultPlatform ? "secondary" : "outline"} className="gap-1">
+                <Icon />
+                {PLATFORM_LABEL[platform]}
+              </Badge>
+            );
+          })}
+          {activeCount > 0 && (
+            <Badge variant="outline" className="border-blue-500/30 bg-blue-500/10 text-blue-700 dark:text-blue-300">
+              {activeCount} active
+            </Badge>
+          )}
+        </div>
+
         {!ok && (
           <ul className="space-y-1 rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-800 dark:text-amber-300">
             {project.problems.map((problem) => (
@@ -277,16 +493,11 @@ function ProjectCard({
             ))}
           </ul>
         )}
+
         <dl className="space-y-2 text-sm">
-          <Row label="App">
-            <span className="flex min-w-0 items-center gap-2">
-              <Badge variant="secondary" className="shrink-0 gap-1">
-                <PlatformIcon />
-                {PLATFORM_LABEL[project.defaultPlatform]}
-              </Badge>
-              <span className="truncate font-mono text-xs" title={project.defaultPackage}>
-                {project.defaultPackage}
-              </span>
+          <Row label="Package">
+            <span className="block truncate font-mono text-xs" title={project.defaultPackage}>
+              {project.defaultPackage}
             </span>
           </Row>
           <Row label="Repo">
@@ -294,72 +505,64 @@ function ProjectCard({
               <span className="truncate font-mono text-xs" title={project.repoPath}>
                 {project.repoPath}
               </span>
-              <CopyButton text={project.repoPath} label="Copy repository path" />
+              <CopyButton value={project.repoPath} />
             </span>
-          </Row>
-          <Row label="Persona">
-            {project.personaFile ? (
-              <span className="truncate font-mono text-xs" title={project.personaFile}>
-                {project.personaFile}
-              </span>
-            ) : (
-              <span>Built-in QA persona</span>
-            )}
-          </Row>
-          <Row label="Reports">
-            <span className="truncate font-mono text-xs" title={project.reportsDir}>
-              {project.reportsDir}/
-            </span>
-          </Row>
-          <Row label="Runs">
-            {stats && stats.total > 0 ? (
-              <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                <span className="tabular-nums">{stats.total} total</span>
-                {activeCount > 0 && <span className="tabular-nums text-blue-700 dark:text-blue-300">{activeCount} active</span>}
-                {last && (
-                  <span className="flex items-center gap-1.5 text-muted-foreground">
-                    · last
-                    {last.verdict ? <VerdictBadge verdict={last.verdict} /> : <StatusBadge status={last.status} />}
-                    {formatRelative(last.endedAt ?? last.createdAt, now)}
-                  </span>
-                )}
-              </span>
-            ) : (
-              <span className="text-muted-foreground">No runs yet</span>
-            )}
           </Row>
         </dl>
+
+        {ok &&
+          (runs.length > 0 ? (
+            <div className="space-y-2">
+              <VerdictStrip runs={runs} />
+              <p className="flex flex-wrap items-center gap-x-1.5 text-xs text-muted-foreground">
+                {passRate !== null && stats ? (
+                  <span className="tabular-nums" title={`${stats.pass} pass of ${conclusive} runs with a verdict in the last 7 days`}>
+                    <span className="font-medium text-foreground">{passRate}%</span> pass · 7d
+                  </span>
+                ) : (
+                  <span>No verdicts in 7d</span>
+                )}
+                {stats && stats.cost !== null && (
+                  <>
+                    <span aria-hidden>·</span>
+                    <span className="tabular-nums">{formatCost(stats.cost)}</span>
+                  </>
+                )}
+                {last && (
+                  <>
+                    <span aria-hidden>·</span>
+                    <span>last run {formatRelative(last.endedAt ?? last.createdAt, now)}</span>
+                  </>
+                )}
+              </p>
+            </div>
+          ) : (
+            <p className="text-sm text-muted-foreground">No runs yet.</p>
+          ))}
       </CardContent>
 
-      <CardFooter className="flex-wrap gap-2">
-        <Button variant="outline" size="sm" onClick={onEdit}>
-          <Pencil />
-          Edit
-        </Button>
+      <CardFooter className="flex-wrap gap-2 px-5">
         {ok ? (
-          <Button asChild variant="outline" size="sm">
-            <a href={`#/p/${encodeURIComponent(project.id)}/reports`}>
-              <FileText />
-              Reports
-            </a>
-          </Button>
+          <>
+            <Button size="sm" onClick={() => openNewRun({ projectId: project.id, device: { platform: project.defaultPlatform } })}>
+              <Play />
+              New run
+            </Button>
+            {runs.length === 0 && (
+              <Button size="sm" variant="outline" onClick={() => startSmokeRun(project)}>
+                Run a smoke test
+              </Button>
+            )}
+          </>
         ) : (
-          <DisabledHint reason="Fix this project first — reports are only available for ready projects">
-            <Button variant="outline" size="sm" disabled>
-              <FileText />
-              Reports
-            </Button>
-          </DisabledHint>
+          <Button size="sm" onClick={onEdit}>
+            <Wrench />
+            Fix
+          </Button>
         )}
-        <div className="ml-auto">
-          <DisabledHint reason={deleteHint}>
-            <Button variant="ghost" size="sm" className="text-destructive hover:text-destructive" disabled={activeCount > 0} onClick={onDelete}>
-              <Trash2 />
-              Delete
-            </Button>
-          </DisabledHint>
-        </div>
       </CardFooter>
+
+      {ok && <SuitesDialog project={project} open={suitesOpen} onClose={() => setSuitesOpen(false)} />}
     </Card>
   );
 }
@@ -367,42 +570,49 @@ function ProjectCard({
 function Row({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div className="flex items-start gap-3">
-      <dt className="w-16 shrink-0 pt-0.5 text-xs text-muted-foreground">{label}</dt>
+      <dt className="w-14 shrink-0 pt-0.5 text-xs text-muted-foreground">{label}</dt>
       <dd className="min-w-0 flex-1">{children}</dd>
     </div>
   );
 }
 
-/** Wraps a (possibly disabled) control so a tooltip can still explain why it is disabled. */
-function DisabledHint({ reason, children }: { reason: string | null; children: ReactNode }) {
-  if (reason === null) return <>{children}</>;
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <span tabIndex={0} className="inline-flex rounded-md [&>button]:pointer-events-none">
-          {children}
-        </span>
-      </TooltipTrigger>
-      <TooltipContent>{reason}</TooltipContent>
-    </Tooltip>
-  );
-}
+// --- Added: next steps ---
 
-function CopyButton({ text, label }: { text: string; label: string }) {
-  const [copied, setCopied] = useState(false);
-  async function copy() {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      toast.error("Could not copy to the clipboard");
-    }
-  }
+function AddedSuccess({ project, onClose }: { project: ProjectStatus; onClose(): void }) {
+  const startSmokeRun = useStartSmokeRun();
   return (
-    <Button type="button" variant="ghost" size="icon-xs" aria-label={label} onClick={() => void copy()}>
-      {copied ? <Check /> : <Copy />}
-    </Button>
+    <div className="flex flex-col gap-4 p-4 pt-2">
+      <div className="flex items-start gap-3 rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-4">
+        <CheckCircle2 className="mt-0.5 size-5 shrink-0 text-emerald-500" />
+        <div className="min-w-0 space-y-1">
+          <p className="font-medium">{project.name} is ready</p>
+          <p className="text-sm text-muted-foreground">
+            Try the built-in smoke test to confirm your app, a device and the QA agent work together end to end.
+          </p>
+        </div>
+      </div>
+      <Button
+        onClick={() => {
+          onClose();
+          startSmokeRun(project);
+        }}
+      >
+        <Play />
+        Start first run
+      </Button>
+      <Button
+        variant="outline"
+        onClick={() => {
+          onClose();
+          navigate("#/setup");
+        }}
+      >
+        Connect your agent
+      </Button>
+      <Button variant="ghost" onClick={onClose}>
+        Done
+      </Button>
+    </div>
   );
 }
 
@@ -577,7 +787,15 @@ function buildFields(form: FormState, options: string[]): Built {
   };
 }
 
-function ProjectForm({ project, onSaved }: { project: ProjectStatus | null; onSaved(): void }) {
+function ProjectForm({
+  project,
+  onCreated,
+  onUpdated,
+}: {
+  project: ProjectStatus | null;
+  onCreated(created: ProjectStatus): void;
+  onUpdated(): void;
+}) {
   const mode = project ? "update" : "create";
   const [stage, setStage] = useState<"locate" | "details">(project ? "details" : "locate");
   const [form, setForm] = useState<FormState>(() => (project ? formFromProject(project) : emptyForm()));
@@ -590,15 +808,21 @@ function ProjectForm({ project, onSaved }: { project: ProjectStatus | null; onSa
   const [validating, setValidating] = useState(false);
   const [saving, setSaving] = useState(false);
   const [generalError, setGeneralError] = useState<string | null>(null);
+  /** Fields the user has left (or tried to submit) once; undetected values stay a neutral hint until then. */
+  const [touched, setTouched] = useState<ReadonlySet<keyof Project>>(new Set());
+  const [qaOpen, setQaOpen] = useState(Boolean(project));
 
   const options = useMemo(() => personaOptions(detection, project?.personaFile ?? null), [detection, project]);
   const built = useMemo(() => buildFields(form, options), [form, options]);
   const errors: FieldErrors = { ...serverErrors, ...saveErrors, ...built.local };
   const hasErrors = Object.values(errors).some(Boolean);
+  // A package that simply was not detected is not an error yet: show it only after the user touched the field.
+  const packageShown = touched.has("defaultPackage") || Boolean(form.packageId.trim());
+  const packageError = packageShown ? errors.defaultPackage : undefined;
 
-  // Move focus to the first field of whichever step is showing.
+  // Step 2 starts on its first field; step 1 leads with the folder list, so focus stays put.
   useEffect(() => {
-    document.getElementById(stage === "locate" ? "pj-repo" : "pj-name")?.focus();
+    if (stage === "details") document.getElementById("pj-name")?.focus();
   }, [stage]);
 
   // Debounced server-side validation; every edit also clears errors left over from a failed save.
@@ -633,8 +857,12 @@ function ProjectForm({ project, onSaved }: { project: ProjectStatus | null; onSa
     setForm((f) => ({ ...f, ...next }));
   }
 
-  async function detect() {
-    const path = form.repoPath.trim();
+  function touch(field: keyof Project) {
+    setTouched((t) => (t.has(field) ? t : new Set(t).add(field)));
+  }
+
+  /** Detects `path` and moves to step 2 (add) or refreshes suggestions (edit). */
+  async function detect(path = form.repoPath.trim()) {
     if (!path) {
       setDetectError("Enter the folder path of your app's repository");
       return;
@@ -651,7 +879,10 @@ function ProjectForm({ project, onSaved }: { project: ProjectStatus | null; onSa
       if (project) {
         toast.success("Detection refreshed");
       } else {
-        setForm(formFromDetection(d));
+        const next = formFromDetection(d);
+        setForm(next);
+        // Nothing to decide when the persona and reports folder are just what detection suggested.
+        setQaOpen(!((next.persona === BUILTIN || next.persona === d.suggestion.personaFile) && next.reportsDir === d.suggestion.reportsDir));
         setStage("details");
       }
     } catch (err) {
@@ -681,11 +912,10 @@ function ProjectForm({ project, onSaved }: { project: ProjectStatus | null; onSa
       if (project) {
         await api.updateProject(project.id, built.fields);
         toast.success(`Saved ${form.name.trim()}`);
+        onUpdated();
       } else {
-        await api.createProject({ id: form.id, ...built.fields });
-        toast.success(`Added ${form.name.trim()}`);
+        onCreated(await api.createProject({ id: form.id, ...built.fields }));
       }
-      onSaved();
     } catch (err) {
       const message = errorMessage(err);
       const match = SAVE_ERROR.exec(message);
@@ -694,6 +924,7 @@ function ProjectForm({ project, onSaved }: { project: ProjectStatus | null; onSa
         const next: FieldErrors = {};
         next[field] = match[2];
         setSaveErrors(next);
+        touch(field);
       } else {
         setGeneralError(message);
       }
@@ -721,13 +952,21 @@ function ProjectForm({ project, onSaved }: { project: ProjectStatus | null; onSa
           title="Where is your app?"
           description="Tapocalypse reads your repository to suggest the settings. It never changes anything in it."
         />
+        <FolderSuggestions
+          busyPath={detecting ? form.repoPath : null}
+          disabled={detecting}
+          onPick={(path) => {
+            patch({ repoPath: path });
+            void detect(path);
+          }}
+        />
         <Field
           id="pj-repo"
-          label="Repository folder"
+          label="Other folder…"
           hint={
             <>
-              In a terminal, <code className="rounded bg-muted px-1">cd</code> into your app and run{" "}
-              <code className="rounded bg-muted px-1">pwd</code>, then paste the result here. <code className="rounded bg-muted px-1">~</code> works too.
+              Paste the absolute path of your app's repository (<code className="rounded bg-muted px-1">pwd</code> inside it prints it).{" "}
+              <code className="rounded bg-muted px-1">~</code> works too.
             </>
           }
           error={detectError ?? undefined}
@@ -824,6 +1063,10 @@ function ProjectForm({ project, onSaved }: { project: ProjectStatus | null; onSa
         </Alert>
       )}
 
+      <section className="space-y-5" aria-labelledby="pj-section-app">
+      <h3 id="pj-section-app" className="text-sm font-semibold">
+        App
+      </h3>
       <Field
         id="pj-name"
         label="Name"
@@ -892,11 +1135,15 @@ function ProjectForm({ project, onSaved }: { project: ProjectStatus | null; onSa
         label="App package"
         detected={choices.some((c) => c.detected && c.value === form.packageId)}
         hint={
-          form.platform === "ios"
-            ? "The iOS bundle identifier of the build installed on the simulator."
-            : "The Android application ID of the build installed on the emulator. Dev or debug flavors are listed first when found."
+          !packageShown ? (
+            <>Not detected — enter your app's {form.platform === "ios" ? "bundle identifier" : "application ID"}, for example {PACKAGE_EXAMPLE[form.platform]}.</>
+          ) : form.platform === "ios" ? (
+            "The iOS bundle identifier of the build installed on the simulator."
+          ) : (
+            "The Android application ID of the build installed on the emulator. Dev or debug flavors are listed first when found."
+          )
         }
-        error={errors.defaultPackage}
+        error={packageError}
       >
         <div className="space-y-2">
           {choices.length > 0 && (
@@ -904,7 +1151,7 @@ function ProjectForm({ project, onSaved }: { project: ProjectStatus | null; onSa
               value={customPackage ? CUSTOM : form.packageId}
               onValueChange={(v) => (v === CUSTOM ? patch({ packageCustom: true }) : patch({ packageCustom: false, packageId: v }))}
             >
-              <SelectTrigger id="pj-package" className="w-full font-mono text-xs" aria-invalid={errors.defaultPackage ? true : undefined}>
+              <SelectTrigger id="pj-package" className="w-full font-mono text-xs" aria-invalid={packageError ? true : undefined} onBlur={() => touch("defaultPackage")}>
                 <SelectValue placeholder="Choose a package" />
               </SelectTrigger>
               <SelectContent>
@@ -926,15 +1173,32 @@ function ProjectForm({ project, onSaved }: { project: ProjectStatus | null; onSa
               aria-label="Custom app package"
               value={form.packageId}
               onChange={(e) => patch({ packageId: e.target.value })}
+              onBlur={() => touch("defaultPackage")}
               autoComplete="off"
               spellCheck={false}
-              aria-invalid={errors.defaultPackage ? true : undefined}
+              aria-invalid={packageError ? true : undefined}
               aria-describedby="pj-package-hint pj-package-error"
             />
           )}
         </div>
       </Field>
+      </section>
 
+      <Collapsible
+        open={qaOpen || Boolean(errors.personaFile || errors.reportsDir)}
+        onOpenChange={setQaOpen}
+        className="rounded-lg border"
+      >
+        <CollapsibleTrigger className="group flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50">
+          <span className="min-w-0 flex-1">
+            <span className="block text-sm font-semibold">QA agent</span>
+            <span className="block truncate text-xs text-muted-foreground">
+              {personaSummary(form)} · reports in {form.reportsDir.trim() || "…"}/
+            </span>
+          </span>
+          <ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform group-data-[state=closed]:-rotate-90" />
+        </CollapsibleTrigger>
+        <CollapsibleContent className="space-y-5 border-t p-3">
       <fieldset className="space-y-2">
         <legend className="text-sm font-medium leading-none">QA persona</legend>
         <p className="text-xs text-muted-foreground">The instructions the QA agent follows when it tests your app.</p>
@@ -996,6 +1260,8 @@ function ProjectForm({ project, onSaved }: { project: ProjectStatus | null; onSa
           aria-describedby="pj-reports-hint pj-reports-error"
         />
       </Field>
+        </CollapsibleContent>
+      </Collapsible>
 
       {warnings.length > 0 && (
         <Alert>
@@ -1040,6 +1306,99 @@ function emptyForm(): FormState {
     customPersona: "",
     reportsDir: "qa",
   };
+}
+
+/** Searchable list of app folders found in common locations; picking one runs detection straight away. */
+function FolderSuggestions({ busyPath, disabled, onPick }: { busyPath: string | null; disabled: boolean; onPick(path: string): void }) {
+  const [suggestions, setSuggestions] = useState<ProjectSuggestion[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    api.projectSuggestions().then(
+      (list) => {
+        if (!cancelled) setSuggestions(list);
+      },
+      (e: unknown) => {
+        if (!cancelled) setError(errorMessage(e));
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const needle = query.trim().toLowerCase();
+  const shown = (suggestions ?? []).filter((x) => !needle || x.name.toLowerCase().includes(needle) || x.path.toLowerCase().includes(needle));
+
+  return (
+    <div className="space-y-2">
+      <Label htmlFor="pj-search">Suggested folders</Label>
+      {error ? (
+        <p className="text-xs text-muted-foreground">Could not look for app folders ({error}). Paste the path below instead.</p>
+      ) : suggestions === null ? (
+        <div className="space-y-2" aria-busy>
+          <Skeleton className="h-11 w-full" />
+          <Skeleton className="h-11 w-full" />
+          <Skeleton className="h-11 w-full" />
+        </div>
+      ) : suggestions.length === 0 ? (
+        <p className="text-xs text-muted-foreground">No app folders found in common locations. Paste the path below instead.</p>
+      ) : (
+        <>
+          {suggestions.length > 5 && (
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                id="pj-search"
+                className="pl-8"
+                placeholder="Search folders"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                autoComplete="off"
+              />
+            </div>
+          )}
+          <ul className="max-h-72 divide-y overflow-y-auto rounded-md border">
+            {shown.map((x) => {
+              const Icon = FRAMEWORK_ICON[x.framework];
+              return (
+                <li key={x.path}>
+                  <button
+                    type="button"
+                    disabled={disabled || x.alreadyAdded}
+                    onClick={() => onPick(x.path)}
+                    className="flex w-full items-center gap-3 px-3 py-2 text-left outline-none hover:bg-accent focus-visible:bg-accent disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-transparent"
+                  >
+                    {busyPath === x.path ? (
+                      <Loader2 className="size-4 shrink-0 animate-spin text-muted-foreground" />
+                    ) : (
+                      <Icon className="size-4 shrink-0 text-muted-foreground" aria-label={FRAMEWORK_LABEL[x.framework]} />
+                    )}
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm font-medium">{x.name}</span>
+                      <span className="block truncate font-mono text-xs text-muted-foreground" title={x.path}>
+                        {x.path}
+                      </span>
+                    </span>
+                    {x.alreadyAdded && <Badge variant="outline">Already added</Badge>}
+                  </button>
+                </li>
+              );
+            })}
+            {shown.length === 0 && <li className="px-3 py-3 text-sm text-muted-foreground">No folder matches “{query.trim()}”.</li>}
+          </ul>
+        </>
+      )}
+    </div>
+  );
+}
+
+function personaSummary(form: FormState): string {
+  if (form.persona === BUILTIN) return "Built-in persona";
+  if (form.persona === CUSTOM) return form.customPersona.trim() || "Custom persona file";
+  return form.persona;
 }
 
 function StepHeading({ step, title, description }: { step: number; title: string; description: string }) {

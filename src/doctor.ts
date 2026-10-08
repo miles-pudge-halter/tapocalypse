@@ -128,6 +128,40 @@ function checkOmp(env: DoctorEnv): Promise<DoctorCheck> {
   });
 }
 
+/** `omp models --json` lists only providers the user is signed in to; it is local/cached and never calls a paid model API. */
+function checkOmpAuth(env: DoctorEnv, omp: Promise<DoctorCheck>): Promise<DoctorCheck> {
+  return guarded({ id: "omp-auth", label: "omp signed in (model access)", required: true }, async () => {
+    if ((await omp).status !== "ok") return { status: "skip", detail: "Needs omp installed first" };
+    const r = await env.run([env.ompBin, "models", "--json"]);
+    const fix = "Run `omp login` and sign in to a model provider (or export its API key), then re-check";
+    if (r.code !== 0) {
+      const reason = r.code === 143 || r.code === 124 ? "timed out" : lastLines(r.stderr || r.text) || `exit ${r.code}`;
+      return { status: "warn", detail: `Could not list omp models (${reason}); cannot confirm you are signed in`, fix };
+    }
+    let count = 0;
+    try {
+      const parsed = JSON.parse(r.text) as { models?: unknown };
+      count = Array.isArray(parsed.models) ? parsed.models.length : 0;
+    } catch {
+      return { status: "warn", detail: "Unexpected output from `omp models --json`; cannot confirm you are signed in", fix };
+    }
+    return count > 0
+      ? { status: "ok", detail: `${count} model(s) available` }
+      : { status: "warn", detail: "omp is not signed in to any model provider; runs cannot start", fix };
+  });
+}
+
+function checkOs(env: DoctorEnv): Promise<DoctorCheck> {
+  return guarded({ id: "os", label: "Operating system", required: true }, () => {
+    if (env.platform === "darwin") return { status: "ok", detail: "macOS (Android and iOS)" };
+    if (env.platform === "linux") return { status: "ok", detail: "Linux (Android only; iOS simulators need macOS)" };
+    if (env.platform === "win32") {
+      return { status: "error", detail: "Windows is not supported", fix: "Run Tapocalypse on macOS or Linux (or inside WSL2 with adb reaching your devices)" };
+    }
+    return { status: "warn", detail: `${env.platform} is untested; macOS and Linux are supported` };
+  });
+}
+
 function checkNode(env: DoctorEnv): Promise<DoctorCheck> {
   return guarded({ id: "node", label: "Node.js / npx (runs mobile-mcp)", required: true }, async () => {
     const r = await env.run(["npx", "--version"]);
@@ -189,7 +223,10 @@ function checkAdb(env: DoctorEnv, xcrun: Promise<DoctorCheck>): Promise<DoctorCh
     return {
       status: iosOk ? "warn" : "error",
       detail: notFound(r.code) ? `\`${env.adbBin}\` not found on PATH` : `\`${env.adbBin} version\` failed: ${lastLines(r.stderr || r.text)}`,
-      fix: "Install Android platform-tools (Android Studio → SDK Manager, or `brew install --cask android-platform-tools`) and add it to PATH, or set ADB_BIN",
+      fix:
+        env.platform === "linux"
+          ? "Install Android platform-tools (Android Studio → SDK Manager, or your distro's `android-tools-adb` package) and add it to PATH, or set ADB_BIN"
+          : "Install Android platform-tools (Android Studio → SDK Manager, or `brew install --cask android-platform-tools`) and add it to PATH, or set ADB_BIN",
     };
   });
 }
@@ -200,7 +237,7 @@ function checkEmulator(env: DoctorEnv): Promise<DoctorCheck> {
       return {
         status: "warn",
         detail: "Android emulator binary not found; Tapocalypse cannot auto-boot emulators",
-        fix: "Install the Android Emulator in Android Studio → SDK Manager, or set EMULATOR_BIN / ANDROID_HOME",
+        fix: "Install the Android Emulator in Android Studio → SDK Manager (looked in ANDROID_HOME, ~/Library/Android/sdk and ~/Android/Sdk), or set EMULATOR_BIN / ANDROID_HOME",
       };
     }
     const r = await env.run([env.emulatorBin, "-list-avds"]);
@@ -300,9 +337,12 @@ export function artemisAvailable(artemisPath: string | undefined = config.artemi
 /** Uncached report for an explicit environment. */
 export async function buildReport(env: DoctorEnv): Promise<DoctorReport> {
   const xcrun = checkXcrun(env);
+  const omp = checkOmp(env);
   const checks = await Promise.all([
+    checkOs(env),
     checkBun(),
-    checkOmp(env),
+    omp,
+    checkOmpAuth(env, omp),
     checkNode(env),
     checkGit(env),
     checkGh(env),

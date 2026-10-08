@@ -36,7 +36,7 @@ export interface ValidationResult {
 }
 
 const ID_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
-const PACKAGE_RE = /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_-]+)+$/;
+export const PACKAGE_RE = /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_-]+)+$/;
 const FIELD_ORDER: (keyof Project)[] = [
   "id",
   "name",

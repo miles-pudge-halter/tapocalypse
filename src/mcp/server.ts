@@ -1,14 +1,18 @@
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { McpServer, WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/server";
 import { z } from "zod";
-import { devicesView, findRun, scheduler } from "../app";
-import { config, HttpError } from "../config";
+import pkg from "../../package.json";
+import { batchView, devicesView, findRun, runDurationMs, runner, scheduler } from "../app";
+import { config, HttpError, MAX_STEER_CHARS } from "../config";
 import { runDoctor } from "../doctor";
 import { detectProject } from "../projects/detect";
-import { createProject, deleteProject, getProject, listProjects, updateProject } from "../projects/registry";
+import { createProject, deleteProject, getProject, listProjects, PACKAGE_RE, updateProject } from "../projects/registry";
+import { resolveUnder } from "../reports/reports";
 import { runMatches } from "../runs/source";
 import { listRuns } from "../runs/store";
 import { ACTIVE, type Run } from "../runs/types";
+import { listSuites } from "../suites";
 
 const TERMINAL = (run: Run) => !ACTIVE.includes(run.status);
 
@@ -21,26 +25,27 @@ export function activeRunIds(projectId: string): string[] {
 }
 
 const ProjectFields = {
-  name: z.string().optional().describe("Display name, 1-60 chars"),
-  defaultPackage: z.string().optional().describe("Android applicationId or iOS bundle id, e.g. com.example.app.dev"),
+  name: z.string().max(60).optional().describe("Display name, 1-60 chars"),
+  defaultPackage: z.string().max(200).optional().describe("Android applicationId or iOS bundle id, e.g. com.example.app.dev"),
   defaultPlatform: z.enum(["android", "ios"]).optional(),
   personaFile: z
     .string()
+    .max(500)
     .nullable()
     .optional()
     .describe("QA persona markdown, relative to the repo; null for the built-in persona"),
-  reportsDir: z.string().optional().describe("Reports folder relative to the repo; default qa"),
+  reportsDir: z.string().max(200).optional().describe("Reports folder relative to the repo; default qa"),
 };
 
 const SourceInput = z.object({
-  path: z.string().optional().describe("Absolute path of your working directory (project repo root or one of its git worktrees)"),
-  branch: z.string().optional().describe("Override the detected branch"),
-  commit: z.string().optional().describe("Override the detected commit sha"),
+  path: z.string().max(4096).optional().describe("Absolute path of your working directory (project repo root or one of its git worktrees)"),
+  branch: z.string().max(200).optional().describe("Override the detected branch"),
+  commit: z.string().max(200).optional().describe("Override the detected commit sha"),
   prNumber: z.number().int().positive().optional().describe("Pull request number, if known"),
-  prTitle: z.string().optional(),
-  prUrl: z.string().optional(),
-  tickets: z.array(z.string()).optional().describe("Ticket keys, e.g. ABC-123"),
-  labels: z.record(z.string(), z.string()).optional().describe("Free-form metadata such as flavor, epic or build id"),
+  prTitle: z.string().max(200).optional(),
+  prUrl: z.string().max(2000).optional(),
+  tickets: z.array(z.string().max(64)).max(20).optional().describe("Ticket keys, e.g. ABC-123"),
+  labels: z.record(z.string().max(100), z.string().max(200)).optional().describe("Free-form metadata such as flavor, epic or build id"),
 });
 
 export function runSummary(run: Run) {
@@ -60,6 +65,13 @@ export function runSummary(run: Run) {
     screenshotsDir: project ? path.join(project.repoPath, project.reportsDir, "screenshots", run.id) : null,
     source: run.source,
     build: run.build,
+    usage: run.usage,
+    durationMs: runDurationMs(run),
+    errorKind: run.errorKind,
+    verdictSource: run.verdictSource,
+    batchId: run.batchId,
+    attempt: run.attempt,
+    retriedBy: run.retriedBy,
   };
 }
 
@@ -69,10 +81,30 @@ function requireRun(runId: string): Run {
   return run;
 }
 
-function waitForTerminal(runId: string, timeoutMs: number): Promise<boolean> {
+/** The run itself, or its newest infra-retry attempt: a retried run is not finished until its successor is. */
+function latestAttempt(run: Run): Run {
+  let current = run;
+  for (let hops = 0; current.retriedBy && hops < 10; hops++) {
+    const next = findRun(current.retriedBy);
+    if (!next) break;
+    current = next;
+  }
+  return current;
+}
+
+function isSettled(runIds: string[], mode: "all" | "any"): boolean {
+  const done = runIds.map((id) => {
+    const run = findRun(id);
+    return !run || TERMINAL(latestAttempt(run));
+  });
+  return mode === "any" ? done.some(Boolean) : done.every(Boolean);
+}
+
+/** Resolves true when `timeoutMs` elapsed before the runs settled, false once they did. */
+function waitForRuns(runIds: string[], mode: "all" | "any", timeoutMs: number): Promise<boolean> {
   const { promise, resolve } = Promise.withResolvers<boolean>();
-  const onRun = (run: Run) => {
-    if (run.id === runId && TERMINAL(run)) done(false);
+  const onRun = () => {
+    if (isSettled(runIds, mode)) done(false);
   };
   const timer = setTimeout(() => done(true), timeoutMs);
   function done(timedOut: boolean) {
@@ -82,17 +114,35 @@ function waitForTerminal(runId: string, timeoutMs: number): Promise<boolean> {
   }
   scheduler.bus.on("run", onRun);
   // Re-check after subscribing so a transition between the caller's check and the listener is not missed.
-  const current = findRun(runId);
-  if (current && TERMINAL(current)) done(false);
+  onRun();
   return promise;
 }
+
+const clampWaitSeconds = (timeoutSec: number | undefined) => Math.min(110, Math.max(5, timeoutSec ?? 90));
+
+const RunOptions = {
+  backend: z
+    .enum(["mobile-mcp", "artemis"])
+    .optional()
+    .describe(
+      "Driver backend; default mobile-mcp. artemis is optional, Android-only, and only available when the operator configured artemisPath (see qa_doctor)",
+    ),
+  packageId: z.string().max(200).regex(PACKAGE_RE, "must look like com.example.app").optional().describe("App package/bundle id; defaults to the project's package"),
+  model: z.string().max(200).optional().describe("Model for the QA agent, e.g. anthropic/claude-sonnet-4-5; defaults to the suite/persona/config model"),
+  thinking: z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]).optional().describe("Thinking level for the QA agent"),
+};
+
+const SOURCE_HINT =
+  "Pass source.path = your current working directory when you work in a git worktree, so the run records your branch, commit and PR.";
+
+const runUrl = (runId: string) => `http://127.0.0.1:${config.port}/#/runs/${runId}`;
 
 type ToolResult = { content: { type: "text"; text: string }[]; isError?: true };
 
 async function respond(fn: () => unknown | Promise<unknown>): Promise<ToolResult> {
   try {
     const result = await fn();
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    return { content: [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result, null, 2) }] };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { isError: true, content: [{ type: "text", text: message }] };
@@ -100,7 +150,7 @@ async function respond(fn: () => unknown | Promise<unknown>): Promise<ToolResult
 }
 
 function buildServer(): McpServer {
-  const server = new McpServer({ name: "tapocalypse", version: "0.1.0" });
+  const server = new McpServer({ name: "tapocalypse", version: pkg.version });
 
   server.registerTool(
     "qa_list_projects",
@@ -117,7 +167,7 @@ function buildServer(): McpServer {
     {
       title: "Detect project settings",
       description: "Inspect a mobile app repository and suggest project settings. Call this first, then qa_create_project.",
-      inputSchema: z.object({ repoPath: z.string().describe("Absolute path of the app repository") }),
+      inputSchema: z.object({ repoPath: z.string().max(4096).describe("Absolute path of the app repository") }),
     },
     ({ repoPath }) => respond(() => detectProject(repoPath)),
   );
@@ -129,8 +179,8 @@ function buildServer(): McpServer {
       description:
         "Register a mobile app repository for QA runs. Fields you omit are filled from the detection suggestion (see qa_detect_project); if something cannot be inferred you get the list of fields to supply.",
       inputSchema: z.object({
-        id: z.string().optional().describe("Lowercase slug, letters/digits/dashes"),
-        repoPath: z.string().describe("Absolute path of the app repository"),
+        id: z.string().max(64).optional().describe("Lowercase slug, letters/digits/dashes"),
+        repoPath: z.string().max(4096).describe("Absolute path of the app repository"),
         ...ProjectFields,
       }),
     },
@@ -161,8 +211,8 @@ function buildServer(): McpServer {
       title: "Update a QA project",
       description: "Change settings of an existing project. Only the fields you pass are changed; the id cannot change.",
       inputSchema: z.object({
-        id: z.string().describe("Project id from qa_list_projects"),
-        repoPath: z.string().optional(),
+        id: z.string().max(64).describe("Project id from qa_list_projects"),
+        repoPath: z.string().max(4096).optional(),
         ...ProjectFields,
       }),
     },
@@ -175,7 +225,7 @@ function buildServer(): McpServer {
       title: "Delete a QA project",
       description:
         "Remove a project from Tapocalypse. Fails while the project has queued or active runs. The repository and its reports are not touched.",
-      inputSchema: z.object({ id: z.string().describe("Project id from qa_list_projects") }),
+      inputSchema: z.object({ id: z.string().max(64).describe("Project id from qa_list_projects") }),
     },
     ({ id }) =>
       respond(() => {
@@ -209,24 +259,18 @@ function buildServer(): McpServer {
     {
       title: "Start a QA run",
       description:
-        "Queue an agent-driven mobile QA run. Returns immediately with the run id; poll with qa_wait_run. Omit serial to let Tapocalypse pick or boot an emulator/simulator for the platform.",
+        "Queue an agent-driven mobile QA run. Returns immediately with the run id; poll with qa_wait_run. Omit serial to let Tapocalypse pick or boot an emulator/simulator for the platform. Give either a brief, or a suiteId (see qa_list_suites) whose body becomes the brief.",
       inputSchema: z.object({
-        projectId: z.string().describe("Project id from qa_list_projects"),
-        title: z.string().describe("Short run title"),
-        brief: z.string().describe("What the QA agent should test, in free text"),
+        projectId: z.string().max(64).describe("Project id from qa_list_projects"),
+        title: z.string().max(200).optional().describe("Short run title (max 200 chars); defaults to the suite title"),
+        brief: z.string().max(20_000).optional().describe("What the QA agent should test, in free text (max 20000 chars)"),
+        suiteId: z.string().max(64).optional().describe("Saved suite id from qa_list_suites; supplies brief, check ids and model"),
+        ...RunOptions,
         platform: z.enum(["android", "ios"]).optional().describe("Defaults to the project's default platform"),
-        serial: z.string().optional().describe("Specific device serial/udid from qa_list_devices"),
-        backend: z
-          .enum(["mobile-mcp", "artemis"])
-          .optional()
-          .describe(
-            "Driver backend; default mobile-mcp. artemis is optional, Android-only, and only available when the operator configured artemisPath (see qa_doctor)",
-          ),
-        packageId: z.string().optional().describe("App package/bundle id; defaults to the project's package"),
-        requester: z.string().optional().describe("Who is asking; shown in the UI"),
-        source: SourceInput.optional().describe(
-          "Pass source.path = your current working directory when you work in a git worktree, so the run records your branch, commit and PR.",
-        ),
+        serial: z.string().max(200).optional().describe("Specific phone/tablet serial/udid from qa_list_devices"),
+        install: z.string().max(4096).optional().describe("Absolute path of an .apk (android) or .app/.ipa (ios) to install before the run"),
+        requester: z.string().max(200).optional().describe("Who is asking; shown in the UI"),
+        source: SourceInput.optional().describe(SOURCE_HINT),
       }),
     },
     (args) =>
@@ -235,9 +279,13 @@ function buildServer(): McpServer {
           projectId: args.projectId,
           title: args.title,
           brief: args.brief,
+          suiteId: args.suiteId,
           device: { platform: args.platform, serial: args.serial },
           backend: args.backend,
           packageId: args.packageId,
+          model: args.model,
+          thinking: args.thinking,
+          install: args.install ? { path: args.install } : undefined,
           source: args.source,
           requestedBy: args.requester ?? "mcp",
         });
@@ -245,9 +293,133 @@ function buildServer(): McpServer {
           runId: run.id,
           status: run.status,
           queuePosition: scheduler.queuePosition(run.id),
-          url: `http://127.0.0.1:${config.port}/#/runs/${run.id}`,
+          url: runUrl(run.id),
           source: run.source,
         };
+      }),
+  );
+
+  server.registerTool(
+    "qa_start_batch",
+    {
+      title: "Start a batch of QA runs",
+      description:
+        "Queue the same brief (or suite) on several devices at once, one run per entry of devices (1-8). Runs go through the normal queue, so they start as devices free up. Poll with qa_wait_runs {batchId}.",
+      inputSchema: z.object({
+        projectId: z.string().max(64).describe("Project id from qa_list_projects"),
+        title: z.string().max(200).optional().describe("Batch title; each run gets a device suffix"),
+        brief: z.string().max(20_000).optional(),
+        suiteId: z.string().max(64).optional(),
+        devices: z
+          .array(z.object({ platform: z.enum(["android", "ios"]).optional(), serial: z.string().max(200).optional() }))
+          .min(1)
+          .max(8)
+          .describe("One entry per run: a specific serial, or just a platform to let Tapocalypse pick or boot a device"),
+        ...RunOptions,
+        install: z.string().max(4096).optional().describe("Absolute path of an .apk/.app/.ipa to install before each run"),
+        requester: z.string().max(200).optional(),
+        source: SourceInput.optional().describe(SOURCE_HINT),
+      }),
+    },
+    (args) =>
+      respond(async () => {
+        const { batchId, runs } = await scheduler.enqueueBatch({
+          projectId: args.projectId,
+          title: args.title,
+          brief: args.brief,
+          suiteId: args.suiteId,
+          devices: args.devices,
+          backend: args.backend,
+          packageId: args.packageId,
+          model: args.model,
+          thinking: args.thinking,
+          install: args.install ? { path: args.install } : undefined,
+          source: args.source,
+          requestedBy: args.requester ?? "mcp",
+        });
+        return {
+          batchId,
+          url: `http://127.0.0.1:${config.port}/#/batches/${batchId}`,
+          runs: runs.map((r) => ({
+            runId: r.id,
+            title: r.title,
+            status: r.status,
+            queuePosition: scheduler.queuePosition(r.id),
+            url: runUrl(r.id),
+          })),
+        };
+      }),
+  );
+
+  server.registerTool(
+    "qa_rerun",
+    {
+      title: "Re-run a finished run",
+      description:
+        "Queue a new run from a finished one. only=failed re-tests just the checks that did not pass or skip (with their previous status and note); only=all repeats the whole brief. Same project, backend, package, model and source.",
+      inputSchema: z.object({
+        runId: z.string(),
+        only: z.enum(["failed", "all"]),
+        platform: z.enum(["android", "ios"]).optional().describe("Override the device platform"),
+        serial: z.string().max(200).optional().describe("Override the device"),
+        requester: z.string().max(200).optional(),
+      }),
+    },
+    ({ runId, only, platform, serial, requester }) =>
+      respond(async () => {
+        requireRun(runId);
+        const device = platform || serial ? { platform, serial } : undefined;
+        const run = await scheduler.rerun(runId, { only, device, requestedBy: requester ?? "mcp" });
+        return { runId: run.id, status: run.status, queuePosition: scheduler.queuePosition(run.id), url: runUrl(run.id) };
+      }),
+  );
+
+  server.registerTool(
+    "qa_steer_run",
+    {
+      title: "Send a message to a running QA agent",
+      description: "Steer a run that is currently running (not queued or finished) with an extra instruction.",
+      inputSchema: z.object({ runId: z.string().max(200), message: z.string().max(MAX_STEER_CHARS) }),
+    },
+    ({ runId, message }) =>
+      respond(async () => {
+        requireRun(runId);
+        if (!message.trim()) throw new HttpError(400, "message is required");
+        await runner.steerRun(runId, message.trim());
+        return { ok: true };
+      }),
+  );
+
+  server.registerTool(
+    "qa_get_report",
+    {
+      title: "Read a run's report",
+      description: "The markdown QA report the agent wrote for a finished run. Errors when the run has no report.",
+      inputSchema: z.object({ runId: z.string() }),
+    },
+    ({ runId }) =>
+      respond(() => {
+        const run = requireRun(runId);
+        const project = getProject(run.projectId);
+        const file = project && run.reportPath ? resolveUnder(project.repoPath, run.reportPath) : null;
+        if (!file || !existsSync(file)) throw new HttpError(404, `run ${runId} has no report`);
+        return readFileSync(file, "utf8");
+      }),
+  );
+
+  server.registerTool(
+    "qa_list_suites",
+    {
+      title: "List saved suites",
+      description:
+        "Saved test suites of a project (reusable briefs with fixed check ids, stored in <repo>/.tapocalypse/suites). Pass an id as suiteId to qa_start_run / qa_start_batch.",
+      inputSchema: z.object({ projectId: z.string() }),
+    },
+    ({ projectId }) =>
+      respond(() => {
+        const project = getProject(projectId);
+        if (!project) throw new HttpError(404, `unknown project ${projectId}`);
+        return listSuites(project);
       }),
   );
 
@@ -266,15 +438,50 @@ function buildServer(): McpServer {
     {
       title: "Wait for a run",
       description:
-        "Block until the run reaches a terminal status or timeoutSec elapses (default 90, clamped 5..110). Check timedOut and call again if the run is still active.",
+        "Block until the run reaches a terminal status or timeoutSec elapses (default 90, clamped 5..110). Check timedOut and call again if the run is still active. A run that failed on infrastructure and was automatically retried is followed to its newest attempt (see runId / attempt in the result).",
       inputSchema: z.object({ runId: z.string(), timeoutSec: z.number().optional() }),
     },
     ({ runId, timeoutSec }) =>
       respond(async () => {
-        const run = requireRun(runId);
-        const seconds = Math.min(110, Math.max(5, timeoutSec ?? 90));
-        const timedOut = TERMINAL(run) ? false : await waitForTerminal(runId, seconds * 1000);
-        return { ...runSummary(requireRun(runId)), timedOut };
+        requireRun(runId);
+        const timedOut = isSettled([runId], "all") ? false : await waitForRuns([runId], "all", clampWaitSeconds(timeoutSec) * 1000);
+        return { ...runSummary(latestAttempt(requireRun(runId))), timedOut };
+      }),
+  );
+
+  server.registerTool(
+    "qa_wait_runs",
+    {
+      title: "Wait for several runs",
+      description:
+        "Block until all (mode=all, default) or any (mode=any) of the given runs or batch reach a terminal status, or timeoutSec elapses (default 90, clamped 5..110). Returns every run's summary; call again while timedOut is true.",
+      inputSchema: z.object({
+        runIds: z.array(z.string()).optional(),
+        batchId: z.string().optional(),
+        mode: z.enum(["all", "any"]).optional(),
+        timeoutSec: z.number().optional(),
+      }),
+    },
+    ({ runIds, batchId, mode, timeoutSec }) =>
+      respond(async () => {
+        const ids = new Set(runIds ?? []);
+        if (batchId) {
+          const batch = batchView(batchId);
+          if (!batch) throw new HttpError(404, `unknown batch ${batchId}`);
+          for (const r of batch.runs) ids.add(r.id);
+        }
+        if (ids.size === 0) throw new HttpError(400, "runIds or batchId is required");
+        for (const id of ids) requireRun(id);
+        const list = [...ids];
+        const waitMode = mode ?? "all";
+        const timedOut = isSettled(list, waitMode) ? false : await waitForRuns(list, waitMode, clampWaitSeconds(timeoutSec) * 1000);
+        const latest = new Map(list.map((id) => latestAttempt(requireRun(id))).map((r) => [r.id, r] as const));
+        const batch = batchId ? batchView(batchId) : null;
+        return {
+          timedOut,
+          batch: batch && { id: batch.id, status: batch.status, verdict: batch.verdict, cost: batch.cost },
+          runs: [...latest.values()].map(runSummary),
+        };
       }),
   );
 
@@ -324,8 +531,38 @@ function buildServer(): McpServer {
   return server;
 }
 
+export interface McpStatus {
+  url: string;
+  lastCallAt: string | null;
+  lastTool: string | null;
+  lastRequester: string | null;
+}
+
+const status: McpStatus = { url: `http://127.0.0.1:${config.port}/mcp`, lastCallAt: null, lastTool: null, lastRequester: null };
+
+export const mcpStatus = (): McpStatus => ({ ...status });
+
+/** Records the newest `tools/call` in the request (it may be a JSON-RPC batch) for the Setup page's live status. */
+async function recordToolCalls(req: Request): Promise<void> {
+  let body: unknown;
+  try {
+    body = await req.clone().json();
+  } catch {
+    return;
+  }
+  for (const message of Array.isArray(body) ? body : [body]) {
+    const m = message as { method?: unknown; params?: { name?: unknown; arguments?: { requester?: unknown } } } | null;
+    if (m?.method !== "tools/call" || typeof m.params?.name !== "string") continue;
+    const requester = m.params.arguments?.requester;
+    status.lastCallAt = new Date().toISOString();
+    status.lastTool = m.params.name;
+    status.lastRequester = typeof requester === "string" && requester ? requester : null;
+  }
+}
+
 /** Stateless: a fresh server + transport per request keeps parallel agent clients independent. */
 export async function handleMcp(req: Request): Promise<Response> {
+  await recordToolCalls(req);
   const server = buildServer();
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,

@@ -14,6 +14,9 @@ export type Verdict = "PASS" | "FAIL" | "PASS WITH ISSUES" | "BLOCKED" | "PARTIA
 export const VERDICTS: Verdict[] = ["PASS", "FAIL", "PASS WITH ISSUES", "BLOCKED", "PARTIAL"];
 export type CheckStatus = "pending" | "running" | "pass" | "fail" | "blocked" | "skipped";
 
+export type ErrorKind = "infra" | "agent" | "timeout" | "cancelled";
+export type VerdictSource = "agent" | "derived";
+
 export interface Check {
   id: string;
   title: string;
@@ -22,6 +25,26 @@ export interface Check {
   /** Relative to the project repoPath. */
   screenshot?: string;
   updatedAt: string;
+  /** First time the check reported "running". */
+  startedAt?: string;
+  /** First time the check reached a terminal status. */
+  endedAt?: string;
+}
+
+/** Normalized from omp `get_session_stats`; null `cost` when the provider reports none. */
+export interface RunUsage {
+  cost: number | null;
+  tokensIn: number;
+  tokensOut: number;
+  cacheRead: number;
+  cacheWrite: number;
+  toolCalls: number;
+  model: string | null;
+}
+
+/** App binary to install on the assigned device before the run: absolute .apk (android) or .app/.ipa (ios simulator). */
+export interface InstallRequest {
+  path: string;
 }
 
 export interface DeviceRequest {
@@ -76,6 +99,8 @@ export interface Run {
   requestedBy: string;
   deviceRequest: DeviceRequest;
   deviceSerial: string | null;
+  /** Friendly name of the assigned device (`Device.name`), kept after the device is gone. Set at preflight. */
+  deviceName: string | null;
   /** The id mobile-mcp tools must be given for the assigned device (AVD name for emulators, UDID for simulators, serial otherwise). Set at preflight for the mobile-mcp backend. */
   deviceLabel?: string | null;
   bootedByRun: boolean;
@@ -95,10 +120,41 @@ export interface Run {
   transcriptHtml: boolean;
   source: RunSource | null;
   build: BuildInfo | null;
+  batchId: string | null;
+  suiteId: string | null;
+  /** Id/title pairs the agent must use in qa_plan (set from the suite). */
+  suiteChecks: { id: string; title: string }[] | null;
+  /** Model actually passed to omp (run > suite > persona > config). */
+  model: string | null;
+  thinking: string | null;
+  errorKind: ErrorKind | null;
+  verdictSource: VerdictSource | null;
+  usage: RunUsage | null;
+  attempt: number;
+  /** Previous attempt's id (infra auto-retry). */
+  retryOf: string | null;
+  /** Next attempt's id. */
+  retriedBy: string | null;
+  /** Run this one was re-run from. */
+  rerunOf: string | null;
+  install: InstallRequest | null;
 }
 
 export interface Activity {
   ts: string;
-  kind: "tool" | "say" | "warn" | "info" | "user" | "error";
+  /** 0-based line index of the source frame in events.jsonl; cursor for pagination. */
+  seq: number;
+  kind: "tool" | "tool_end" | "say" | "warn" | "info" | "user" | "error" | "check";
+  /** Human one-liner. */
   text: string;
+  /** Tool call id; pairs `tool` with `tool_end`. */
+  callId?: string;
+  /** Resolved tool name (an xd:// write is attributed to the MCP tool it calls). */
+  tool?: string;
+  /** Tool arguments; JSON truncated to 2 KB (a string once truncated). */
+  args?: unknown;
+  ok?: boolean;
+  durationMs?: number;
+  checkId?: string;
+  checkStatus?: CheckStatus;
 }

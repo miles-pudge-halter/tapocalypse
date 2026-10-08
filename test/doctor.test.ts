@@ -138,3 +138,55 @@ describe("artemis status", () => {
     expect(artemisAvailable(file)).toBe(false);
   });
 });
+
+describe("omp sign-in", () => {
+  const models = (list: unknown[]): Responder => (cmd) => (cmd[1] === "models" ? { code: 0, text: JSON.stringify({ models: list }) } : undefined);
+
+  test("signed in: at least one model listed", async () => {
+    const { checks } = await buildReport(envWith({ run: fakeRun([], models([{ id: "m" }, { id: "n" }])) }));
+    const auth = byId(checks, "omp-auth");
+    expect(auth.status).toBe("ok");
+    expect(auth.required).toBe(true);
+  });
+
+  test("not signed in: an empty model list warns with `omp login`", async () => {
+    const { checks } = await buildReport(envWith({ run: fakeRun([], models([])) }));
+    const auth = byId(checks, "omp-auth");
+    expect(auth.status).toBe("warn");
+    expect(auth.fix).toContain("omp login");
+  });
+
+  test("a failing or garbled `omp models` warns instead of throwing", async () => {
+    const failing = await buildReport(envWith({ run: fakeRun([], (cmd) => (cmd[1] === "models" ? { code: 1, stderr: "boom" } : undefined)) }));
+    expect(byId(failing.checks, "omp-auth").status).toBe("warn");
+    expect(byId(failing.checks, "omp-auth").detail).toContain("boom");
+    const garbled = await buildReport(envWith({ run: fakeRun([], (cmd) => (cmd[1] === "models" ? { code: 0, text: "not json" } : undefined)) }));
+    expect(byId(garbled.checks, "omp-auth").status).toBe("warn");
+  });
+
+  test("is skipped when omp itself is missing, and never shells out to omp then", async () => {
+    const calls: string[][] = [];
+    const base = fakeRun([MISSING]);
+    const run: DoctorEnv["run"] = (cmd) => {
+      calls.push(cmd);
+      return base(cmd);
+    };
+    const { checks } = await buildReport(envWith({ ompBin: MISSING, run }));
+    expect(byId(checks, "omp-auth").status).toBe("skip");
+    expect(calls.some((c) => c[1] === "models")).toBe(false);
+  });
+});
+
+describe("operating system", () => {
+  test.each([
+    ["darwin", "ok"],
+    ["linux", "ok"],
+    ["win32", "error"],
+    ["freebsd", "warn"],
+  ] as const)("%s → %s", async (platform, status) => {
+    const { checks } = await buildReport(envWith({ platform: platform as NodeJS.Platform }));
+    const os = byId(checks, "os");
+    expect(os.status).toBe(status);
+    expect(os.required).toBe(true);
+  });
+});

@@ -25,5 +25,9 @@ if (blockers.length > 0) {
   console.log(paint("31", `${blockers.length} required check(s) failed: ${blockers.map((c) => c.id).join(", ")}`));
   process.exit(1);
 }
+const needsAttention = checks.filter((c) => c.required && c.status === "warn");
+if (needsAttention.length > 0) {
+  console.log(paint("33", `Required but unconfirmed: ${needsAttention.map((c) => c.id).join(", ")} — Tapocalypse may not be able to start runs.`));
+}
 const warnings = checks.filter((c) => c.status === "warn").length;
 console.log(paint("32", warnings > 0 ? `Ready, with ${warnings} warning(s).` : "All checks passed."));
