@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { AppSidebar } from "@/components/app-sidebar";
+import { Lockup } from "@/components/brand";
 import { CommandPalette } from "@/components/command-palette";
 import { NewRunSheet } from "@/components/new-run-sheet";
 import { Notifications } from "@/components/notifications";
@@ -84,9 +85,9 @@ export function App() {
       >
         <AppSidebar />
         <SidebarInset className="min-w-0">
-          <header className="sticky top-0 z-30 flex h-12 items-center gap-2 border-b bg-background/80 px-3 backdrop-blur md:hidden">
+          <header className="sticky top-0 z-30 flex h-12 items-center gap-2 border-b bg-background/80 px-3 backdrop-blur after:absolute after:inset-x-0 after:-bottom-px after:h-px after:bg-(image:--brand-thunder) after:opacity-70 md:hidden">
             <SidebarTrigger />
-            <span className="text-sm font-semibold tracking-tight">Tapocalypse</span>
+            <Lockup size="sm" />
           </header>
           <main className="w-full max-w-none px-4 py-6 sm:px-6">
             <View />

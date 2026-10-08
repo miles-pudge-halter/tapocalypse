@@ -29,12 +29,12 @@ const STYLES: Record<RunStatus, { badge: string; dot: string }> = {
     dot: "bg-red-500",
   },
   cancelled: {
-    badge: "border-zinc-500/30 bg-zinc-500/10 text-zinc-700 dark:text-zinc-300",
-    dot: "bg-zinc-500",
+    badge: "border-stone-500/30 bg-stone-500/10 text-stone-700 dark:text-stone-300",
+    dot: "bg-stone-500",
   },
   interrupted: {
-    badge: "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300",
-    dot: "bg-amber-500",
+    badge: "border-orange-500/30 bg-orange-500/10 text-orange-800 dark:text-orange-300",
+    dot: "bg-orange-400",
   },
 };
 

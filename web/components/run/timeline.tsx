@@ -214,7 +214,7 @@ export function Timeline({
             <Button
               variant={filter === "warnings" ? "secondary" : "ghost"}
               size="xs"
-              className="text-amber-600 dark:text-amber-400"
+              className="text-orange-700 dark:text-orange-400"
               aria-pressed={filter === "warnings"}
               title="Warnings — click to filter"
               onClick={() => toggleFilter("warnings")}

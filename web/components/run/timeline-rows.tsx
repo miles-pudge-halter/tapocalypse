@@ -36,7 +36,7 @@ const FAMILY_ICON: Record<ToolFamily, LucideIcon> = {
 
 const FAMILY_TONE: Record<ToolFamily, string> = {
   device: "text-blue-600 dark:text-blue-400",
-  shell: "text-zinc-600 dark:text-zinc-400",
+  shell: "text-stone-600 dark:text-stone-400",
   code: "text-violet-600 dark:text-violet-400",
   file: "text-teal-600 dark:text-teal-400",
   check: "text-emerald-600 dark:text-emerald-400",
@@ -116,7 +116,7 @@ function ToolLine({ row, mode, startTs, live }: { row: ToolRow; mode: TimeMode; 
 }
 
 const NOTE_STYLE: Record<string, { icon: LucideIcon; row: string; label: string }> = {
-  warn: { icon: TriangleAlert, row: "bg-amber-500/10 text-amber-800 dark:text-amber-200", label: "warning" },
+  warn: { icon: TriangleAlert, row: "bg-orange-500/10 text-orange-800 dark:text-orange-200", label: "warning" },
   error: { icon: CircleX, row: "bg-red-500/10 text-red-800 dark:text-red-200", label: "error" },
   info: { icon: Info, row: "text-muted-foreground", label: "info" },
   user: { icon: User, row: "bg-violet-500/10 text-violet-900 dark:text-violet-100", label: "you" },

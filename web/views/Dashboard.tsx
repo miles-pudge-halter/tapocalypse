@@ -1,5 +1,6 @@
-import { AlertCircle, ChevronDown, FolderOpen, Inbox, Loader2, Plus, Search, SearchX, X } from "lucide-react";
+import { AlertCircle, ChevronDown, Inbox, Loader2, Plus, Search, SearchX, X } from "lucide-react";
 import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
+import { Lockup } from "@/components/brand";
 import { BatchRow, RunActions, RunRow } from "@/components/run-row";
 import { RunStatusIcon } from "@/components/run-status-icon";
 import { SegmentedProgress } from "@/components/segmented-progress";
@@ -54,16 +55,16 @@ const STATUS_DOT: Record<RunStatus, string> = {
   finishing: "bg-violet-500",
   done: "bg-emerald-500",
   error: "bg-red-500",
-  cancelled: "bg-zinc-500",
-  interrupted: "bg-amber-500",
+  cancelled: "bg-stone-500",
+  interrupted: "bg-orange-400",
 };
 
 const VERDICT_DOT: Record<Verdict, string> = {
   PASS: "bg-emerald-500",
-  "PASS WITH ISSUES": "bg-amber-500",
+  "PASS WITH ISSUES": "bg-orange-400",
   FAIL: "bg-red-500",
   BLOCKED: "bg-rose-800",
-  PARTIAL: "bg-amber-500/40 ring-1 ring-amber-500",
+  PARTIAL: "bg-orange-400/40 ring-1 ring-orange-400",
 };
 
 type Item = { kind: "run"; run: RunView } | { kind: "batch"; id: string; runs: RunView[] };
@@ -208,7 +209,7 @@ export function Dashboard() {
         <SetupBanner />
         {header}
         <EmptyState
-          icon={FolderOpen}
+          media={<Lockup size="lg" />}
           title="Add your first project"
           description="A project tells Tapocalypse where your app's repository lives. Point it at a folder and it detects the framework, package name and QA persona for you."
           action={
@@ -578,7 +579,7 @@ function MultiFilter<T extends string>({
   return (
     <Popover>
       <PopoverTrigger asChild>
-        <Button variant="outline" size="sm" className={cn("h-8", selected.length > 0 && "border-primary/50")}>
+        <Button variant="outline" size="sm" className={cn("h-8", selected.length > 0 && "border-ring/60")}>
           {label}
           {selected.length > 0 && (
             <span className="rounded-full bg-primary px-1.5 text-[10px] font-semibold leading-4 text-primary-foreground">{selected.length}</span>
@@ -608,7 +609,7 @@ function VerdictStack({ runs }: { runs: RunView[] }) {
   return (
     <span className="flex items-center gap-2 tabular-nums">
       {pass > 0 && <span className="text-emerald-600 dark:text-emerald-400">{pass} ✓</span>}
-      {issues > 0 && <span className="text-amber-600 dark:text-amber-400">{issues} ⚠</span>}
+      {issues > 0 && <span className="text-orange-700 dark:text-orange-400">{issues} ⚠</span>}
       {fail > 0 && <span className="text-red-600 dark:text-red-400">{fail} ✗</span>}
       {other > 0 && <span>{other} ⊘</span>}
     </span>

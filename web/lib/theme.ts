@@ -14,9 +14,16 @@ function readTheme(): Theme {
 
 let current: Theme = readTheme();
 
+const THEME_COLOR = { light: "#FBF8F3", dark: "#0F0B07" } as const;
+
 function apply(): void {
   const dark = current === "dark" || (current === "system" && media.matches);
   document.documentElement.classList.toggle("dark", dark);
+  // Keep the browser chrome tint in step with a forced theme; in "system" each meta keeps the value for its own media.
+  for (const meta of document.querySelectorAll<HTMLMetaElement>('meta[name="theme-color"]')) {
+    const own = meta.media.includes("dark") ? "dark" : "light";
+    meta.content = THEME_COLOR[current === "system" ? own : current];
+  }
 }
 
 apply();

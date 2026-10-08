@@ -18,7 +18,7 @@ const FILM_BORDER: Record<CheckStatus, string> = {
   pass: "border-t-emerald-500",
   fail: "border-t-red-500",
   blocked: "border-t-rose-800 dark:border-t-rose-500",
-  skipped: "border-t-zinc-400",
+  skipped: "border-t-stone-400",
   running: "border-t-blue-500",
   pending: "border-t-transparent",
 };
@@ -31,7 +31,7 @@ function Freshness({ updatedAt, failed, latencyMs }: { updatedAt: number | null;
   const tone = lost
     ? "border-red-500/40 bg-red-500/10 text-red-700 dark:text-red-300"
     : stale
-      ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+      ? "border-orange-500/40 bg-orange-500/10 text-orange-800 dark:text-orange-300"
       : "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300";
   return (
     <span
@@ -197,7 +197,7 @@ export function DevicePane({
                   className={cn(
                     "relative h-12 shrink-0 overflow-hidden rounded border border-t-2 outline-none hover:opacity-80 focus-visible:ring-2 focus-visible:ring-ring",
                     FILM_BORDER[status],
-                    still?.key === item.key && "ring-2 ring-primary",
+                    still?.key === item.key && "ring-2 ring-ring",
                   )}
                 >
                   <img src={item.url} alt="" loading="lazy" className="h-full w-auto object-cover" />

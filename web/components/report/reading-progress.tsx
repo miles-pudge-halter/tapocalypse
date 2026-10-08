@@ -20,7 +20,7 @@ export function ReadingProgress({ anchor, resetKey }: { anchor: RefObject<HTMLEl
       aria-valuenow={Math.round(progress * 100)}
       className="pointer-events-none fixed inset-x-0 top-0 z-50 h-0.5"
     >
-      <div className="h-full origin-left bg-primary" style={{ transform: `scaleX(${progress})` }} />
+      <div className="h-full origin-left bg-(image:--brand-thunder)" style={{ transform: `scaleX(${progress})` }} />
     </div>
   );
 }

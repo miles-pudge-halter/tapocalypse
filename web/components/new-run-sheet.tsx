@@ -643,7 +643,7 @@ function StartFrom({
   onRecent(r: { id: string; title: string; brief: string }): void;
 }) {
   const is = (kind: Source["kind"], id?: string) => source?.kind === kind && (id === undefined || ("id" in source && source.id === id));
-  const chip = (active: boolean) => cn("h-7 max-w-52 gap-1.5 px-2 text-xs font-normal", active && "border-primary bg-accent");
+  const chip = (active: boolean) => cn("h-7 max-w-52 gap-1.5 px-2 text-xs font-normal", active && "border-ring bg-accent");
   return (
     <div className="space-y-2">
       <Label>Start from</Label>
@@ -680,7 +680,7 @@ function DeviceChip({ children, tone }: { children: string; tone?: "busy" | "fre
       className={cn(
         "rounded border px-1 py-px text-[10px] leading-none",
         tone === "free" && "border-emerald-500/30 text-emerald-700 dark:text-emerald-400",
-        tone === "busy" && "border-amber-500/30 text-amber-700 dark:text-amber-400",
+        tone === "busy" && "border-orange-500/30 text-orange-700 dark:text-orange-400",
         !tone && "text-muted-foreground",
       )}
     >
@@ -880,7 +880,7 @@ function BackendOption({ value, title, description, disabled }: { value: Backend
     <Label
       htmlFor={id}
       className={cn(
-        "flex items-start gap-3 rounded-lg border p-3 has-[[data-state=checked]]:border-primary has-[[data-state=checked]]:bg-accent",
+        "flex items-start gap-3 rounded-lg border p-3 has-[[data-state=checked]]:border-ring has-[[data-state=checked]]:bg-accent",
         disabled ? "cursor-not-allowed opacity-50" : "cursor-pointer",
       )}
     >

@@ -292,11 +292,11 @@ function dotClass(run: RunView): string {
     case "FAIL":
       return "bg-red-500";
     case "PASS WITH ISSUES":
-      return "bg-amber-500";
+      return "bg-orange-400";
     case "BLOCKED":
       return "bg-rose-800 dark:bg-rose-700";
     case "PARTIAL":
-      return "border-2 border-amber-500 bg-transparent";
+      return "border-2 border-orange-400 bg-transparent";
     case null:
       break;
   }
@@ -304,7 +304,7 @@ function dotClass(run: RunView): string {
     return "animate-pulse bg-blue-500";
   }
   if (run.status === "error") return "border-2 border-red-500/60 bg-transparent";
-  return "bg-zinc-400 dark:bg-zinc-600";
+  return "bg-stone-400 dark:bg-stone-600";
 }
 
 function VerdictStrip({ runs }: { runs: RunView[] }) {
@@ -484,7 +484,7 @@ function ProjectCard({
         </div>
 
         {!ok && (
-          <ul className="space-y-1 rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-sm text-amber-800 dark:text-amber-300">
+          <ul className="space-y-1 rounded-md border border-orange-500/30 bg-orange-500/5 p-3 text-sm text-orange-800 dark:text-orange-300">
             {project.problems.map((problem) => (
               <li key={problem} className="flex items-start gap-2">
                 <TriangleAlert className="mt-0.5 size-3.5 shrink-0" />
@@ -1432,7 +1432,7 @@ function DetectionSummary({ detection }: { detection: Detection }) {
 
 function DetectedTag() {
   return (
-    <span className="inline-flex shrink-0 items-center gap-1 rounded border border-primary/30 bg-primary/10 px-1.5 py-px text-[10px] font-medium leading-none text-primary">
+    <span className="inline-flex shrink-0 items-center gap-1 rounded border border-primary/40 bg-primary/15 px-1.5 py-px text-[10px] font-medium leading-none text-foreground dark:text-primary">
       <Sparkles className="size-2.5" />
       detected
     </span>
@@ -1496,7 +1496,7 @@ function ChoiceCard({
   return (
     <Label
       htmlFor={id}
-      className="flex cursor-pointer items-start gap-3 rounded-lg border p-3 has-[[data-state=checked]]:border-primary has-[[data-state=checked]]:bg-accent"
+      className="flex cursor-pointer items-start gap-3 rounded-lg border p-3 has-[[data-state=checked]]:border-ring has-[[data-state=checked]]:bg-accent"
     >
       <RadioGroupItem id={id} value={value} className="mt-0.5" />
       <span className="min-w-0 flex-1 space-y-0.5">

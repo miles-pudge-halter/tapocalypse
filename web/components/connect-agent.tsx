@@ -38,12 +38,12 @@ function McpLiveStatus() {
         "inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs",
         connected
           ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-          : "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+          : "border-orange-500/30 bg-orange-500/10 text-orange-800 dark:text-orange-300",
       )}
     >
       <span className="relative flex size-2">
-        {!connected && <span className="absolute inline-flex size-full animate-ping rounded-full bg-amber-500 opacity-60" />}
-        <span className={cn("relative inline-flex size-2 rounded-full", connected ? "bg-emerald-500" : "bg-amber-500")} />
+        {!connected && <span className="absolute inline-flex size-full animate-ping rounded-full bg-orange-400 opacity-60" />}
+        <span className={cn("relative inline-flex size-2 rounded-full", connected ? "bg-emerald-500" : "bg-orange-400")} />
       </span>
       {connected && status?.lastCallAt ? (
         <span>

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import {
   AlertOctagon,
   AlertTriangle,
@@ -27,10 +27,10 @@ const SUMMARY_CLAMP_CHARS = 280;
 
 const VERDICT_STYLE: Record<Verdict, { icon: LucideIcon; className: string }> = {
   PASS: { icon: CheckCircle2, className: "border-emerald-500/40 bg-emerald-500/5 text-emerald-700 dark:text-emerald-300" },
-  "PASS WITH ISSUES": { icon: AlertTriangle, className: "border-amber-500/40 bg-amber-500/5 text-amber-700 dark:text-amber-300" },
+  "PASS WITH ISSUES": { icon: AlertTriangle, className: "border-orange-500/40 bg-orange-500/5 text-orange-700 dark:text-orange-300" },
   FAIL: { icon: XCircle, className: "border-red-500/40 bg-red-500/5 text-red-700 dark:text-red-300" },
   BLOCKED: { icon: Octagon, className: "border-rose-700/50 bg-rose-700/5 text-rose-800 dark:text-rose-300" },
-  PARTIAL: { icon: AlertTriangle, className: "border-amber-500/40 bg-transparent text-amber-700 dark:text-amber-300" },
+  PARTIAL: { icon: AlertTriangle, className: "border-orange-500/40 bg-transparent text-orange-700 dark:text-orange-300" },
 };
 
 interface Problem {
@@ -46,7 +46,7 @@ function describeProblem(run: RunView, resolved: number): Problem | null {
   if (run.status === "interrupted") {
     return {
       icon: Power,
-      className: "border-amber-500/40 bg-amber-500/5 text-amber-700 dark:text-amber-300",
+      className: "border-orange-500/40 bg-orange-500/5 text-orange-700 dark:text-orange-300",
       title: "Tapocalypse restarted while this run was active",
       explanation: "The agent session was lost with it, so nothing more will be recorded for this run.",
       showStderr: true,
@@ -59,7 +59,7 @@ function describeProblem(run: RunView, resolved: number): Problem | null {
     case "cancelled":
       return {
         icon: Ban,
-        className: "border-zinc-500/40 bg-zinc-500/5 text-zinc-700 dark:text-zinc-300",
+        className: "border-stone-500/40 bg-stone-500/5 text-stone-700 dark:text-stone-300",
         title: "Run cancelled",
         explanation: "The run was stopped before it finished. Checks already resolved are kept below.",
         showStderr: false,
@@ -77,7 +77,7 @@ function describeProblem(run: RunView, resolved: number): Problem | null {
     case "timeout":
       return {
         icon: AlertOctagon,
-        className: "border-amber-500/40 bg-amber-500/5 text-amber-700 dark:text-amber-300",
+        className: "border-orange-500/40 bg-orange-500/5 text-orange-700 dark:text-orange-300",
         title: "The run hit its time budget",
         explanation: "The agent was still testing when time ran out, so the report may be missing or incomplete.",
         showStderr: true,
@@ -145,7 +145,7 @@ function StderrTail({ runId }: { runId: string }) {
   );
 }
 
-function VerdictCallout({ run }: { run: RunView }) {
+function VerdictCallout({ run, strike }: { run: RunView; strike: boolean }) {
   const [expanded, setExpanded] = useState(false);
   if (!run.verdict) return null;
   const style = VERDICT_STYLE[run.verdict];
@@ -162,7 +162,7 @@ function VerdictCallout({ run }: { run: RunView }) {
   const long = summary.length > SUMMARY_CLAMP_CHARS || summary.split("\n").length > 4;
 
   return (
-    <Alert className={style.className}>
+    <Alert className={cn(style.className, strike && "motion-safe:animate-verdict-strike")}>
       <Icon />
       <AlertTitle className="font-semibold">
         {run.verdict}
@@ -188,6 +188,9 @@ function VerdictCallout({ run }: { run: RunView }) {
  * a plain-language explanation of the cause with the stderr tail and the next step.
  */
 export function OutcomeCallout({ run, actions }: { run: RunView; actions: RunActions }) {
+  // The verdict flashes once, only when the run finished while this view was open; an already-finished run never does.
+  const sawActive = useRef(isActive(run.status));
+  if (isActive(run.status)) sawActive.current = true;
   if (isActive(run.status)) return null;
   const resolved = run.checks.filter((c) => c.status !== "pending" && c.status !== "running").length;
   const problem = describeProblem(run, resolved);
@@ -195,7 +198,7 @@ export function OutcomeCallout({ run, actions }: { run: RunView; actions: RunAct
 
   return (
     <div className="space-y-2">
-      <VerdictCallout run={run} />
+      <VerdictCallout run={run} strike={sawActive.current && run.verdict !== null} />
       {problem ? (
         <Alert className={problem.className}>
           <problem.icon />

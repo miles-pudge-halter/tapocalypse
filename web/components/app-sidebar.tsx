@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { useEffect } from "react";
 import pkg from "../../package.json";
+import { LogoMark, Wordmark } from "@/components/brand";
 import { openCommandPalette } from "@/components/command-palette";
 import { NotificationsToggle } from "@/components/notifications";
 import {
@@ -53,14 +54,6 @@ import {
 import { type Theme, useTheme } from "@/lib/theme";
 import { cn } from "@/lib/utils";
 
-function LogoMark() {
-  return (
-    <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground">
-      <Smartphone className="size-4" />
-    </span>
-  );
-}
-
 function ProjectSwitcher() {
   const { projects } = useProjects();
   const { projectId, setProjectId } = useProjectScope();
@@ -78,9 +71,9 @@ function ProjectSwitcher() {
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <SidebarMenuButton size="lg" tooltip={current?.name ?? "All projects"} className="data-[state=open]:bg-sidebar-accent">
-              <LogoMark />
-              <div className="grid flex-1 text-left leading-tight">
-                <span className="truncate text-sm font-semibold">Tapocalypse</span>
+              <LogoMark size={32} />
+              <div className="grid flex-1 gap-1 text-left leading-tight">
+                <Wordmark className="h-[11px]" />
                 <span className="truncate text-xs text-muted-foreground">{current?.name ?? "All projects"}</span>
               </div>
               <ChevronsUpDown className="ml-auto size-4 text-muted-foreground" />
@@ -259,10 +252,10 @@ function LiveIndicator() {
         <span className="flex size-4 items-center justify-center">
           <span className="relative flex size-2">
             {live && <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-500 opacity-60" />}
-            <span className={cn("relative inline-flex size-2 rounded-full", live ? "bg-emerald-500" : "bg-amber-500")} />
+            <span className={cn("relative inline-flex size-2 rounded-full", live ? "bg-emerald-500" : "bg-orange-400")} />
           </span>
         </span>
-        <span className={cn(!live && "text-amber-700 dark:text-amber-400")}>{live ? "Live" : "Reconnecting…"}</span>
+        <span className={cn(!live && "text-orange-700 dark:text-orange-400")}>{live ? "Live" : "Reconnecting…"}</span>
       </SidebarMenuButton>
     </SidebarMenuItem>
   );
@@ -275,6 +268,7 @@ export function AppSidebar() {
     <Sidebar collapsible="icon">
       <SidebarHeader>
         <ProjectSwitcher />
+        <div aria-hidden className="mx-2 h-px bg-(image:--brand-thunder) opacity-70 group-data-[collapsible=icon]:mx-1" />
       </SidebarHeader>
       <SidebarContent>
         <SidebarGroup>

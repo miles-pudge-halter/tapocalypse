@@ -1,6 +1,7 @@
 import { Bell, BellOff } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
+import notificationIcon from "../logo-192.png";
 import { SidebarMenuButton } from "@/components/ui/sidebar";
 import { ACTIVE_STATUSES, type RunStatus, type RunView, runHash } from "@/lib/api";
 import { listenEvent, navigate, useActiveRuns, useNotifications } from "@/lib/hooks";
@@ -25,7 +26,7 @@ function showToast(run: RunView): void {
 
 function showDesktopNotification(run: RunView): void {
   const body = run.summary ?? run.error ?? undefined;
-  const n = new Notification(`${outcomeLabel(run)} · ${run.title}`, { body, tag: run.id });
+  const n = new Notification(`${outcomeLabel(run)} · ${run.title}`, { body, tag: run.id, icon: notificationIcon });
   n.onclick = () => {
     window.focus();
     navigate(runHash(run.id));

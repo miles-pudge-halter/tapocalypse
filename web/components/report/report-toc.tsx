@@ -69,7 +69,7 @@ export function ReportToc({
                   "-ml-px block w-full border-l-2 py-1 pr-2 text-left text-sm leading-snug transition-colors",
                   heading.level === 3 ? "pl-6" : "pl-3",
                   active
-                    ? "border-primary font-medium text-foreground"
+                    ? "border-ring font-medium text-foreground"
                     : "border-transparent text-muted-foreground hover:text-foreground",
                 )}
               >

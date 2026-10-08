@@ -48,7 +48,7 @@ const CODE_SPAN = /`([^`]+)`/g;
 
 const STATUS: Record<DoctorCheck["status"], { icon: LucideIcon; className: string }> = {
   ok: { icon: CheckCircle2, className: "text-emerald-500" },
-  warn: { icon: AlertTriangle, className: "text-amber-500" },
+  warn: { icon: AlertTriangle, className: "text-orange-500" },
   error: { icon: XCircle, className: "text-red-500" },
   skip: { icon: MinusCircle, className: "text-muted-foreground" },
 };

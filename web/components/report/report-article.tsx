@@ -109,7 +109,7 @@ export function ReportArticle({
         onClick={onClick}
         onKeyDown={onKeyDown}
         className={[
-          "prose prose-zinc dark:prose-invert max-w-3xl",
+          "prose prose-stone dark:prose-invert max-w-3xl",
           "prose-headings:scroll-mt-24 prose-headings:font-semibold",
           "prose-code:before:content-none prose-code:after:content-none",
           "[&_:not(pre)>code]:rounded [&_:not(pre)>code]:bg-muted [&_:not(pre)>code]:px-1.5 [&_:not(pre)>code]:py-0.5 [&_:not(pre)>code]:font-normal",

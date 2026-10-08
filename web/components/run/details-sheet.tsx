@@ -17,7 +17,7 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 
 function RunLink({ id }: { id: string }) {
   return (
-    <a href={runHash(id)} className="font-mono text-xs underline underline-offset-2 hover:text-primary">
+    <a href={runHash(id)} className="font-mono text-xs underline underline-offset-2 hover:decoration-primary hover:decoration-2">
       {id}
     </a>
   );

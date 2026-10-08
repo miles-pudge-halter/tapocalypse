@@ -14,7 +14,7 @@ const PR_STATE_STYLE: Record<string, string> = {
   MERGED: "border-violet-500/30 bg-violet-500/10 text-violet-700 dark:text-violet-300",
   CLOSED: "border-red-500/30 bg-red-500/10 text-red-700 dark:text-red-300",
 };
-const PR_DRAFT_STYLE = "border-zinc-500/30 bg-zinc-500/10 text-zinc-700 dark:text-zinc-300";
+const PR_DRAFT_STYLE = "border-stone-500/30 bg-stone-500/10 text-stone-700 dark:text-stone-300";
 
 /** `https://github.com/o/r/commit/<sha>` when the remote is GitHub, otherwise null. */
 function commitUrl(remoteUrl: string | null, sha: string): string | null {
@@ -154,7 +154,7 @@ export function SourceChips({
       {!compact && source?.dirty ? (
         <Chip
           mono={false}
-          className="border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+          className="border-orange-500/30 bg-orange-500/10 text-orange-800 dark:text-orange-300"
           tooltip={`Uncommitted changes in ${source.path}`}
         >
           uncommitted

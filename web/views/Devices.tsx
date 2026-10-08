@@ -22,8 +22,8 @@ type Tone = "free" | "busy" | "warn" | "neutral";
 const TONE: Record<Tone, { badge: string; dot: string }> = {
   free: { badge: "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300", dot: "bg-emerald-500" },
   busy: { badge: "border-blue-500/30 bg-blue-500/10 text-blue-700 dark:text-blue-300", dot: "bg-blue-500" },
-  warn: { badge: "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300", dot: "bg-amber-500" },
-  neutral: { badge: "border-zinc-500/30 bg-zinc-500/10 text-zinc-700 dark:text-zinc-300", dot: "bg-zinc-500" },
+  warn: { badge: "border-orange-500/30 bg-orange-500/10 text-orange-800 dark:text-orange-300", dot: "bg-orange-400" },
+  neutral: { badge: "border-stone-500/30 bg-stone-500/10 text-stone-700 dark:text-stone-300", dot: "bg-stone-500" },
 };
 
 /** A chip's `pulse` marks transient states (running, booting) the way StatusBadge does for runs. */
