@@ -1,0 +1,21 @@
+{
+  "port": 4310,
+  "maxConcurrentRuns": 2,
+  "runMaxTime": "60m",
+  "projects": [],
+  "devicePool": {
+    "android": {
+      "avds": [],
+      "basePort": 5560,
+      "maxBooted": 1,
+      "minSize": "720x1280",
+      "minDensity": 320,
+      "idleShutdownMinutes": 20,
+      "excludeSerials": []
+    },
+    "ios": {
+      "simulators": [],
+      "idleShutdownMinutes": 20
+    }
+  }
+}

@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Local state written by Tapocalypse (machine-specific paths, run history, transcripts)
+/tapocalypse.config.json
+/tapocalypse.config.json.tmp
+/data/
+
+# Secrets / local env
+.env
+.env.*
+!.env.example
+
+# Build, coverage, TypeScript caches
+/dist/
+/coverage/
+*.lcov
+*.tsbuildinfo
+.cache/
+
+# Logs
+*.log
+
+# Editors and OS
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*~
+.DS_Store
+Thumbs.db

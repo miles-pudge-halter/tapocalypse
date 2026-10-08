@@ -1,0 +1,10 @@
+[test]
+preload = ["./test/preload.ts"]
+
+[serve.static]
+plugins = ["bun-plugin-tailwind"]
+
+[install]
+# bun-plugin-tailwind lists `bun` as a peer; auto-installing it would pull a second Bun
+# binary into node_modules/.bin and shadow the user's Bun for `bun run`.
+peer = false
