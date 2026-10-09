@@ -139,6 +139,19 @@ describe("project CRUD", () => {
     expect(updateProject("my-app", { personaFile: null }).personaFile).toBeNull();
   });
 
+  test("a project's agent overrides are validated, persisted and can be cleared", () => {
+    createProject(input({ agent: { harness: "claude", model: "sonnet", effort: "high", ignored: 1 } } as never));
+    expect(getProject("my-app")?.agent).toEqual({ harness: "claude", model: "sonnet", effort: "high" });
+    expect((readFileConfig().projects as { agent?: unknown }[])[0]!.agent).toEqual({ harness: "claude", model: "sonnet", effort: "high" });
+    initProjects();
+    expect(getProject("my-app")?.agent?.harness).toBe("claude");
+
+    expect(updateProject("my-app", { agent: { harness: "codex" } }).agent).toEqual({ harness: "codex" });
+    expect(thrown(() => updateProject("my-app", { agent: { harness: "gemini" } }))).toMatchObject({ status: 400 });
+    expect(getProject("my-app")?.agent).toEqual({ harness: "codex" });
+    expect(updateProject("my-app", { agent: null }).agent).toBeUndefined();
+  });
+
   test("update cannot change the id, and unknown ids are 404", () => {
     createProject(input());
     expect(thrown(() => updateProject("my-app", { id: "other" }))).toMatchObject({ status: 400 });

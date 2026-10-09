@@ -1,14 +1,8 @@
 import { existsSync, statSync } from "node:fs";
-import {
-  ADB_BIN,
-  CONFIG_PATH,
-  config,
-  EMULATOR_BIN,
-  GH_BIN,
-  GIT_BIN,
-  OMP_BIN,
-} from "./config";
+import { ADB_BIN, CONFIG_PATH, config, EMULATOR_BIN, GH_BIN, GIT_BIN } from "./config";
 import { type ExecResult, exec, parseAdbDevices } from "./devices/devices";
+import { getHarness, type HarnessReadiness, harnessBin, pickDefaultHarness, readinessOf } from "./harness";
+import { HARNESS_IDS, type Harness, type HarnessId } from "./harness/types";
 import { listProjects, projectEvents, type ProjectStatus } from "./projects/registry";
 import type { Backend } from "./runs/types";
 
@@ -28,7 +22,12 @@ export interface DoctorReport {
 
 /** Everything the checks read from the outside world; tests inject their own. */
 export interface DoctorEnv {
-  ompBin: string;
+  /** Binary per agent harness (config / `<ID>_BIN` / default name). */
+  harnessBins: Record<HarnessId, string>;
+  /** `agent.harness` from the config; unset = the first ready harness is the required one. */
+  configuredHarness: HarnessId | undefined;
+  /** Adapter lookup; tests inject fakes. */
+  harness: (id: HarnessId) => Pick<Harness, "label" | "doctor">;
   adbBin: string;
   gitBin: string;
   ghBin: string;
@@ -46,11 +45,17 @@ const PROBE_TIMEOUT_MS = 8_000;
 const OVERALL_TIMEOUT_MS = 20_000;
 const CACHE_TTL_MS = 10_000;
 const MIN_BUN = [1, 3, 0] as const;
-const OMP_URL = "https://github.com/can1357/oh-my-pi";
+const INSTALL_LINKS = [
+  "omp: https://github.com/can1357/oh-my-pi",
+  "Claude Code: https://docs.anthropic.com/en/docs/claude-code/overview",
+  "Codex CLI: https://github.com/openai/codex",
+];
 
 export function defaultEnv(): DoctorEnv {
   return {
-    ompBin: OMP_BIN,
+    harnessBins: { omp: harnessBin("omp"), claude: harnessBin("claude"), codex: harnessBin("codex") },
+    configuredHarness: config.agent?.harness,
+    harness: getHarness,
     adbBin: ADB_BIN,
     gitBin: GIT_BIN,
     ghBin: GH_BIN,
@@ -115,40 +120,42 @@ function checkBun(): Promise<DoctorCheck> {
   });
 }
 
-function checkOmp(env: DoctorEnv): Promise<DoctorCheck> {
-  return guarded({ id: "omp", label: "omp (agent runtime)", required: true }, async () => {
-    const r = await env.run([env.ompBin, "--version"]);
-    if (notFound(r.code)) {
-      return { status: "error", detail: `\`${env.ompBin}\` not found on PATH`, fix: `Install omp: ${OMP_URL}, then make sure \`omp\` is on your PATH (or set OMP_BIN)` };
-    }
-    if (r.code !== 0) {
-      return { status: "error", detail: `\`${env.ompBin} --version\` failed: ${lastLines(r.stderr || r.text)}`, fix: `Reinstall omp: ${OMP_URL}` };
-    }
-    return { status: "ok", detail: firstLine(r.text) || "installed" };
-  });
+const authId = (id: HarnessId) => `${id}-auth`;
+
+/** Runs one adapter's checks; a throwing adapter becomes an error row (plus a skipped sign-in row) rather than failing the report. */
+async function harnessChecks(env: DoctorEnv, id: HarnessId): Promise<DoctorCheck[]> {
+  const adapter = env.harness(id);
+  try {
+    return await adapter.doctor({ bin: env.harnessBins[id], platform: env.platform, run: env.run, selected: id === env.configuredHarness });
+  } catch (e) {
+    return [
+      { id, label: adapter.label, status: "error", detail: e instanceof Error ? e.message : String(e), required: false },
+      { id: authId(id), label: `${adapter.label} signed in`, status: "skip", detail: `Needs ${adapter.label} installed first`, required: false },
+    ];
+  }
 }
 
-/** `omp models --json` lists only providers the user is signed in to; it is local/cached and never calls a paid model API. */
-function checkOmpAuth(env: DoctorEnv, omp: Promise<DoctorCheck>): Promise<DoctorCheck> {
-  return guarded({ id: "omp-auth", label: "omp signed in (model access)", required: true }, async () => {
-    if ((await omp).status !== "ok") return { status: "skip", detail: "Needs omp installed first" };
-    const r = await env.run([env.ompBin, "models", "--json"]);
-    const fix = "Run `omp login` and sign in to a model provider (or export its API key), then re-check";
-    if (r.code !== 0) {
-      const reason = r.code === 143 || r.code === 124 ? "timed out" : lastLines(r.stderr || r.text) || `exit ${r.code}`;
-      return { status: "warn", detail: `Could not list omp models (${reason}); cannot confirm you are signed in`, fix };
-    }
-    let count = 0;
-    try {
-      const parsed = JSON.parse(r.text) as { models?: unknown };
-      count = Array.isArray(parsed.models) ? parsed.models.length : 0;
-    } catch {
-      return { status: "warn", detail: "Unexpected output from `omp models --json`; cannot confirm you are signed in", fix };
-    }
-    return count > 0
-      ? { status: "ok", detail: `${count} model(s) available` }
-      : { status: "warn", detail: "omp is not signed in to any model provider; runs cannot start", fix };
-  });
+/** At least one harness must be installed and signed in for any run to start. */
+function agentRuntimeCheck(env: DoctorEnv, readiness: Record<HarnessId, HarnessReadiness>): DoctorCheck {
+  const base = { id: "agent-runtime", label: "Agent runtime (omp, Claude Code or Codex)", required: true };
+  const installed = HARNESS_IDS.filter((id) => readiness[id].installed);
+  const ready = HARNESS_IDS.filter((id) => readiness[id].signedIn);
+  const names = (ids: readonly HarnessId[]) => ids.map((id) => env.harness(id).label).join(", ");
+  if (ready.length > 0) return { ...base, status: "ok", detail: `Ready: ${names(ready)}` };
+  if (installed.length > 0) {
+    return {
+      ...base,
+      status: "warn",
+      detail: `${names(installed)} installed but not confirmed signed in; runs cannot start until one is`,
+      fix: "Sign in to one of them (see its row below), then re-check",
+    };
+  }
+  return {
+    ...base,
+    status: "error",
+    detail: "No agent runtime found; Tapocalypse needs one of omp, Claude Code or Codex CLI",
+    fix: `Install at least one, sign in, then re-check — ${INSTALL_LINKS.join("; ")}`,
+  };
 }
 
 function checkOs(env: DoctorEnv): Promise<DoctorCheck> {
@@ -337,12 +344,10 @@ export function artemisAvailable(artemisPath: string | undefined = config.artemi
 /** Uncached report for an explicit environment. */
 export async function buildReport(env: DoctorEnv): Promise<DoctorReport> {
   const xcrun = checkXcrun(env);
-  const omp = checkOmp(env);
-  const checks = await Promise.all([
+  const [os, bun, harnessRows, ...rest] = await Promise.all([
     checkOs(env),
     checkBun(),
-    omp,
-    checkOmpAuth(env, omp),
+    Promise.all(HARNESS_IDS.map(async (id) => [id, await harnessChecks(env, id)] as const)),
     checkNode(env),
     checkGit(env),
     checkGh(env),
@@ -354,6 +359,13 @@ export async function buildReport(env: DoctorEnv): Promise<DoctorReport> {
     checkProjects(env),
     checkArtemis(env),
   ]);
+  const byHarness = new Map<HarnessId, DoctorCheck[]>(harnessRows);
+  const readiness = Object.fromEntries(HARNESS_IDS.map((id) => [id, readinessOf(id, byHarness.get(id) ?? [])])) as Record<HarnessId, HarnessReadiness>;
+  const selected = env.configuredHarness ?? pickDefaultHarness(readiness);
+  const harnessList = HARNESS_IDS.flatMap((id) =>
+    (byHarness.get(id) ?? []).map((c) => (c.id === id || c.id === authId(id) ? { ...c, required: id === selected } : c)),
+  );
+  const checks = [os, bun, agentRuntimeCheck(env, readiness), ...harnessList, ...rest];
   return { checks, backends: artemisAvailable(env.artemisPath) ? ["mobile-mcp", "artemis"] : ["mobile-mcp"] };
 }
 

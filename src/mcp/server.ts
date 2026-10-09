@@ -6,6 +6,7 @@ import pkg from "../../package.json";
 import { batchView, devicesView, findRun, runDurationMs, runner, scheduler } from "../app";
 import { config, HttpError, MAX_STEER_CHARS } from "../config";
 import { runDoctor } from "../doctor";
+import { HARNESS_IDS, type HarnessId } from "../harness/types";
 import { detectProject } from "../projects/detect";
 import { createProject, deleteProject, getProject, listProjects, PACKAGE_RE, updateProject } from "../projects/registry";
 import { resolveUnder } from "../reports/reports";
@@ -121,6 +122,10 @@ function waitForRuns(runIds: string[], mode: "all" | "any", timeoutMs: number): 
 const clampWaitSeconds = (timeoutSec: number | undefined) => Math.min(110, Math.max(5, timeoutSec ?? 90));
 
 const RunOptions = {
+  harness: z
+    .enum(HARNESS_IDS)
+    .optional()
+    .describe("Agent harness that drives the QA run: omp, claude (Claude Code) or codex (Codex CLI). Defaults to the project/config default; see qa_doctor for what is installed"),
   backend: z
     .enum(["mobile-mcp", "artemis"])
     .optional()
@@ -128,8 +133,11 @@ const RunOptions = {
       "Driver backend; default mobile-mcp. artemis is optional, Android-only, and only available when the operator configured artemisPath (see qa_doctor)",
     ),
   packageId: z.string().max(200).regex(PACKAGE_RE, "must look like com.example.app").optional().describe("App package/bundle id; defaults to the project's package"),
-  model: z.string().max(200).optional().describe("Model for the QA agent, e.g. anthropic/claude-sonnet-4-5; defaults to the suite/persona/config model"),
-  thinking: z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]).optional().describe("Thinking level for the QA agent"),
+  model: z.string().max(200).optional().describe("Harness-native model id for the QA agent (omp: anthropic/claude-sonnet-4-5, claude: sonnet, codex: gpt-5); defaults to the suite/persona/config model"),
+  thinking: z
+    .enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"])
+    .optional()
+    .describe("Reasoning effort for the QA agent, in the harness's own terms (omp thinking level, Claude --effort, Codex model_reasoning_effort); unsupported levels are rejected or mapped by the harness"),
 };
 
 const SOURCE_HINT =
@@ -249,7 +257,7 @@ function buildServer(): McpServer {
     {
       title: "Check Tapocalypse setup",
       description:
-        "Report which prerequisites are installed (omp, npx, adb, emulators, simulators, git, gh), configured projects, and which driver backends are available, with a fix for anything missing. Call this when runs fail to start.",
+        "Report which prerequisites are installed (agent runtimes omp / Claude Code / Codex and whether they are signed in, npx, adb, emulators, simulators, git, gh), configured projects, and which driver backends are available, with a fix for anything missing. Call this when runs fail to start.",
     },
     () => respond(() => runDoctor({ fresh: true })),
   );
@@ -281,6 +289,7 @@ function buildServer(): McpServer {
           brief: args.brief,
           suiteId: args.suiteId,
           device: { platform: args.platform, serial: args.serial },
+          harness: args.harness,
           backend: args.backend,
           packageId: args.packageId,
           model: args.model,
@@ -329,6 +338,7 @@ function buildServer(): McpServer {
           brief: args.brief,
           suiteId: args.suiteId,
           devices: args.devices,
+          harness: args.harness,
           backend: args.backend,
           packageId: args.packageId,
           model: args.model,
@@ -356,20 +366,21 @@ function buildServer(): McpServer {
     {
       title: "Re-run a finished run",
       description:
-        "Queue a new run from a finished one. only=failed re-tests just the checks that did not pass or skip (with their previous status and note); only=all repeats the whole brief. Same project, backend, package, model and source.",
+        "Queue a new run from a finished one. only=failed re-tests just the checks that did not pass or skip (with their previous status and note); only=all repeats the whole brief. Same project, harness, backend, package, model and source unless you override the harness.",
       inputSchema: z.object({
         runId: z.string(),
         only: z.enum(["failed", "all"]),
         platform: z.enum(["android", "ios"]).optional().describe("Override the device platform"),
         serial: z.string().max(200).optional().describe("Override the device"),
+        harness: RunOptions.harness.describe("Run the repeat on a different agent harness (omp, claude, codex); default: the original run's harness"),
         requester: z.string().max(200).optional(),
       }),
     },
-    ({ runId, only, platform, serial, requester }) =>
+    ({ runId, only, platform, serial, harness, requester }) =>
       respond(async () => {
         requireRun(runId);
         const device = platform || serial ? { platform, serial } : undefined;
-        const run = await scheduler.rerun(runId, { only, device, requestedBy: requester ?? "mcp" });
+        const run = await scheduler.rerun(runId, { only, device, harness, requestedBy: requester ?? "mcp" });
         return { runId: run.id, status: run.status, queuePosition: scheduler.queuePosition(run.id), url: runUrl(run.id) };
       }),
   );
@@ -378,7 +389,8 @@ function buildServer(): McpServer {
     "qa_steer_run",
     {
       title: "Send a message to a running QA agent",
-      description: "Steer a run that is currently running (not queued or finished) with an extra instruction.",
+      description:
+        "Steer a run that is currently running (not queued or finished) with an extra instruction. Fails for harnesses that cannot take mid-run messages (check capabilities.steer in GET /api/harnesses).",
       inputSchema: z.object({ runId: z.string().max(200), message: z.string().max(MAX_STEER_CHARS) }),
     },
     ({ runId, message }) =>

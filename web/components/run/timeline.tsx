@@ -324,7 +324,7 @@ export function Timeline({
         ) : null}
       </div>
 
-      {run.status === "running" ? <SteerComposer runId={run.id} /> : null}
+      {run.status === "running" ? <SteerComposer runId={run.id} harness={run.harness} /> : null}
     </div>
   );
 }

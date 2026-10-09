@@ -3,6 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { artemisAvailable, buildReport, type DoctorCheck, type DoctorEnv } from "../src/doctor";
+import { getHarness } from "../src/harness";
+import { HARNESS_IDS, type HarnessId } from "../src/harness/types";
 
 const MISSING = "/nonexistent/bin";
 
@@ -22,7 +24,9 @@ function fakeRun(missing: readonly string[] = [], respond: Responder = () => und
 /** A fully hermetic environment: no real binary is ever spawned. */
 function envWith(over: Partial<DoctorEnv>): DoctorEnv {
   return {
-    ompBin: "omp",
+    harnessBins: { omp: "omp", claude: "claude", codex: "codex" },
+    configuredHarness: "omp",
+    harness: getHarness,
     adbBin: "adb",
     gitBin: "git",
     ghBin: "gh",
@@ -58,11 +62,26 @@ describe("buildReport", () => {
   });
 
   test("a missing omp binary is a required error with an install fix, not a throw", async () => {
-    const { checks } = await buildReport(envWith({ ompBin: MISSING, run: fakeRun([MISSING]) }));
+    const { checks } = await buildReport(envWith({ harnessBins: { omp: MISSING, claude: "claude", codex: "codex" }, run: fakeRun([MISSING]) }));
     const omp = byId(checks, "omp");
     expect(omp.status).toBe("error");
     expect(omp.required).toBe(true);
     expect(omp.fix).toContain("https://github.com/can1357/oh-my-pi");
+  });
+
+  test("omp and Codex that are missing or signed out only warn while another harness is selected, and error once selected", async () => {
+    const signedOut: Responder = (cmd) => (cmd[1] === "login" ? { code: 1, text: "Not logged in" } : undefined);
+    const absent = { harnessBins: { omp: MISSING, claude: "claude", codex: MISSING }, run: fakeRun([MISSING], signedOut) };
+    const elsewhere = await buildReport(envWith({ ...absent, configuredHarness: "claude" }));
+    for (const id of ["omp", "codex"]) expect(byId(elsewhere.checks, id).status).toBe("warn");
+    for (const id of ["omp", "codex"] as const) {
+      const selected = await buildReport(envWith({ ...absent, configuredHarness: id }));
+      expect(byId(selected.checks, id).status).toBe("error");
+    }
+
+    const present = { run: fakeRun([], signedOut) };
+    expect(byId((await buildReport(envWith({ ...present, configuredHarness: "claude" }))).checks, "codex-auth").status).toBe("warn");
+    expect(byId((await buildReport(envWith({ ...present, configuredHarness: "codex" }))).checks, "codex-auth").status).toBe("error");
   });
 
   test("missing optional binaries (git, gh) warn without failing the report", async () => {
@@ -149,11 +168,13 @@ describe("omp sign-in", () => {
     expect(auth.required).toBe(true);
   });
 
-  test("not signed in: an empty model list warns with `omp login`", async () => {
+  test("not signed in: an empty model list is an error with `omp login` when omp is selected, a warning otherwise", async () => {
     const { checks } = await buildReport(envWith({ run: fakeRun([], models([])) }));
     const auth = byId(checks, "omp-auth");
-    expect(auth.status).toBe("warn");
+    expect(auth.status).toBe("error");
     expect(auth.fix).toContain("omp login");
+    const other = await buildReport(envWith({ configuredHarness: "claude", run: fakeRun([], models([])) }));
+    expect(byId(other.checks, "omp-auth").status).toBe("warn");
   });
 
   test("a failing or garbled `omp models` warns instead of throwing", async () => {
@@ -171,7 +192,7 @@ describe("omp sign-in", () => {
       calls.push(cmd);
       return base(cmd);
     };
-    const { checks } = await buildReport(envWith({ ompBin: MISSING, run }));
+    const { checks } = await buildReport(envWith({ harnessBins: { omp: MISSING, claude: "claude", codex: "codex" }, run }));
     expect(byId(checks, "omp-auth").status).toBe("skip");
     expect(calls.some((c) => c[1] === "models")).toBe(false);
   });
@@ -188,5 +209,98 @@ describe("operating system", () => {
     const os = byId(checks, "os");
     expect(os.status).toBe(status);
     expect(os.required).toBe(true);
+  });
+});
+
+describe("agent runtimes", () => {
+  type Fake = { installed: boolean; signedIn?: boolean };
+
+  /** Fake adapters: `<id>` / `<id>-auth` rows reflect the scenario and echo the `selected` flag they were given. */
+  function fakeHarnesses(scenario: Record<HarnessId, Fake>, seen: Partial<Record<HarnessId, { bin: string; selected: boolean }>> = {}): DoctorEnv["harness"] {
+    return (id) => ({
+      label: `Label ${id}`,
+      doctor: async (env) => {
+        seen[id] = { bin: env.bin, selected: env.selected };
+        const s = scenario[id];
+        return [
+          { id, label: id, status: s.installed ? "ok" : "error", detail: "", required: env.selected },
+          { id: `${id}-auth`, label: `${id} auth`, status: !s.installed ? "skip" : s.signedIn ? "ok" : "warn", detail: "", required: env.selected },
+        ];
+      },
+    });
+  }
+
+  const none: Record<HarnessId, Fake> = { omp: { installed: false }, claude: { installed: false }, codex: { installed: false } };
+
+  test("every harness is probed with its own bin; only the configured one is selected", async () => {
+    const seen: Partial<Record<HarnessId, { bin: string; selected: boolean }>> = {};
+    const bins = { omp: "omp-x", claude: "claude-x", codex: "codex-x" };
+    await buildReport(envWith({ harnessBins: bins, configuredHarness: "claude", harness: fakeHarnesses(none, seen) }));
+    expect(seen).toEqual({
+      omp: { bin: "omp-x", selected: false },
+      claude: { bin: "claude-x", selected: true },
+      codex: { bin: "codex-x", selected: false },
+    });
+  });
+
+  test("agent-runtime is ok and names every installed, signed-in harness", async () => {
+    const { checks } = await buildReport(
+      envWith({
+        configuredHarness: undefined,
+        harness: fakeHarnesses({ omp: { installed: false }, claude: { installed: true, signedIn: true }, codex: { installed: true, signedIn: true } }),
+      }),
+    );
+    const runtime = byId(checks, "agent-runtime");
+    expect(runtime.status).toBe("ok");
+    expect(runtime.required).toBe(true);
+    expect(runtime.detail).toContain("Label claude");
+    expect(runtime.detail).toContain("Label codex");
+    expect(runtime.detail).not.toContain("Label omp");
+  });
+
+  test("agent-runtime warns when a harness is installed but not signed in, and errors with install links when none is", async () => {
+    const unsigned = await buildReport(envWith({ harness: fakeHarnesses({ ...none, codex: { installed: true, signedIn: false } }) }));
+    expect(byId(unsigned.checks, "agent-runtime").status).toBe("warn");
+
+    const { checks } = await buildReport(envWith({ harness: fakeHarnesses(none) }));
+    const runtime = byId(checks, "agent-runtime");
+    expect(runtime.status).toBe("error");
+    expect(runtime.required).toBe(true);
+    expect(runtime.fix).toContain("https://github.com/can1357/oh-my-pi");
+    expect(runtime.fix).toMatch(/Claude Code/);
+    expect(runtime.fix).toMatch(/Codex/);
+  });
+
+  test("with no configured harness the first ready one is the required one, so a Codex-only machine is not blocked by omp", async () => {
+    const { checks } = await buildReport(
+      envWith({ configuredHarness: undefined, harness: fakeHarnesses({ ...none, codex: { installed: true, signedIn: true } }) }),
+    );
+    for (const id of HARNESS_IDS) {
+      expect(byId(checks, id).required).toBe(id === "codex");
+      expect(byId(checks, `${id}-auth`).required).toBe(id === "codex");
+    }
+    expect(byId(checks, "agent-runtime").status).toBe("ok");
+  });
+
+  test("a configured harness stays required even when another one is ready", async () => {
+    const { checks } = await buildReport(
+      envWith({ configuredHarness: "claude", harness: fakeHarnesses({ ...none, codex: { installed: true, signedIn: true } }) }),
+    );
+    expect(byId(checks, "claude").required).toBe(true);
+    expect(byId(checks, "claude").status).toBe("error");
+    expect(byId(checks, "codex").required).toBe(false);
+  });
+
+  test("a throwing adapter becomes an error row instead of failing the report", async () => {
+    const boom: DoctorEnv["harness"] = (id) => ({
+      label: id,
+      doctor: async () => {
+        throw new Error("probe exploded");
+      },
+    });
+    const { checks } = await buildReport(envWith({ harness: boom }));
+    expect(byId(checks, "omp").status).toBe("error");
+    expect(byId(checks, "omp").detail).toContain("probe exploded");
+    expect(byId(checks, "agent-runtime").status).toBe("error");
   });
 });

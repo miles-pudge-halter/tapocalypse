@@ -6,6 +6,7 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { parseArgs, type ParseArgsOptionsConfig } from "node:util";
+import { HARNESS_IDS, type HarnessId } from "./harness/types";
 import { VERDICTS, type CheckStatus, type RunStatus, type Verdict } from "./runs/types";
 
 export const EXIT = { OK: 0, VERDICT: 1, ERROR: 2, USAGE: 3 } as const;
@@ -49,6 +50,7 @@ export interface RunOptions {
   platform: "android" | "ios" | null;
   serials: string[];
   devices: number | null;
+  harness: HarnessId | null;
   model: string | null;
   install: string | null;
   wait: boolean;
@@ -88,7 +90,8 @@ Run options:
   --platform <p>        android | ios (default: the device's platform, else the project's default)
   --serial <serial>     Run on this device; repeat for one run per device (a batch)
   --devices <n>         Fan out to n devices of the platform (a batch, 1-${MAX_BATCH_DEVICES})
-  --model <model>       Model for the agent (default: suite / persona / config)
+  --harness <id>        Agent harness: ${HARNESS_IDS.join(" | ")} (default: project / persona / config, else the first installed)
+  --model <model>       Harness-native model for the agent (default: suite / persona / config)
   --install <path>      Install this .apk / .app / .ipa on the device before the run (single run only)
   --wait                Wait for the run(s) to finish; progress goes to stderr
   --timeout <dur>       Stop waiting after this long (default ${DEFAULT_TIMEOUT}; e.g. 30s, 45m, 2h); only used with --wait
@@ -188,6 +191,7 @@ function parseRunOptions(args: string[], env: Record<string, string | undefined>
     platform: { type: "string" },
     serial: { type: "string", multiple: true },
     devices: { type: "string" },
+    harness: { type: "string" },
     model: { type: "string" },
     install: { type: "string" },
     wait: { type: "boolean" },
@@ -222,6 +226,11 @@ function parseRunOptions(args: string[], env: Record<string, string | undefined>
   const fanOut = serials.length > 1 || (devices ?? 1) > 1;
   if (fanOut && values.install !== undefined) throw new UsageError("--install is only supported for a single device");
 
+  const harness = HARNESS_IDS.find((id) => id === values.harness) ?? null;
+  if (values.harness !== undefined && harness === null) {
+    throw new UsageError(`invalid --harness "${values.harness}" (${HARNESS_IDS.join(", ")})`);
+  }
+
   const junit = values.junit ?? null;
   return {
     projectId: values.project,
@@ -232,6 +241,7 @@ function parseRunOptions(args: string[], env: Record<string, string | undefined>
     platform,
     serials,
     devices,
+    harness,
     model: values.model ?? null,
     install: values.install ?? null,
     wait: values.wait === true || junit !== null,
@@ -312,6 +322,7 @@ export function buildStartRequest(
     projectId: options.projectId,
     requestedBy,
     ...(options.suiteId ? { suiteId: options.suiteId } : { brief }),
+    ...(options.harness ? { harness: options.harness } : {}),
     ...(options.model ? { model: options.model } : {}),
   };
   const title = options.title ?? defaultTitle(options, brief);

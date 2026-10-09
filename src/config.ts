@@ -2,18 +2,42 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
+import { HarnessIdSchema } from "./harness/types";
+import { parseDurationMs } from "./runs/outcome";
 
 export const REPO_ROOT = path.resolve(import.meta.dir, "..");
 
-const ConfigSchema = z.object({
+const HarnessSettingsSchema = z.object({
+  bin: z.string().min(1).optional(),
+  model: z.string().min(1).optional(),
+  effort: z.string().min(1).optional(),
+  permissions: z.enum(["bypass", "allowlist"]).optional(),
+  sandbox: z.enum(["danger-full-access", "workspace-write"]).optional(),
+});
+
+export const ConfigSchema = z.object({
   port: z.number().int().positive(),
   maxConcurrentRuns: z.number().int().positive(),
-  runMaxTime: z.string().min(1),
+  /** Wall-clock budget per run (`90m`, `1h30m`, `45s`; a bare number is minutes). Validated so every harness gets a usable limit. */
+  runMaxTime: z.string().refine((s) => (parseDurationMs(s) ?? 0) > 0, "must be a positive duration such as 90m, 1h30m or 45s"),
   artemisPath: z.string().min(1).optional(),
   /** Loose entries: the project registry validates them individually so one bad project never blocks boot. */
   projects: z.array(z.record(z.string(), z.unknown())),
-  /** Fallback model/thinking when a project persona has no `model:`; neither set = omp's own default. */
-  agent: z.object({ model: z.string().min(1).optional(), thinking: z.string().min(1).optional() }).optional(),
+  /**
+   * Agent runtime settings. `harness` picks the default CLI (unset = first installed of omp, claude, codex); `model` /
+   * `thinking` are the legacy omp-only fallbacks; `harnesses[id]` holds per-CLI settings; `maxTurns` / `maxBudgetUsd`
+   * apply to harnesses that enforce them (Claude Code) and are ignored by the others.
+   */
+  agent: z
+    .object({
+      harness: HarnessIdSchema.optional(),
+      model: z.string().min(1).optional(),
+      thinking: z.string().min(1).optional(),
+      maxTurns: z.number().int().positive().optional(),
+      maxBudgetUsd: z.number().positive().optional(),
+      harnesses: z.partialRecord(HarnessIdSchema, HarnessSettingsSchema).optional(),
+    })
+    .optional(),
   /** Automatic re-queue of runs that die from infrastructure causes (boot failure, omp crash) before any check resolved. */
   retry: z.object({ infra: z.number().int().nonnegative().default(1) }).default({ infra: 1 }),
   /** Run-history cleanup; unset = keep everything. Only run directories under the data dir are ever deleted. */

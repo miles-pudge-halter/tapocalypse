@@ -12,6 +12,7 @@ import { Popover, PopoverAnchor, PopoverContent, PopoverTrigger } from "@/compon
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import {
   api,
@@ -19,6 +20,8 @@ import {
   runHash,
   type Backend,
   type Device,
+  type HarnessId,
+  type HarnessInfo,
   type DeviceTarget,
   type Platform,
   type ProjectStatus,
@@ -30,6 +33,7 @@ import {
   navigate,
   useDevices,
   useDoctor,
+  useHarnesses,
   useModels,
   useNewRun,
   useProjects,
@@ -152,7 +156,7 @@ function NewRunForm({ prefill, onDone }: { prefill: NewRunPrefill | null; onDone
   const { devices } = useDevices();
   const { report: doctor } = useDoctor();
   const { templates } = useTemplates();
-  const { models } = useModels();
+  const { harnesses, defaultId, loading: harnessesLoading, error: harnessesError } = useHarnesses();
 
   const initialProject = useMemo(
     () => ready.find((p) => p.id === prefill?.projectId) ?? ready.find((p) => p.id === scopeProject) ?? ready[0],
@@ -194,7 +198,10 @@ function NewRunForm({ prefill, onDone }: { prefill: NewRunPrefill | null; onDone
       initialProject={initialProject}
       devices={devices.filter(isQaDevice)}
       templates={templates}
-      models={models}
+      harnesses={harnesses}
+      defaultHarness={defaultId}
+      harnessesLoading={harnessesLoading}
+      harnessesError={harnessesError}
       artemisAvailable={doctor?.backends.includes("artemis") ?? false}
       onDone={onDone}
     />
@@ -207,18 +214,58 @@ interface BodyProps {
   initialProject: ProjectStatus;
   devices: Device[];
   templates: Template[];
-  models: string[];
+  harnesses: HarnessInfo[];
+  defaultHarness: HarnessId | null;
+  harnessesError: string | null;
+  harnessesLoading: boolean;
   artemisAvailable: boolean;
   onDone(): void;
 }
 
-function RunFormBody({ prefill, projects, initialProject, devices, templates, models, artemisAvailable, onDone }: BodyProps) {
+function RunFormBody({
+  prefill,
+  projects,
+  initialProject,
+  devices,
+  templates,
+  harnesses,
+  defaultHarness,
+  harnessesError,
+  harnessesLoading,
+  artemisAvailable,
+  onDone,
+}: BodyProps) {
   const [projectId, setProjectId] = useState(initialProject.id);
   const project = projects.find((p) => p.id === projectId) ?? initialProject;
   const [targets, setTargets] = useState<Targets>(() => targetsFromPrefill(prefill, initialProject.defaultPlatform));
   const [backend, setBackend] = useState<Backend>(prefill?.backend ?? "mobile-mcp");
   const [packageId, setPackageId] = useState(prefill?.packageId ?? initialProject.defaultPackage);
+  const installed = useMemo(() => harnesses.filter((h) => h.installed), [harnesses]);
+  /** Set by the user or a prefill; null = untouched, so the run request names no harness and the project or persona decides. */
+  const [chosenHarness, setChosenHarness] = useState<HarnessId | null>(prefill?.harness ?? null);
+  const explicitHarness = installed.find((h) => h.id === chosenHarness)?.id ?? null;
+  /** What an untouched picker shows: the project's harness, else the server default, among the installed ones. */
+  function defaultHarnessFor(p: ProjectStatus): HarnessId | null {
+    return (
+      installed.find((h) => h.id === p.agent?.harness)?.id ??
+      installed.find((h) => h.id === defaultHarness)?.id ??
+      installed[0]?.id ??
+      null
+    );
+  }
+  const harness = explicitHarness ?? defaultHarnessFor(project);
+  const harnessInfo = installed.find((h) => h.id === harness) ?? null;
+  const noRuntime = !harnessesLoading && !harnessesError && installed.length === 0;
+  const { models, loading: modelsLoading } = useModels(harness ?? undefined);
   const [model, setModel] = useState(prefill?.model ?? "");
+  const [effort, setEffort] = useState(prefill?.effort ?? "");
+
+  // A prefilled harness that is not installed is dropped, and so are the harness-native model and effort that came with it.
+  useEffect(() => {
+    if (harnessesLoading || !prefill?.harness || installed.some((h) => h.id === prefill.harness)) return;
+    setModel((m) => (m === prefill.model ? "" : m));
+    setEffort((e) => (e === prefill.effort ? "" : e));
+  }, [harnessesLoading, installed, prefill]);
   const [sourcePath, setSourcePath] = useState(prefill?.sourcePath ?? "");
   const [prNumber, setPrNumber] = useState("");
   const [installPath, setInstallPath] = useState("");
@@ -275,7 +322,8 @@ function RunFormBody({ prefill, projects, initialProject, devices, templates, mo
   }, [suites, prefill?.suiteId, prefill?.model, dirty]);
 
   const hasIos = targets.anyIos > 0 || targets.serials.some((t) => t.platform === "ios");
-  const effectiveBackend: Backend = artemisAvailable && !hasIos ? backend : "mobile-mcp";
+  const harnessAllowsArtemis = harnessInfo ? harnessInfo.capabilities.backends.includes("artemis") : true;
+  const effectiveBackend: Backend = artemisAvailable && !hasIos && harnessAllowsArtemis ? backend : "mobile-mcp";
   const total = targetCount(targets);
   const suggested = suggestTitle(brief);
   const shownTitle = titleTouched ? title : suggested;
@@ -306,6 +354,11 @@ function RunFormBody({ prefill, projects, initialProject, devices, templates, mo
     const next = projects.find((p) => p.id === id);
     if (!next) return;
     setProjectId(id);
+    if (explicitHarness === null && defaultHarnessFor(next) !== harness) {
+      // the untouched picker follows the project: model and effort are harness-native, so they do not carry over
+      setModel("");
+      setEffort("");
+    }
     setPackageId(next.defaultPackage);
     setSuite(null);
     setSource(null);
@@ -366,7 +419,9 @@ function RunFormBody({ prefill, projects, initialProject, devices, templates, mo
       ...(activeSuite ? { suiteId: activeSuite.id } : { brief: brief.trim() }),
       backend: effectiveBackend,
       packageId: packageId.trim() || project.defaultPackage,
+      ...(explicitHarness ? { harness: explicitHarness } : {}),
       model: model.trim() || undefined,
+      thinking: effort || undefined,
       ...(Object.keys(runSource).length > 0 ? { source: runSource } : {}),
     };
     submittingRef.current = true;
@@ -408,6 +463,7 @@ function RunFormBody({ prefill, projects, initialProject, devices, templates, mo
 
   const advancedSummary = [
     effectiveBackend,
+    harnessInfo?.label ?? (noRuntime ? "no runtime" : null),
     packageId.trim() || project.defaultPackage,
     model.trim() || null,
     sourcePath.trim() || "project root",
@@ -524,7 +580,9 @@ function RunFormBody({ prefill, projects, initialProject, devices, templates, mo
           </div>
         </div>
 
-        <Collapsible defaultOpen={Boolean(prefill?.model || prefill?.sourcePath || prefill?.packageId)}>
+        <HarnessNotice error={harnessesError} none={noRuntime} unknown={harnesses.length === 0} />
+
+        <Collapsible defaultOpen={Boolean(prefill?.harness || prefill?.model || prefill?.effort || prefill?.sourcePath || prefill?.packageId)}>
           <CollapsibleTrigger asChild>
             <Button type="button" variant="outline" className="h-auto w-full justify-between py-2 text-left font-normal">
               <span className="min-w-0">
@@ -535,6 +593,19 @@ function RunFormBody({ prefill, projects, initialProject, devices, templates, mo
             </Button>
           </CollapsibleTrigger>
           <CollapsibleContent className="space-y-4 pt-4">
+            <HarnessField
+              installed={installed}
+              value={harness}
+              explicit={explicitHarness !== null}
+              loading={harnessesLoading}
+              error={harnessesError}
+              onChange={(next) => {
+                setChosenHarness(next);
+                // models and effort levels are harness-native strings: they do not carry over
+                setModel("");
+                setEffort("");
+              }}
+            />
             {artemisAvailable && (
               <div className="space-y-2">
                 <Label>Backend</Label>
@@ -544,8 +615,24 @@ function RunFormBody({ prefill, projects, initialProject, devices, templates, mo
                   className="grid grid-cols-2 gap-3"
                 >
                   <BackendOption value="mobile-mcp" title="mobile-mcp" description="Android and iOS" />
-                  <BackendOption value="artemis" title="artemis" description={hasIos ? "Android only — iOS device selected" : "Android only"} disabled={hasIos} />
+                  <BackendOption
+                    value="artemis"
+                    title="artemis"
+                    description={
+                      !harnessAllowsArtemis
+                        ? `Not available with ${harnessInfo?.label ?? "this agent runtime"}`
+                        : hasIos
+                          ? "Android only — iOS device selected"
+                          : "Android only"
+                    }
+                    disabled={hasIos || !harnessAllowsArtemis}
+                  />
                 </RadioGroup>
+                {!harnessAllowsArtemis && (
+                  <p className="text-xs text-muted-foreground">
+                    The artemis backend needs your own MCP config, which only omp sessions inherit.
+                  </p>
+                )}
               </div>
             )}
             <div className="space-y-2">
@@ -554,9 +641,10 @@ function RunFormBody({ prefill, projects, initialProject, devices, templates, mo
             </div>
             <div className="space-y-2">
               <Label htmlFor="nr-model">Model</Label>
-              <ModelCombobox id="nr-model" value={model} models={models} onChange={setModel} />
-              <p className="text-xs text-muted-foreground">Empty uses the suite, persona or configured default.</p>
+              <ModelCombobox id="nr-model" value={model} models={models} loading={modelsLoading} onChange={setModel} />
+              <p className="text-xs text-muted-foreground">{modelHint(harness)}</p>
             </div>
+            <EffortField harness={harness} value={effort} onChange={setEffort} />
             <div className="space-y-2">
               <Label htmlFor="nr-source-path">Working directory</Label>
               <Input
@@ -614,7 +702,7 @@ function RunFormBody({ prefill, projects, initialProject, devices, templates, mo
             </span>
           </label>
         )}
-        <Button type="submit" disabled={submitting || total === 0 || !brief.trim()}>
+        <Button type="submit" disabled={submitting || harnessesLoading || noRuntime || total === 0 || !brief.trim()}>
           {submitting ? <Loader2 className="animate-spin" /> : <Play />}
           {submitting ? "Starting…" : total > 1 ? `Start ${total} runs` : "Start run"}
         </Button>
@@ -823,7 +911,162 @@ function DevicePicker({
   );
 }
 
-function ModelCombobox({ id, value, models, onChange }: { id: string; value: string; models: string[]; onChange(next: string): void }) {
+/** Harness-native effort levels the server accepts for `thinking`; the first entry of each list is the lowest. */
+const EFFORT_LEVELS: Record<HarnessId, string[]> = {
+  omp: ["off", "minimal", "low", "medium", "high", "xhigh"],
+  claude: ["low", "medium", "high", "xhigh", "max"],
+  codex: ["minimal", "low", "medium", "high", "xhigh"],
+};
+const ALL_EFFORT_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+const EFFORT_DEFAULT = "default";
+
+function modelHint(harness: HarnessId | null): string {
+  const fallback = "Empty uses the suite, persona or configured default.";
+  switch (harness) {
+    case "omp":
+      return `provider/model, optionally with a :thinking suffix. ${fallback}`;
+    case "claude":
+      return `A Claude alias (sonnet, opus) or a full model id. ${fallback}`;
+    case "codex":
+      return `A Codex model id such as gpt-5.5. ${fallback}`;
+    case null:
+      return fallback;
+  }
+}
+
+function effortHint(harness: HarnessId | null): string {
+  switch (harness) {
+    case "omp":
+      return "omp thinking level. Empty uses the suite, persona or configured default.";
+    case "claude":
+      return "Claude Code effort (--effort). Empty uses Claude Code's default.";
+    case "codex":
+      return "Codex reasoning effort (model_reasoning_effort). Empty uses Codex's default.";
+    case null:
+      return "Empty uses the configured default.";
+  }
+}
+
+function EffortField({ harness, value, onChange }: { harness: HarnessId | null; value: string; onChange(next: string): void }) {
+  const levels = harness ? EFFORT_LEVELS[harness] : ALL_EFFORT_LEVELS;
+  return (
+    <div className="space-y-2">
+      <Label htmlFor="nr-effort">{harness === "omp" ? "Thinking" : "Effort"}</Label>
+      <Select value={value || EFFORT_DEFAULT} onValueChange={(v) => onChange(v === EFFORT_DEFAULT ? "" : v)}>
+        <SelectTrigger id="nr-effort" className="w-full">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value={EFFORT_DEFAULT}>Default</SelectItem>
+          {levels.map((level) => (
+            <SelectItem key={level} value={level}>
+              {level}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      <p className="text-xs text-muted-foreground">{effortHint(harness)}</p>
+    </div>
+  );
+}
+
+/** Alert above the Advanced section: a failed runtime lookup, or no installed runtime (Start is disabled then). */
+function HarnessNotice({ error, none, unknown }: { error: string | null; none: boolean; unknown: boolean }) {
+  if (error) {
+    return (
+      <Alert variant="destructive">
+        <AlertCircle />
+        <AlertTitle>Could not load agent runtimes</AlertTitle>
+        <AlertDescription>{error}. The run will use the server default.</AlertDescription>
+      </Alert>
+    );
+  }
+  if (!none) return null;
+  return (
+    <Alert variant="destructive">
+      <AlertCircle />
+      <AlertTitle>No agent runtime installed</AlertTitle>
+      <AlertDescription>
+        {unknown ? "No agent runtimes are known to the server." : "Install omp, Claude Code or Codex to start runs."}{" "}
+        <a href="#/setup" className="underline">
+          Open Setup
+        </a>
+      </AlertDescription>
+    </Alert>
+  );
+}
+
+/** Agent CLI picker: only installed harnesses are offered. `explicit` = the user (or a prefill) chose; otherwise the project or persona decides. */
+function HarnessField({
+  installed,
+  value,
+  explicit,
+  loading,
+  error,
+  onChange,
+}: {
+  installed: HarnessInfo[];
+  value: HarnessId | null;
+  explicit: boolean;
+  loading: boolean;
+  error: string | null;
+  onChange(next: HarnessId): void;
+}) {
+  const selected = installed.find((h) => h.id === value) ?? null;
+  const none = installed.length === 0;
+  return (
+    <div className="space-y-2">
+      <Label htmlFor="nr-harness">Agent runtime</Label>
+      {loading ? (
+        <Skeleton className="h-9 w-full" aria-busy aria-label="Loading agent runtimes" />
+      ) : (
+        <>
+          <Select
+            value={value ?? ""}
+            onValueChange={(v) => {
+              const next = installed.find((h) => h.id === v);
+              if (next) onChange(next.id);
+            }}
+            disabled={none}
+          >
+            <SelectTrigger id="nr-harness" className="w-full">
+              <SelectValue placeholder={error ? "Server default" : "No agent runtime installed"} />
+            </SelectTrigger>
+            <SelectContent>
+              {installed.map((h) => (
+                <SelectItem key={h.id} value={h.id}>
+                  {h.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          {!none && !explicit && (
+            <p className="text-xs text-muted-foreground">
+              Left untouched, the project or persona setting decides; otherwise the server default.
+            </p>
+          )}
+          {selected && !selected.capabilities.steer && (
+            <p className="text-xs text-muted-foreground">{selected.label} cannot be steered while a run is in progress.</p>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function ModelCombobox({
+  id,
+  value,
+  models,
+  loading,
+  onChange,
+}: {
+  id: string;
+  value: string;
+  models: string[];
+  loading: boolean;
+  onChange(next: string): void;
+}) {
   const [open, setOpen] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const query = value.trim().toLowerCase();
@@ -835,7 +1078,7 @@ function ModelCombobox({ id, value, models, onChange }: { id: string; value: str
           ref={inputRef}
           id={id}
           className="font-mono"
-          placeholder="default"
+          placeholder={loading ? "Loading models…" : "default"}
           value={value}
           onChange={(e) => {
             onChange(e.target.value);

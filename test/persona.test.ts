@@ -34,6 +34,13 @@ describe("parsePersona", () => {
 
   test("no frontmatter: whole text is the body, model null", () => {
     const p = parsePersona("Just a body\n");
-    expect(p).toEqual({ body: "Just a body\n", model: null, thinking: null });
+    expect(p).toEqual({ body: "Just a body\n", model: null, thinking: null, harness: null });
+  });
+
+  test("harness: names the harness the model is written for; unknown names are ignored", () => {
+    expect(parsePersona("---\nharness: claude\nmodel: sonnet\n---\nBody\n")).toMatchObject({ harness: "claude", model: "sonnet" });
+    expect(parsePersona("---\nharness: \"codex\"\n---\nBody\n")).toMatchObject({ harness: "codex", model: null });
+    expect(parsePersona("---\nharness: gemini\nmodel: a/b\n---\nBody\n").harness).toBeNull();
+    expect(parsePersona("---\nmodel: a/b\n---\nBody\n").harness).toBeNull();
   });
 });

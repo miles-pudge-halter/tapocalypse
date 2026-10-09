@@ -15,6 +15,9 @@ import { config, HttpError, MAX_STEER_CHARS } from "./config";
 import { runDoctor } from "./doctor";
 import { connectedAndroidSerials, exec, listDevices, screencap } from "./devices/devices";
 import { bootTarget, isBootedByTapocalypse, poolView, shutdownDevice } from "./devices/pool";
+import { harnesses, defaultHarness, detectInstalled } from "./harness";
+import { HARNESS_IDS, HarnessIdSchema, type HarnessId } from "./harness/types";
+import { handleRunMcp } from "./mcp/run-server";
 import { activeRunIds, handleMcp, mcpStatus } from "./mcp/server";
 import { listModels } from "./models";
 import { detectProject } from "./projects/detect";
@@ -88,7 +91,7 @@ function hasJsonBody(method: string, parts: string[]): boolean {
   const [root, a, b, c] = parts;
   if (method === "PUT") return parts.length === 3 && root === "api" && a === "projects";
   if (method !== "POST") return false;
-  if (root === "mcp") return parts.length === 1;
+  if (root === "mcp") return parts.length === 1 || (parts.length === 3 && a === "runs");
   if (root !== "api") return false;
   if (parts.length === 2) return a === "runs" || a === "batches" || a === "projects";
   if (parts.length === 3) {
@@ -109,6 +112,30 @@ function guardRequest(req: Request, parts: string[]): void {
   if (hasJsonBody(req.method, parts) && !req.headers.get("content-type")?.startsWith("application/json")) {
     throw new HttpError(415, "content-type must be application/json");
   }
+}
+
+
+
+/** Optional `harness` value; 400 when present but not a known harness id. */
+function harnessParam(value: unknown): HarnessId | undefined {
+  if (value === undefined || value === null) return undefined;
+  const parsed = HarnessIdSchema.safeParse(value);
+  if (!parsed.success) throw new HttpError(400, `harness must be one of ${HARNESS_IDS.join(", ")}`);
+  return parsed.data;
+}
+
+/** `GET /api/harnesses`: what the New run picker offers and what the run page may show (steer, transcript). */
+async function harnessesView() {
+  const [installed, selected] = await Promise.all([detectInstalled(), defaultHarness()]);
+  return {
+    default: selected,
+    harnesses: HARNESS_IDS.map((id) => ({
+      id,
+      label: harnesses[id].label,
+      installed: installed[id],
+      capabilities: harnesses[id].capabilities,
+    })),
+  };
 }
 
 function json(data: unknown, status = 200, headers?: Record<string, string>): Response {
@@ -284,9 +311,9 @@ async function route(req: Request, url: URL): Promise<Response> {
   const parts = pathname.split("/").filter(Boolean).map(decodeURIComponent);
   guardRequest(req, parts);
 
-  if (parts.length === 1 && parts[0] === "mcp") {
+  if (parts[0] === "mcp" && (parts.length === 1 || (parts.length === 3 && parts[1] === "runs"))) {
     if (method !== "POST") return json({ error: "method not allowed" }, 405, { Allow: "POST" });
-    return handleMcp(req);
+    return parts.length === 1 ? handleMcp(req) : handleRunMcp(req, parts[2], (id) => runner.progressLookup(id));
   }
 
   if (method === "GET" && parts[0] === "files" && parts.length >= 3) {
@@ -373,7 +400,11 @@ async function route(req: Request, url: URL): Promise<Response> {
   if (method === "GET") {
     if (pathname === "/api/doctor") return json(await runDoctor({ fresh: url.searchParams.get("fresh") === "1" }));
     if (pathname === "/api/events") return globalEvents(req);
-    if (pathname === "/api/models") return json({ models: await listModels() });
+    if (pathname === "/api/harnesses") return json(await harnessesView());
+    if (pathname === "/api/models") {
+      const harness = harnessParam(url.searchParams.get("harness")) ?? (await defaultHarness());
+      return json({ models: await listModels(harness) });
+    }
     if (pathname === "/api/templates") return json(listTemplates());
     if (pathname === "/api/mcp/status") return json(mcpStatus());
     if (pathname === "/api/stats") {
@@ -387,7 +418,9 @@ async function route(req: Request, url: URL): Promise<Response> {
 
   if (parts[1] === "batches") {
     if (parts.length === 2 && method === "POST") {
-      const { runs, batchId } = await scheduler.enqueueBatch(await readJsonObject(req));
+      const body = await readJsonObject(req);
+      harnessParam(body.harness);
+      const { runs, batchId } = await scheduler.enqueueBatch(body);
       return json({ batchId, runs: runs.map(runView) }, 201);
     }
     if (parts.length === 3 && method === "GET") {
@@ -420,6 +453,7 @@ async function route(req: Request, url: URL): Promise<Response> {
         const body = await readJsonObject(req);
         // batchId is assigned by POST /api/batches only.
         delete body.batchId;
+        harnessParam(body.harness);
         const created = await scheduler.enqueueRun({
           ...body,
           requestedBy: typeof body.requestedBy === "string" && body.requestedBy ? body.requestedBy : "web",
@@ -449,7 +483,7 @@ async function route(req: Request, url: URL): Promise<Response> {
           return json({ ok: true });
         }
         if (action === "rerun" && method === "POST") {
-          const { only, device, requestedBy } = await readJsonObject(req);
+          const { only, device, requestedBy, harness } = await readJsonObject(req);
           if (only !== "failed" && only !== "all") throw new HttpError(400, "only must be failed or all");
           if (device !== undefined && (typeof device !== "object" || device === null || Array.isArray(device))) {
             throw new HttpError(400, "device must be an object");
@@ -458,6 +492,7 @@ async function route(req: Request, url: URL): Promise<Response> {
             only,
             device: device as { serial?: string; platform?: Platform } | undefined,
             requestedBy: typeof requestedBy === "string" && requestedBy ? requestedBy : "web",
+            harness: harnessParam(harness),
           });
           return json(runView(created), 201);
         }

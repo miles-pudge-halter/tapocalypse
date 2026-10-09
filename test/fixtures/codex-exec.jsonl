@@ -1,0 +1,22 @@
+{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Unknown configuration key `request_max_retries` ignored"}}
+{"type":"item.started","item":{"id":"item_1","type":"mcp_tool_call","server":"tpc","tool":"qa_plan","arguments":{"checks":[{"id":"C1","title":"App launches"},{"id":"C2","title":"Login works"}]},"result":null,"error":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"mcp_tool_call","server":"tpc","tool":"qa_plan","arguments":{"checks":[{"id":"C1","title":"App launches"},{"id":"C2","title":"Login works"}]},"result":{"content":[{"type":"text","text":"recorded"}],"structured_content":null},"error":null,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"reasoning","text":"**Planning the first device action**"}}
+{"type":"item.started","item":{"id":"item_3","type":"mcp_tool_call","server":"mobile_mcp","tool":"mobile_list_elements_on_screen","arguments":{"device":"Pixel_8"},"result":null,"error":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_3","type":"mcp_tool_call","server":"mobile_mcp","tool":"mobile_list_elements_on_screen","arguments":{"device":"Pixel_8"},"result":{"content":[{"type":"text","text":"[{\"text\":\"Sign in\"}]"},{"type":"image","data":"AAAA","mimeType":"image/png"}],"structured_content":null},"error":null,"status":"completed"}}
+{"type":"item.started","item":{"id":"item_4","type":"command_execution","command":"/bin/zsh -lc 'adb devices'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_4","type":"command_execution","command":"/bin/zsh -lc 'adb devices'","aggregated_output":"List of devices attached\nemulator-5554\tdevice\n","exit_code":0,"status":"completed"}}
+{"type":"item.started","item":{"id":"item_5","type":"command_execution","command":"/bin/zsh -lc 'grep -q missing log.txt'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_5","type":"command_execution","command":"/bin/zsh -lc 'grep -q missing log.txt'","aggregated_output":"","exit_code":1,"status":"failed"}}
+{"type":"item.completed","item":{"id":"item_6","type":"file_change","changes":[{"path":"reports/QA-REPORT-demo.md","kind":"add"},{"path":"reports/notes.md","kind":"update"}],"status":"completed"}}
+{"type":"item.started","item":{"id":"item_7","type":"mcp_tool_call","server":"tpc","tool":"qa_check","arguments":{"id":"C9","status":"pass"},"result":null,"error":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_7","type":"mcp_tool_call","server":"tpc","tool":"qa_check","arguments":{"id":"C9","status":"pass"},"result":null,"error":{"message":"unknown check C9"},"status":"failed"}}
+{"type":"item.started","item":{"id":"item_8","type":"web_search","query":"flutter semantics label"}}
+{"type":"item.completed","item":{"id":"item_8","type":"web_search","query":"flutter semantics label"}}
+{"type":"item.updated","item":{"id":"item_9","type":"todo_list","items":[{"text":"Check C1","completed":true},{"text":"Check C2","completed":false}]}}
+{"type":"item.started","item":{"id":"item_10","type":"mcp_tool_call","server":"tpc","tool":"qa_finish","arguments":{"verdict":"PASS","summary":"All good","reportPath":"reports/QA-REPORT-demo.md"},"result":null,"error":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_10","type":"mcp_tool_call","server":"tpc","tool":"qa_finish","arguments":{"verdict":"PASS","summary":"All good","reportPath":"reports/QA-REPORT-demo.md"},"result":{"content":[{"type":"text","text":"recorded"}],"structured_content":null},"error":null,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_11","type":"agent_message","text":"All checks passed. Report written."}}
+{"type":"turn.completed","usage":{"input_tokens":12000,"cached_input_tokens":8000,"cache_write_input_tokens":300,"output_tokens":540,"reasoning_output_tokens":120}}

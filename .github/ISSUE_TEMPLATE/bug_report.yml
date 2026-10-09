@@ -48,11 +48,23 @@ body:
       placeholder: macOS 15.4, arm64
     validations:
       required: true
-  - type: input
-    id: omp-version
+  - type: dropdown
+    id: harness
     attributes:
-      label: omp version
-      description: Output of `omp --version`.
+      label: Agent harness
+      description: The agent runtime the failing run used (shown on the run page).
+      options:
+        - omp
+        - Claude Code
+        - Codex CLI
+    validations:
+      required: true
+  - type: input
+    id: harness-version
+    attributes:
+      label: Harness version
+      description: Output of `omp --version`, `claude --version` or `codex --version` for the harness above.
+      placeholder: claude 2.1.291
     validations:
       required: true
   - type: input

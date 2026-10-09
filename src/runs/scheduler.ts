@@ -5,17 +5,20 @@ import { z } from "zod";
 import { getBatchMeta, makeBatchId, pruneBatchMeta, saveBatchMeta } from "../batches";
 import { type Config, HttpError } from "../config";
 import { artemisAvailable } from "../doctor";
-import { getProject, PACKAGE_RE } from "../projects/registry";
+import { getHarness, resolveHarness } from "../harness";
+import { HARNESS_IDS, type HarnessId } from "../harness/types";
+import { getProject, PACKAGE_RE, type Project, resolvePersonaPath } from "../projects/registry";
 import type { Device } from "../devices/devices";
 import { getSuite, MAX_BRIEF_LENGTH, MAX_TITLE_LENGTH, type Suite, type SuiteCheck } from "../suites";
 import { extractTickets, lookupPullRequest, resolveSource, type SourceInput, SourceInputSchema } from "./source";
+import { loadPersona } from "./prompt";
 import { createRun, deleteRun as deleteStoredRun, getRun, listRuns, type NewRun, saveRun } from "./store";
 import { ACTIVE, type Activity, type Backend, type Check, type DeviceRequest, type Platform, type Run, type RunSource } from "./types";
 
 export type StartTarget = { serial: string } | { bootTarget: { platform: Platform; target: string } };
 
 export interface SchedulerDeps {
-  config: Pick<Config, "maxConcurrentRuns" | "devicePool">;
+  config: Pick<Config, "maxConcurrentRuns" | "devicePool" | "agent">;
   listDevices(): Promise<Device[]>;
   /** Number of devices of this platform booted by this process (pool `booted` map). */
   bootedCount(platform: Platform): number;
@@ -44,8 +47,12 @@ export interface EnqueueInput {
   packageId?: string;
   requestedBy?: string;
   source?: SourceInput;
+  /** Agent CLI; omitted = project `agent.harness`, persona `harness:`, config `agent.harness`, first installed. */
+  harness?: HarnessId;
   model?: string;
   thinking?: string;
+  /** Harness-native reasoning effort; `thinking` is the legacy omp spelling. */
+  effort?: string;
   suiteId?: string;
   install?: { path: string };
   /** Set by `enqueueBatch`; HTTP/MCP entry points must not forward it from clients. */
@@ -60,8 +67,10 @@ export interface BatchInput {
   devices: Partial<DeviceRequest>[];
   backend?: Backend;
   packageId?: string;
+  harness?: HarnessId;
   model?: string;
   thinking?: string;
+  effort?: string;
   install?: { path: string };
   source?: SourceInput;
   requestedBy?: string;
@@ -85,6 +94,7 @@ const thinkingLevel = z
   .refine((v) => v === undefined || (THINKING_LEVELS as readonly string[]).includes(v), {
     message: `must be one of ${THINKING_LEVELS.join(", ")}`,
   });
+const harnessId = z.enum(HARNESS_IDS).optional();
 /** Same shape the project registry enforces for `defaultPackage`; empty falls back to the project's package. */
 const packageId = z
   .string()
@@ -105,8 +115,10 @@ const EnqueueSchema = z.object({
   packageId,
   requestedBy,
   source: SourceInputSchema.optional(),
+  harness: harnessId,
   model: optionalText(),
   thinking: thinkingLevel,
+  effort: optionalText(40),
   suiteId: optionalText(),
   install: installRequest.optional(),
   batchId: optionalText(),
@@ -122,8 +134,10 @@ const BatchSchema = z.object({
   packageId,
   requestedBy,
   source: SourceInputSchema.optional(),
+  harness: harnessId,
   model: optionalText(),
   thinking: thinkingLevel,
+  effort: optionalText(40),
   install: installRequest.optional(),
 });
 
@@ -133,6 +147,15 @@ function parseOrThrow<T>(schema: z.ZodType<T>, body: unknown): T {
   const issue = parsed.error.issues[0]!;
   const where = issue.path.map(String).join(".");
   throw new HttpError(400, where ? `${where}: ${issue.message}` : issue.message);
+}
+
+/** The `harness:` a project's persona names; null when it names none or the persona cannot be read (the runner reports that). */
+function personaHarness(project: Project): HarnessId | null {
+  try {
+    return loadPersona(resolvePersonaPath(project)).harness;
+  } catch {
+    return null;
+  }
 }
 
 /** State carried over from an existing run by `rerun`; skips suite lookup and source resolution. */
@@ -281,6 +304,14 @@ export class Scheduler {
       throw new HttpError(400, `suite ${suite.id} does not support ${platform}`);
     }
     const backend = input.backend ?? "mobile-mcp";
+    const harness = await resolveHarness({
+      run: input.harness,
+      project: project.agent?.harness,
+      persona: personaHarness(project),
+      config: this.deps.config.agent?.harness,
+    });
+    const { label, capabilities } = getHarness(harness);
+    if (!capabilities.backends.includes(backend)) throw new HttpError(400, `${label} does not support the ${backend} backend`);
     if (backend === "artemis" && platform === "ios") throw new HttpError(400, "Artemis backend is Android-only");
     if (backend === "artemis" && !artemisAvailable()) {
       throw new HttpError(400, "Artemis backend is not configured (set artemisPath in tapocalypse.config.json)");
@@ -328,8 +359,10 @@ export class Scheduler {
         batchId: input.batchId ?? null,
         suiteId: copy ? copy.suiteId : (suite?.id ?? null),
         suiteChecks,
+        harness,
         model: input.model ?? suite?.model ?? null,
-        thinking: input.thinking ?? null,
+        thinking: input.thinking ?? (harness === "omp" ? (input.effort ?? null) : null),
+        effort: input.effort ?? input.thinking ?? null,
         rerunOf: copy?.rerunOf ?? null,
         install: input.install ?? null,
       },
@@ -380,8 +413,10 @@ export class Scheduler {
           device: { platform, serial: device.serial },
           backend: input.backend,
           packageId: input.packageId,
+          harness: input.harness,
           model: input.model,
           thinking: input.thinking,
+          effort: input.effort,
           install: input.install,
           source: input.source,
           requestedBy: input.requestedBy,
@@ -404,7 +439,7 @@ export class Scheduler {
    */
   async rerun(
     runId: string,
-    opts: { only: "failed" | "all"; device?: Partial<DeviceRequest>; requestedBy?: string },
+    opts: { only: "failed" | "all"; device?: Partial<DeviceRequest>; requestedBy?: string; harness?: HarnessId },
   ): Promise<Run> {
     if (opts.only !== "failed" && opts.only !== "all") throw new HttpError(400, "only must be failed or all");
     const run = this.live.get(runId) ?? getRun(runId);
@@ -422,6 +457,9 @@ export class Scheduler {
         suiteChecks = suiteChecks.filter((c) => ids.has(c.id));
       }
     }
+    // A model / effort is harness-native: a different harness starts from its own defaults.
+    const harness = opts.harness ?? run.harness;
+    const sameHarness = harness === run.harness;
     const baseTitle = run.title.endsWith(RERUN_SUFFIX) ? run.title.slice(0, -RERUN_SUFFIX.length) : run.title;
     const prepared = await this.prepare(
       {
@@ -431,8 +469,10 @@ export class Scheduler {
         device: opts.device ?? run.deviceRequest,
         backend: run.backend,
         packageId: run.packageId,
-        model: run.model ?? undefined,
-        thinking: run.thinking ?? undefined,
+        harness,
+        model: (sameHarness ? run.model : null) ?? undefined,
+        thinking: (sameHarness ? run.thinking : null) ?? undefined,
+        effort: (sameHarness ? run.effort : null) ?? undefined,
         requestedBy: opts.requestedBy ?? "web",
       },
       { rerunOf: run.id, suiteId: run.suiteId, suiteChecks, source: run.source },
@@ -472,8 +512,10 @@ export class Scheduler {
       batchId: run.batchId,
       suiteId: run.suiteId,
       suiteChecks: structuredClone(run.suiteChecks),
+      harness: run.harness,
       model: run.model,
       thinking: run.thinking,
+      effort: run.effort,
       attempt: run.attempt + 1,
       retryOf: run.id,
       rerunOf: run.rerunOf,

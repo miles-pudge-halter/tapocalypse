@@ -51,6 +51,12 @@ function runOptions(argv: string[]): RunOptions {
 }
 
 describe("parseCli", () => {
+  test("--harness accepts omp, claude and codex only", () => {
+    for (const id of ["omp", "claude", "codex"] as const) expect(runOptions(["--brief", "x", "--harness", id]).harness).toBe(id);
+    expect(runOptions(["--brief", "x"]).harness).toBeNull();
+    expect(() => runOptions(["--brief", "x", "--harness", "gemini"])).toThrow(UsageError);
+  });
+
   test("run with a brief applies the documented defaults", () => {
     const o = runOptions(["--brief", "open settings"]);
     expect(o).toMatchObject({
@@ -165,6 +171,14 @@ describe("buildStartRequest", () => {
       device: { platform: "ios", serial: "ios-sim" },
       requestedBy: "cli",
     });
+  });
+
+  test("--harness picks the agent harness for a run and for a batch; omitted it is not sent", () => {
+    const single = buildStartRequest(runOptions(["--brief", "x", "--harness", "codex"]), "x", platformFor, "cli");
+    expect(single.body.harness).toBe("codex");
+    const batch = buildStartRequest(runOptions(["--brief", "x", "--devices", "2", "--harness", "claude"]), "x", platformFor, "cli");
+    expect(batch.body.harness).toBe("claude");
+    expect("harness" in buildStartRequest(runOptions(["--brief", "x"]), "x", platformFor, "cli").body).toBe(false);
   });
 
   test("several serials or --devices N fan out to a batch; suites send no brief or default title", () => {

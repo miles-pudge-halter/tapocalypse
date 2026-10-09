@@ -20,6 +20,8 @@ import {
   type Template,
   type Verdict,
   type Backend,
+  type HarnessInfo,
+  type HarnessId,
 } from "./api";
 import { readStorage, writeStorage } from "./storage";
 
@@ -602,9 +604,27 @@ export function useStats(
   return { stats: data, loading, error, refresh };
 }
 
-export function useModels(): { models: string[]; loading: boolean; error: string | null } {
-  const { data, loading, error } = useAsync(api.models, "models");
+export function useModels(harness?: HarnessId): { models: string[]; loading: boolean; error: string | null } {
+  const { data, loading, error } = useAsync(() => api.models(harness), `models:${harness ?? ""}`);
   return { models: data ?? [], loading, error };
+}
+
+/** Supported agent CLIs with install state and capabilities (`default` = the harness a run gets when none is chosen). */
+export function useHarnesses(): {
+  harnesses: HarnessInfo[];
+  defaultId: HarnessId | null;
+  loading: boolean;
+  error: string | null;
+} {
+  const { data, loading, error } = useAsync(api.harnesses, "harnesses");
+  return { harnesses: data?.harnesses ?? [], defaultId: data?.default ?? null, loading, error };
+}
+
+/** One harness by id (a run's `harness`): `label` is undefined while the list loads, then falls back to the raw id. */
+export function useHarness(id: HarnessId): { info: HarnessInfo | null; label: string | undefined; loading: boolean } {
+  const { harnesses, loading } = useHarnesses();
+  const info = harnesses.find((h) => h.id === id) ?? null;
+  return { info, label: info?.label ?? (loading ? undefined : id), loading };
 }
 
 export function useTemplates(): { templates: Template[]; loading: boolean; error: string | null } {
@@ -636,6 +656,8 @@ export interface NewRunPrefill {
   backend?: Backend;
   packageId?: string;
   model?: string;
+  harness?: HarnessId;
+  effort?: string;
   suiteId?: string;
   sourcePath?: string;
 }

@@ -85,6 +85,11 @@ describe("humaniseTool: other families", () => {
     expect(humaniseTool("grep", { pattern: "junction", path: "lib" }).label).toBe('Search "junction" in lib');
   });
 
+  test("the canonical web search of claude/codex reads as a web search, with or without a query", () => {
+    expect(humaniseTool("search", { query: "x" }).label).toBe('Web search "x"');
+    expect(humaniseTool("search", {}).label).toBe("Web search");
+  });
+
   test("an unresolved xd:// write is described as the MCP call it is", () => {
     const wrapped = { path: `xd://${MCP}click_on_screen_at_coordinates`, content: '{"device":"d","ref":"@e1"}' };
     expect(humaniseTool("write", wrapped)).toEqual({ family: "device", label: "Tap @e1" });

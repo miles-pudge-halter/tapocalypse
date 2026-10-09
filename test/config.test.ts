@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import path from "node:path";
-import { config, findEmulator, REPO_ROOT, resolveConfigPath, resolveDataDir } from "../src/config";
+import { config, ConfigSchema, findEmulator, REPO_ROOT, resolveConfigPath, resolveDataDir } from "../src/config";
 
 const HOME = "/home/me";
 const legacyConfig = path.join(REPO_ROOT, "tapocalypse.config.json");
@@ -43,5 +43,12 @@ describe("config defaults", () => {
   test("a config without retry/retention gets one infra retry and keeps everything", () => {
     expect(config.retry).toEqual({ infra: 1 });
     expect(config.retention).toEqual({});
+  });
+});
+
+describe("ConfigSchema runMaxTime", () => {
+  test("accepts the durations the runner and omp understand and rejects what parseDurationMs cannot read", () => {
+    for (const ok of ["60m", "1h30m", "45s", "2h", "90"]) expect(ConfigSchema.safeParse({ ...config, runMaxTime: ok }).success).toBe(true);
+    for (const bad of ["soon", "10 minutes", "m60", "0s"]) expect(ConfigSchema.safeParse({ ...config, runMaxTime: bad }).success).toBe(false);
   });
 });

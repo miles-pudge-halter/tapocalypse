@@ -1,10 +1,10 @@
 # Contributing to Tapocalypse
 
-Thanks for helping. Tapocalypse is a local developer tool: a Bun server, a React UI and an MCP endpoint that start headless [omp](https://github.com/can1357/oh-my-pi) agents to QA mobile apps on emulators and simulators.
+Thanks for helping. Tapocalypse is a local developer tool: a Bun server, a React UI and an MCP endpoint that start headless coding-agent CLIs ([omp](https://github.com/can1357/oh-my-pi), [Claude Code](https://code.claude.com) or [Codex CLI](https://github.com/openai/codex), called *harnesses*) to QA mobile apps on emulators and simulators.
 
 ## Setup
 
-You need [Bun](https://bun.sh) 1.3 or newer and, to exercise real runs, omp plus Android `adb` and/or Xcode. See the README's Prerequisites.
+You need [Bun](https://bun.sh) 1.3 or newer and, to exercise real runs, at least one of omp, Claude Code or Codex CLI (signed in) plus Android `adb` and/or Xcode. See the README's Prerequisites.
 
 ```sh
 git clone https://github.com/miles-pudge-halter/tapocalypse.git
@@ -36,7 +36,11 @@ The CLI is `src/cli.ts` (`bun src/cli.ts --help`); it only needs a running serve
 - Tests live in `test/` and use `bun:test`. `test/preload.ts` points the config and data directory at a temporary fake project, so tests never touch your real state.
 - Test behaviour a user or integrator could notice: lifecycle transitions, scheduling rules, parsing, path safety, error mapping. Do not pin wording, copies of the implementation or incidental defaults.
 - A bug fix comes with a test that fails without the fix.
-- Tests must be deterministic and must not need adb, a simulator or a model provider. Stub the device and omp layers (see `test/scheduler.test.ts` and `test/rpc.test.ts`; `test/fixtures/rpc-session.jsonl` is a captured omp session).
+- Tests must be deterministic and must not need adb, a simulator or a model provider. Stub the device and harness layers (see `test/scheduler.test.ts`, `test/rpc.test.ts` and the adapter tests; `test/fixtures/` holds recorded or synthetic streams of each harness, such as `rpc-session.jsonl` for omp). A harness adapter is tested by feeding its fixture stream or a fake child process through its public interface, never by launching the real CLI.
+
+## Adding a harness
+
+A harness is one folder, `src/harness/<id>/index.ts`, that exports `harness: Harness` (see `src/harness/types.ts`) and is registered in `src/harness/index.ts`. It spawns the CLI headless, normalizes its event stream into `HarnessEvent`s, maps tool names to the canonical form, reports its capabilities (steer, cost, transcript, backends, limits) and doctor checks, and writes any per-run config under the run folder, never into the repository or the user's home. Secrets such as the run's progress token go through the environment, not argv. Keep the raw frames verbatim in `events.jsonl`; `toActivity` replays them. Test it test-first with a fixture stream and a fake child process.
 
 ## Code style
 

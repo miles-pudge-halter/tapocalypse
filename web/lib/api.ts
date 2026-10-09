@@ -26,6 +26,23 @@ import type { Device } from "../../src/devices/devices";
 import type { Detection, Framework } from "../../src/projects/detect";
 import type { ProjectInput, ProjectStatus, ValidationResult } from "../../src/projects/registry";
 import type { DoctorReport } from "../../src/doctor";
+import type { HarnessCapabilities, HarnessId } from "../../src/harness/types";
+
+export type { HarnessCapabilities, HarnessId };
+
+/** `GET /api/harnesses` entry: one supported agent CLI, whether it is installed, and what it can do. */
+export interface HarnessInfo {
+  id: HarnessId;
+  label: string;
+  installed: boolean;
+  capabilities: HarnessCapabilities;
+}
+
+export interface HarnessList {
+  /** The harness a run uses when the request names none. */
+  default: HarnessId;
+  harnesses: HarnessInfo[];
+}
 
 export type RunView = Run & {
   queuePosition: number | null;
@@ -163,6 +180,7 @@ export interface StartRunInput {
   packageId: string;
   source?: StartRunSource;
   model?: string;
+  harness?: HarnessId;
   thinking?: string;
   suiteId?: string;
   install?: { path: string };
@@ -176,6 +194,7 @@ export interface StartBatchInput {
   backend?: Backend;
   packageId?: string;
   model?: string;
+  harness?: HarnessId;
   thinking?: string;
   source?: StartRunSource;
   requestedBy?: string;
@@ -290,9 +309,11 @@ export const api = {
     if (project) q.set("project", project);
     return request<RunStats>(`/api/stats?${q}`);
   },
-  async models() {
-    return (await request<{ models: string[] }>("/api/models")).models;
+  async models(harness?: HarnessId) {
+    const q = harness ? `?harness=${encodeURIComponent(harness)}` : "";
+    return (await request<{ models: string[] }>(`/api/models${q}`)).models;
   },
+  harnesses: () => request<HarnessList>("/api/harnesses"),
   templates: () => request<Template[]>("/api/templates"),
   suites: (projectId: string) => request<Suite[]>(`/api/projects/${encodeURIComponent(projectId)}/suites`),
   saveSuite: (projectId: string, input: SaveSuiteInput) =>

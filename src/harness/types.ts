@@ -3,18 +3,22 @@
  * the run lifecycle (device, prompt, time budget, verdict); an adapter owns how one CLI is spawned, how its event stream is
  * normalized, how progress tools reach it (omp host tools or the run-scoped MCP endpoint), and how it is probed by doctor.
  */
+import { z } from "zod";
 import type { ExecResult } from "../devices/devices";
 import type { DoctorCheck } from "../doctor";
 import type { Activity, Backend, RunUsage } from "../runs/types";
 
-export type HarnessId = "omp" | "claude" | "codex";
-export const HARNESS_IDS: readonly HarnessId[] = ["omp", "claude", "codex"];
+export const HARNESS_IDS = ["omp", "claude", "codex"] as const;
+export type HarnessId = (typeof HARNESS_IDS)[number];
+export const HarnessIdSchema = z.enum(HARNESS_IDS);
 
 /** Short name of the run-scoped progress MCP server (`qa_plan` / `qa_check` / `qa_finish`). Short because omp truncates long tool names. */
 export const PROGRESS_SERVER = "tpc";
 /** Server names an adapter mounts for the device driver; `toolName(server, tool)` resolves them to the harness's callable name. */
 export const MOBILE_MCP_SERVER = "mobile_mcp";
 export const ARTEMIS_SERVER = "artemis";
+/** npm package of the mobile-mcp device driver every harness mounts through `npx`. */
+export const MOBILE_MCP_PACKAGE = "@mobilenext/mobile-mcp";
 
 export type McpServerSpec =
   | { name: string; transport: "stdio"; command: string; args: string[]; env?: Record<string, string> }
@@ -55,7 +59,8 @@ export interface SpawnOptions {
   /** Device driver + progress servers to mount for this session only. Never touches the user's own config. */
   mcpServers: McpServerSpec[];
   backend: Backend;
-  limits: { maxTimeMs: number | null; maxTurns: number | null; maxBudgetUsd: number | null };
+  /** Raw `config.runMaxTime` (e.g. `60m`) for harnesses that enforce the limit themselves (omp `--max-time`); null = none. */
+  limits: { maxTime: string | null; maxTurns: number | null; maxBudgetUsd: number | null };
   /** Per-harness settings from `config.agent.harnesses[id]` (bin, permissions, sandbox…); adapters validate what they read. */
   settings: Record<string, unknown>;
   onEvent: (e: HarnessEvent) => void;
@@ -79,6 +84,8 @@ export interface HarnessExit {
   signal: string | null;
   /** The harness emitted its terminal event (omp `session_settled`, Claude final `result`, Codex `turn.completed`). */
   settled: boolean;
+  /** False when the session never ran (spawn failure, launch-plan error, MCP startup failure): classified as infra and retried. */
+  started: boolean;
   /** A harness-enforced limit ended the session. */
   limit: "turns" | "budget" | "time" | null;
   /** Terminal error text from the stream (Claude `result.errors`, Codex `turn.failed`, omp `prompt_result.error`). */
@@ -99,6 +106,8 @@ export interface HarnessSession {
   kill(): void;
   /** Best-effort final usage (omp session stats, Claude `result`); the runner falls back to what `onEvent` accumulated. */
   usage(): Promise<RunUsage | null>;
+  /** Present iff the harness has a raw stats payload worth keeping (omp `get_session_stats`); stored as `Run.stats`. */
+  rawStats?(): Promise<unknown>;
   /** Present iff `capabilities.transcriptExport`; resolves true when the file was written. */
   exportTranscript?(file: string): Promise<boolean>;
   readonly exited: Promise<HarnessExit>;
@@ -128,11 +137,15 @@ export interface ProgressSink {
   record(tool: "qa_plan" | "qa_check" | "qa_finish", args: unknown): Promise<string>;
 }
 
-/** Replay context for `toActivity`: tool starts seen so far in this events.jsonl, so results resolve tool and duration. */
+/**
+ * Replay context for `toActivity`: tool starts seen so far in this events.jsonl, so results resolve tool and duration.
+ * `toActivity` runs more than once per frame (store scan pass, then the page pass), so it must be idempotent: an adapter
+ * that dedupes repeated frames records the frame's `seq` in the entry and only skips a frame whose `seq` differs.
+ */
 export interface ReplayContext {
   backend: Backend;
   seq: number;
-  starts: Map<string, { ts: number; tool: string }>;
+  starts: Map<string, { ts: number; tool: string; seq?: number }>;
 }
 
 export interface HarnessDoctorEnv {

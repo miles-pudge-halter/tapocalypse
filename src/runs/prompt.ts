@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
-import type { ToolPrefixes } from "../omp/provision";
+import { ARTEMIS_SERVER, HARNESS_IDS, type HarnessId, MOBILE_MCP_SERVER, PROGRESS_SERVER } from "../harness/types";
 import type { Project } from "../projects/registry";
-import type { Activity, Backend, CheckStatus, Run } from "./types";
+import type { Backend, Run } from "./types";
 
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
@@ -9,6 +9,8 @@ export interface Persona {
   body: string;
   model: string | null;
   thinking: string | null;
+  /** Harness the persona's `model:` is written for; null = unspecified (counts as omp). */
+  harness: HarnessId | null;
 }
 
 /** Splits a trailing `:<thinking level>` off a model id (`anthropic/claude-opus-5-5:high`); other colons stay in the model. */
@@ -19,90 +21,39 @@ export function splitThinking(raw: string): { model: string; thinking: string | 
   return { model: raw, thinking: null };
 }
 
-/** Parses a persona file: optional frontmatter `model:` (optionally `:<thinking>` suffixed) + body. */
+/** Parses a persona file: optional frontmatter `harness:` and `model:` (optionally `:<thinking>` suffixed) + body. */
 export function parsePersona(text: string): Persona {
   const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(text);
-  if (!m) return { body: text, model: null, thinking: null };
+  if (!m) return { body: text, model: null, thinking: null, harness: null };
   const body = text.slice(m[0].length);
-  const modelLine = m[1]!.split(/\r?\n/).find((l) => /^model:\s*/.test(l));
-  const raw = modelLine?.replace(/^model:\s*/, "").trim().replace(/^["']|["']$/g, "");
-  if (!raw) return { body, model: null, thinking: null };
-  return { body, ...splitThinking(raw) };
+  const lines = m[1]!.split(/\r?\n/);
+  const value = (key: string): string | undefined =>
+    lines.find((l) => l.startsWith(`${key}:`))?.slice(key.length + 1).trim().replace(/^["']|["']$/g, "") || undefined;
+  const harnessText = value("harness")?.toLowerCase();
+  const harness = HARNESS_IDS.find((id) => id === harnessText) ?? null;
+  const raw = value("model");
+  if (!raw) return { body, model: null, thinking: null, harness };
+  return { body, ...splitThinking(raw), harness };
 }
 
 export function loadPersona(file: string): Persona {
   return parsePersona(readFileSync(file, "utf8"));
 }
 
-export const hostTools = [
-  {
-    name: "qa_plan",
-    label: "QA plan",
-    description: "Declare every check you will execute, before the first device action.",
-    parameters: {
-      type: "object",
-      properties: {
-        checks: {
-          type: "array",
-          minItems: 1,
-          items: {
-            type: "object",
-            properties: { id: { type: "string" }, title: { type: "string" } },
-            required: ["id", "title"],
-            additionalProperties: false,
-          },
-        },
-      },
-      required: ["checks"],
-      additionalProperties: false,
-    },
-    loadMode: "essential",
-  },
-  {
-    name: "qa_check",
-    label: "QA check",
-    description: "Report a check's status as it changes; attach the screenshot that proves it.",
-    parameters: {
-      type: "object",
-      properties: {
-        id: { type: "string" },
-        status: { type: "string", enum: ["running", "pass", "fail", "blocked", "skipped"] },
-        note: { type: "string" },
-        screenshot: { type: "string", description: "Path relative to the repo root." },
-      },
-      required: ["id", "status"],
-      additionalProperties: false,
-    },
-    loadMode: "essential",
-  },
-  {
-    name: "qa_finish",
-    label: "QA finish",
-    description: "Call exactly once, after the report file is written.",
-    parameters: {
-      type: "object",
-      properties: {
-        verdict: { type: "string", enum: ["PASS", "FAIL", "PASS WITH ISSUES", "BLOCKED", "PARTIAL"] },
-        summary: { type: "string" },
-        reportPath: { type: "string", description: "Path relative to the repo root." },
-      },
-      required: ["verdict", "summary", "reportPath"],
-      additionalProperties: false,
-    },
-    loadMode: "essential",
-  },
-];
+/** The callable name the harness gives `tool` of the MCP server `server` (see `HarnessSession.toolName`). */
+export type ToolNamer = (server: string, tool: string) => string;
 
-/** Backend rules and driving guidance, naming the tool prefixes omp actually mounted for this run. */
-function backendRules(backend: Backend, prefixes: ToolPrefixes): string {
-  const mobile = prefixes.mobileMcp ?? "mcp__mobile_mcp_";
-  const artemis = prefixes.artemis ?? "mcp__artemis_";
+/** Backend rules and driving guidance, naming the tools exactly as this harness mounted them for this run. */
+function backendRules(backend: Backend, toolName: ToolNamer): string {
+  const mobile = (tool: string) => toolName(MOBILE_MCP_SERVER, tool);
+  const artemis = (tool: string) => toolName(ARTEMIS_SERVER, tool);
   if (backend === "artemis") {
-    return `Driver backend: Artemis direct tools. Use ${artemis}mobile_click/swipe/input_text/press_key/long_press/get_device_state/manage_app (package names only) plus adb. NEVER call any ${mobile}* tool and NEVER call ${artemis}mobile_run_task.`;
+    const direct = ["mobile_click", "mobile_swipe", "mobile_input_text", "mobile_press_key", "mobile_long_press", "mobile_get_device_state", "mobile_manage_app"];
+    return `Driver backend: Artemis direct tools. Use ${direct.map(artemis).join(", ")} (package names only) plus adb. NEVER call any ${mobile("")}* tool and NEVER call ${artemis("mobile_run_task")}.`;
   }
-  return `Driver backend: mobile-mcp. Use the ${mobile}* tools plus adb/simctl. NEVER call any ${artemis}* tool.
-mobile-mcp: call mobile_list_elements_on_screen once per screen and tap by its @ref; re-list only after navigation or a visible change.
-Group known sequences (tap, type, tap) in mobile_batch_commands. Use mobile_take_screenshot only for what the element list cannot show.`;
+  return `Driver backend: mobile-mcp. Use the ${mobile("")}* tools plus adb/simctl. NEVER call any ${artemis("")}* tool.
+mobile-mcp: call ${mobile("mobile_list_elements_on_screen")} once per screen and tap by its @ref; re-list only after navigation or a visible change.
+Group known sequences (tap, type, tap) in ${mobile("mobile_batch_commands")}. Use ${mobile("mobile_take_screenshot")} only for what the element list cannot show.`;
 }
 
 function deviceLine(run: Run): string {
@@ -134,149 +85,49 @@ function sourceBlock(run: Run): string {
 }
 
 /** The qa_plan instruction for suite runs, so check ids stay stable across runs; empty otherwise. */
-function suiteBlock(run: Run): string {
+function suiteBlock(run: Run, planTool: string): string {
   if (!run.suiteId || !run.suiteChecks?.length) return "";
-  return `Use exactly these check ids and titles in qa_plan: ${run.suiteChecks.map((c) => `${c.id} ${JSON.stringify(c.title)}`).join(", ")}\n`;
+  return `Use exactly these check ids and titles in ${planTool}: ${run.suiteChecks.map((c) => `${c.id} ${JSON.stringify(c.title)}`).join(", ")}\n`;
 }
 
-export function buildPrompt(run: Run, project: Project, prefixes: ToolPrefixes, runMaxTime: string): string {
+export interface PromptOptions {
+  /** The run's time budget as configured (`runMaxTime`). */
+  runMaxTime: string;
+  /** Persona body to put in front of the prompt, for harnesses that cannot append a system prompt; omit to leave it out. */
+  prependPersona?: string | null;
+}
+
+export function buildPrompt(run: Run, project: Project, toolName: ToolNamer, opts: PromptOptions): string {
   const { reportsDir } = project;
   const runId = run.id;
-  return `You are the QA agent described in your system prompt, running headless inside Tapocalypse. Other QA agents are running in parallel on other devices. You are the top-level agent: do NOT spawn subagents, do NOT use the ask tool, do NOT wait for user replies, and NEVER call any mcp__tapocalypse_* tool. If you are blocked, record why in the report and call qa_finish with verdict BLOCKED.
+  const plan = toolName(PROGRESS_SERVER, "qa_plan");
+  const check = toolName(PROGRESS_SERVER, "qa_check");
+  const finish = toolName(PROGRESS_SERVER, "qa_finish");
+  const persona = opts.prependPersona ? `Your system instructions (follow them for the whole session):\n${opts.prependPersona.trim()}\n\n---\n\n` : "";
+  return `${persona}You are the QA agent described in your system instructions, running headless inside Tapocalypse. Other QA agents are running in parallel on other devices. You are the top-level agent: do NOT spawn subagents, do NOT ask the user questions or wait for replies, and NEVER call a tool of any MCP server named "tapocalypse". If you are blocked, record why in the report and call ${finish} with verdict BLOCKED.
 
 ${deviceLine(run)}
 App package: ${run.packageId}. Use the build that is already installed unless the brief says otherwise.
 Run id: ${runId}.
-Time budget: ${runMaxTime}. If you are running out of time, stop testing, write the report with what you have and call qa_finish.
-${sourceBlock(run)}${backendRules(run.backend, prefixes)}
+Time budget: ${opts.runMaxTime}. If you are running out of time, stop testing, write the report with what you have and call ${finish}.
+${sourceBlock(run)}${backendRules(run.backend, toolName)}
 
 Progress reporting (mandatory — the Tapocalypse UI is built from these calls):
-1. After writing your test plan and before your first device action, call qa_plan with every check (short ids like C1, C2...).
-2. Call qa_check(status "running") when you start a check, and qa_check(pass|fail|blocked|skipped, note, screenshot) when it resolves.
+1. After writing your test plan and before your first device action, call ${plan} with every check (short ids like C1, C2...).
+2. Call ${check}(status "running") when you start a check, and ${check}(pass|fail|blocked|skipped, note, screenshot) when it resolves.
 3. Save screenshots under ${reportsDir}/screenshots/${runId}/ and write the report to ${reportsDir}/QA-REPORT-${runId}.md (these unique paths keep parallel runs from colliding), embedding screenshots with paths relative to the report (screenshots/${runId}/NN-name.png).
-4. Finally call qa_finish with the verdict, a 2-4 sentence summary and the report path.
-${suiteBlock(run)}
+4. Finally call ${finish} with the verdict, a 2-4 sentence summary and the report path.
+${suiteBlock(run, plan)}
 Brief:
 ${run.brief}`;
 }
 
-/** Matches mobile-mcp's tools in both naming forms: `mcp__mobile_mcp_mobile_*` (user config) and `mcp__<plugin>_mobile_mcp_mobile_*` (Tapocalypse's plugin). */
-const MOBILE_MCP_TOOL = /^mcp__\w*mobile_mcp_mobile_/;
+/** Canonical `mcp__mobile_mcp_*` names (adapters strip plugin namespaces, so user-config and Tapocalypse-provisioned servers look alike). */
+const MOBILE_MCP_TOOL = /^mcp__mobile_mcp_/;
 
-const HOST_TOOL_NAMES = hostTools.map((t) => t.name);
-
-function backendViolation(tool: string, backend: Backend): boolean {
+/** True when `tool` (canonical name) breaks the run's backend rule or reaches Tapocalypse's own MCP server. */
+export function backendViolation(tool: string, backend: Backend): boolean {
   if (tool.startsWith("mcp__tapocalypse_")) return true;
   if (backend === "mobile-mcp") return tool.startsWith("mcp__artemis_");
   return MOBILE_MCP_TOOL.test(tool) || tool === "mcp__artemis_mobile_run_task";
-}
-
-/** Tool calls awaiting their `tool_execution_end`: lets the end line name the resolved tool and time the call. */
-export type ToolStarts = Map<string, { ts: number; tool: string }>;
-
-const ARGS_LIMIT = 2048;
-const CHECK_STATUSES: readonly CheckStatus[] = ["pending", "running", "pass", "fail", "blocked", "skipped"];
-
-/** Keeps the value as-is when its JSON fits `ARGS_LIMIT`, else a truncated JSON string. */
-function truncateArgs(v: unknown): unknown {
-  let json: string | undefined;
-  try {
-    json = JSON.stringify(v);
-  } catch {
-    return undefined;
-  }
-  if (json === undefined || json.length <= ARGS_LIMIT) return v;
-  return `${json.slice(0, ARGS_LIMIT)}…`;
-}
-
-/** Tool-result text blocks joined. */
-function resultText(result: unknown): string {
-  const content = (result as { content?: unknown } | undefined)?.content;
-  if (!Array.isArray(content)) return "";
-  return content
-    .filter((c): c is { type: "text"; text: string } => c?.type === "text" && typeof c.text === "string")
-    .map((c) => c.text)
-    .join("\n")
-    .trim();
-}
-
-function formatDuration(ms: number): string {
-  return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
-}
-
-/** Feed line for a host tool call (qa_plan / qa_check / qa_finish); null when its arguments are malformed. */
-function hostToolActivity(tool: string, args: Record<string, unknown>): Pick<Activity, "text" | "checkId" | "checkStatus"> | null {
-  if (tool === "qa_plan" && Array.isArray(args.checks)) {
-    return { text: `Test plan: ${args.checks.length} check${args.checks.length === 1 ? "" : "s"}` };
-  }
-  if (tool === "qa_check" && typeof args.id === "string" && CHECK_STATUSES.includes(args.status as CheckStatus)) {
-    const note = typeof args.note === "string" && args.note ? ` — ${args.note.slice(0, 300)}` : "";
-    return { text: `${args.id}: ${String(args.status)}${note}`, checkId: args.id, checkStatus: args.status as CheckStatus };
-  }
-  if (tool === "qa_finish" && typeof args.verdict === "string") return { text: `Finished: ${args.verdict}` };
-  return null;
-}
-
-/**
- * Maps an omp frame (live or replayed from events.jsonl) to a feed line; `seq` is the frame's 0-based line index in
- * events.jsonl. Pass the same `starts` map across a session so `tool_end` lines resolve their tool and duration.
- */
-export function frameToActivity(frame: unknown, backend: Backend, seq: number, starts?: ToolStarts): Activity | null {
-  if (!frame || typeof frame !== "object") return null;
-  const f = frame as Record<string, unknown>;
-  const ts = typeof f._ts === "string" ? f._ts : new Date().toISOString();
-  switch (f.type) {
-    case "_activity":
-      return { ts, seq, kind: f.kind as Activity["kind"], text: String(f.text) };
-    case "tool_execution_start": {
-      if (typeof f.toolName !== "string") return { ts, seq, kind: "tool", text: JSON.stringify(frame).slice(0, 300) };
-      // omp mounts MCP tools as xd:// devices: a `write xd://mcp__x` is the actual call of tool `mcp__x`
-      // (a `read` of it only fetches its docs). Attribute the call to the MCP tool.
-      const args = (f.args ?? {}) as Record<string, unknown>;
-      const xdTool = typeof args.path === "string" && args.path.startsWith("xd://") ? args.path.slice(5) : null;
-      const [tool, detail] =
-        f.toolName === "write" && xdTool ? [xdTool, args.content ?? {}] : [f.toolName, args];
-      const callId = typeof f.toolCallId === "string" ? f.toolCallId : undefined;
-      if (callId) starts?.set(callId, { ts: Date.parse(ts), tool });
-      let parsedDetail = detail;
-      if (typeof detail === "string") {
-        try {
-          parsedDetail = JSON.parse(detail);
-        } catch {}
-      }
-      const base = { ts, seq, callId, tool, args: truncateArgs(parsedDetail) };
-      if (backendViolation(tool, backend)) return { ...base, kind: "warn", text: `backend violation: ${tool}` };
-      const host = hostToolActivity(tool, args);
-      if (host) return { ...base, kind: "check", ...host };
-      const shown = typeof detail === "string" ? detail : JSON.stringify(detail);
-      return { ...base, kind: "tool", text: `${tool} ${shown.slice(0, 200)}` };
-    }
-    case "tool_execution_end": {
-      if (typeof f.toolName !== "string") return null;
-      const callId = typeof f.toolCallId === "string" ? f.toolCallId : undefined;
-      const start = callId ? starts?.get(callId) : undefined;
-      const tool = start?.tool ?? f.toolName;
-      // A successful qa_* call already has its "check" line from the start frame; a rejected one must stay visible.
-      if (HOST_TOOL_NAMES.includes(tool) && f.isError !== true) return null;
-      const ok = f.isError !== true;
-      const durationMs = start ? Math.max(0, Date.parse(ts) - start.ts) : undefined;
-      const detail = ok ? "" : `: ${resultText(f.result).slice(0, 200)}`;
-      const took = durationMs === undefined ? "" : ` (${formatDuration(durationMs)})`;
-      return { ts, seq, kind: "tool_end", text: `${tool} ${ok ? "ok" : "failed"}${took}${detail}`, callId, tool, ok, durationMs };
-    }
-    case "message_end": {
-      const msg = f.message as { role?: string; content?: unknown } | undefined;
-      if (msg?.role !== "assistant" || !Array.isArray(msg.content)) return null;
-      const text = msg.content
-        .filter((c): c is { type: "text"; text: string } => c?.type === "text" && typeof c.text === "string")
-        .map((c) => c.text)
-        .join("\n")
-        .trim();
-      return text ? { ts, seq, kind: "say", text: text.slice(0, 500) } : null;
-    }
-    case "auto_retry_start":
-      return { ts, seq, kind: "warn", text: `auto retry: ${JSON.stringify(frame).slice(0, 300)}` };
-    default:
-      return null;
-  }
 }

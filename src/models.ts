@@ -1,73 +1,71 @@
 import { readFileSync } from "node:fs";
-import { config, OMP_BIN } from "./config";
+import { config } from "./config";
 import { exec } from "./devices/devices";
+import { getHarness, harnessBin } from "./harness";
+import type { HarnessId } from "./harness/types";
 import { listProjects } from "./projects/registry";
 import { parsePersona } from "./runs/prompt";
 import { listRuns } from "./runs/store";
 
 const CACHE_MS = 10 * 60_000;
-/** A failed `omp models` is not retried for a minute, so a broken install does not stall every request. */
+/** A failed model listing is not retried for a minute, so a broken install does not stall every request. */
 const FAILURE_BACKOFF_MS = 60_000;
-/** The list request waits this long for `omp models`; a slower call keeps running and fills the cache for the next one. */
+/** The list request waits this long for the harness CLI; a slower call keeps running and fills the cache for the next one. */
 const WAIT_MS = 3_000;
-const OMP_TIMEOUT_MS = 20_000;
+const LIST_TIMEOUT_MS = 20_000;
 const RECENT_RUNS = 200;
 
-let cache: { at: number; ttl: number; models: string[] } | null = null;
-let inflight: Promise<string[]> | null = null;
+const caches = new Map<HarnessId, { at: number; ttl: number; models: string[] }>();
+const inflight = new Map<HarnessId, Promise<string[]>>();
 
-/** Parses the table `omp models` prints: `provider (n)` header lines followed by `│ model │ …` rows. */
-export function parseOmpModels(output: string): string[] {
-  const models: string[] = [];
-  let provider: string | null = null;
-  for (const line of output.split("\n")) {
-    const header = /^(\S+) \(\d+\)\s*$/.exec(line);
-    if (header) {
-      provider = header[1]!;
-      continue;
-    }
-    const row = /^│\s*([^│\s]+)\s*│/.exec(line);
-    if (row && provider && row[1] !== "model") models.push(`${provider}/${row[1]}`);
+function refreshHarnessModels(id: HarnessId): Promise<string[]> {
+  let pending = inflight.get(id);
+  if (!pending) {
+    pending = getHarness(id)
+      .listModels({ bin: harnessBin(id), run: (cmd) => exec(cmd, { timeoutMs: LIST_TIMEOUT_MS }) })
+      .catch(() => [])
+      .then((models) => {
+        caches.set(id, { at: Date.now(), ttl: models.length > 0 ? CACHE_MS : FAILURE_BACKOFF_MS, models });
+        return models;
+      })
+      .finally(() => {
+        inflight.delete(id);
+      });
+    inflight.set(id, pending);
   }
-  return models;
+  return pending;
 }
 
-function refreshOmpModels(): Promise<string[]> {
-  inflight ??= exec([OMP_BIN, "models"], { timeoutMs: OMP_TIMEOUT_MS })
-    .then((r) => {
-      const models = r.code === 0 ? parseOmpModels(r.text) : [];
-      cache = { at: Date.now(), ttl: models.length > 0 ? CACHE_MS : FAILURE_BACKOFF_MS, models };
-      return models;
-    })
-    .finally(() => {
-      inflight = null;
-    });
-  return inflight;
-}
-
-async function ompModels(): Promise<string[]> {
+async function harnessModels(id: HarnessId): Promise<string[]> {
+  const cache = caches.get(id);
   if (cache && Date.now() - cache.at < cache.ttl) return cache.models;
-  return Promise.race([refreshOmpModels(), Bun.sleep(WAIT_MS).then(() => cache?.models ?? [])]);
+  return Promise.race([refreshHarnessModels(id), Bun.sleep(WAIT_MS).then(() => caches.get(id)?.models ?? [])]);
 }
 
-function personaModels(): string[] {
+/** Models named by project personas that target `harness` (a persona without `harness:` counts as omp). */
+function personaModels(harness: HarnessId): string[] {
   return listProjects().flatMap((p) => {
     if (!p.personaFile) return [];
     try {
-      const { model } = parsePersona(readFileSync(`${p.repoPath}/${p.personaFile}`, "utf8"));
-      return model ? [model] : [];
+      const persona = parsePersona(readFileSync(`${p.repoPath}/${p.personaFile}`, "utf8"));
+      return persona.model && (persona.harness ?? "omp") === harness ? [persona.model] : [];
     } catch {
       return [];
     }
   });
 }
 
-/** Distinct model ids for the New run picker: recently used, configured, persona models, then everything omp offers. */
-export async function listModels(): Promise<string[]> {
+function configuredModels(harness: HarnessId): string[] {
+  const own = config.agent?.harnesses?.[harness]?.model;
+  const legacy = harness === "omp" ? config.agent?.model : undefined;
+  return [own, legacy].filter((m): m is string => !!m);
+}
+
+/** Distinct model ids for the New run picker: recently used, configured, persona models, then everything the harness offers. */
+export async function listModels(harness: HarnessId): Promise<string[]> {
   const recent = listRuns()
     .slice(0, RECENT_RUNS)
-    .flatMap((r) => (r.model ? [r.model] : []));
-  const configured = config.agent?.model ? [config.agent.model] : [];
-  const omp = await ompModels();
-  return [...new Set([...recent, ...configured, ...personaModels(), ...omp])];
+    .flatMap((r) => (r.harness === harness && r.model ? [r.model] : []));
+  const offered = await harnessModels(harness);
+  return [...new Set([...recent, ...configuredModels(harness), ...personaModels(harness), ...offered])];
 }

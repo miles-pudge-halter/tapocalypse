@@ -494,3 +494,56 @@ describe("auto-boot targets", () => {
     expect(env.scheduler.queueReason(run.id)).toBe("maxBooted (1) reached");
   });
 });
+
+describe("harness selection", () => {
+  const base = { projectId: "test-proj", title: "t", brief: "b" };
+  const finish = (env: ReturnType<typeof setup>, run: { id: string; status: string }) => {
+    run.status = "error";
+    env.scheduler.release(run.id);
+  };
+
+  test("runs default to omp when nothing names a harness; a request wins and is stored", async () => {
+    const env = setup();
+    expect((await env.scheduler.enqueueRun(base)).harness).toBe("omp");
+    expect((await env.scheduler.enqueueRun({ ...base, harness: "claude" })).harness).toBe("claude");
+    const err = await env.scheduler.enqueueRun({ ...base, harness: "gemini" }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(HttpError);
+    expect((err as HttpError).status).toBe(400);
+    expect((err as HttpError).message).toStartWith("harness: ");
+  });
+
+  test("a harness without the artemis backend is rejected at enqueue", async () => {
+    const env = setup();
+    const err = await env.scheduler.enqueueRun({ ...base, harness: "codex", backend: "artemis" }).catch((e: unknown) => e);
+    expect(err).toMatchObject({ status: 400, message: "Codex CLI does not support the artemis backend" });
+    expect(env.scheduler.queue).toEqual([]);
+  });
+
+  test("effort is stored harness-neutrally; thinking stays populated only for omp", async () => {
+    const env = setup();
+    expect(await env.scheduler.enqueueRun({ ...base, thinking: "high" })).toMatchObject({ thinking: "high", effort: "high" });
+    expect(await env.scheduler.enqueueRun({ ...base, harness: "omp", effort: "low" })).toMatchObject({ thinking: "low", effort: "low" });
+    expect(await env.scheduler.enqueueRun({ ...base, harness: "claude", effort: "xhigh" })).toMatchObject({ thinking: null, effort: "xhigh" });
+  });
+
+  test("batch runs carry the requested harness", async () => {
+    const env = setup();
+    const { runs } = await env.scheduler.enqueueBatch({ ...base, harness: "claude", devices: [{ platform: "android" }, { platform: "android" }] });
+    expect(runs.map((r) => r.harness)).toEqual(["claude", "claude"]);
+  });
+
+  test("rerun and retry keep the harness; a rerun on another harness starts from its own model and effort", async () => {
+    const env = setup();
+    const first = await env.scheduler.enqueueRun({ ...base, harness: "claude", model: "sonnet", effort: "high" });
+    finish(env, first);
+
+    const same = await env.scheduler.rerun(first.id, { only: "all" });
+    expect(same).toMatchObject({ harness: "claude", model: "sonnet", effort: "high" });
+
+    const other = await env.scheduler.rerun(first.id, { only: "all", harness: "omp" });
+    expect(other).toMatchObject({ harness: "omp", model: null, effort: null, thinking: null });
+
+    const retried = env.scheduler.retry(first);
+    expect(retried).toMatchObject({ harness: "claude", model: "sonnet", effort: "high", retryOf: first.id });
+  });
+});

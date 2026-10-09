@@ -2,7 +2,9 @@ import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { z } from "zod";
 import { CONFIG_PATH, HttpError, REPO_ROOT } from "../config";
+import { HARNESS_IDS, type HarnessId } from "../harness/types";
 import { resolveUnder } from "../reports/reports";
 import { parsePersona } from "../runs/prompt";
 import type { Platform } from "../runs/types";
@@ -17,7 +19,21 @@ export interface Project {
   reportsDir: string;
   defaultPackage: string;
   defaultPlatform: Platform;
+  /** Per-project agent runtime overrides (harness, harness-native model and effort); absent = defaults. */
+  agent?: ProjectAgent;
 }
+
+export interface ProjectAgent {
+  harness?: HarnessId;
+  model?: string;
+  effort?: string;
+}
+
+const ProjectAgentSchema = z.object({
+  harness: z.enum(HARNESS_IDS).optional(),
+  model: z.string().trim().min(1).max(200).optional(),
+  effort: z.string().trim().min(1).max(40).optional(),
+});
 
 export interface ProjectStatus extends Project {
   status: "ok" | "invalid";
@@ -45,6 +61,7 @@ const FIELD_ORDER: (keyof Project)[] = [
   "reportsDir",
   "defaultPackage",
   "defaultPlatform",
+  "agent",
 ];
 const DEFAULT_REPORTS_DIR = "qa";
 const BUNDLED_PERSONA = path.join(REPO_ROOT, "personas", "default-mobile-qa.md");
@@ -90,6 +107,7 @@ function isFile(p: string): boolean {
 
 /** Best-effort typed view of a stored entry, used when it fails validation. */
 function coerce(raw: Raw): Project {
+  const agent = ProjectAgentSchema.safeParse(raw.agent);
   return {
     id: str(raw.id),
     name: str(raw.name),
@@ -98,6 +116,7 @@ function coerce(raw: Raw): Project {
     reportsDir: str(raw.reportsDir) || DEFAULT_REPORTS_DIR,
     defaultPackage: str(raw.defaultPackage),
     defaultPlatform: raw.defaultPlatform === "ios" ? "ios" : "android",
+    ...(agent.success && Object.keys(agent.data).length > 0 ? { agent: agent.data } : {}),
   };
 }
 
@@ -167,6 +186,13 @@ function check(input: Raw, unique: boolean): Check {
   const defaultPlatform = input.defaultPlatform;
   if (defaultPlatform !== "android" && defaultPlatform !== "ios") errors.defaultPlatform = 'must be "android" or "ios"';
 
+  let agent: ProjectAgent | undefined;
+  if (input.agent !== undefined && input.agent !== null) {
+    const parsed = ProjectAgentSchema.safeParse(input.agent);
+    if (!parsed.success) errors.agent = parsed.error.issues[0]!.message;
+    else if (Object.keys(parsed.data).length > 0) agent = parsed.data;
+  }
+
   if (repoOk) {
     if (!fs.existsSync(path.join(repoPath, ".git"))) warnings.push("Not a git repository: runs will not record branch/commit/PR.");
     if (reportsOk && !fs.existsSync(path.join(repoPath, reportsDir))) {
@@ -177,7 +203,7 @@ function check(input: Raw, unique: boolean): Check {
 
   const result: ValidationResult = { ok: Object.keys(errors).length === 0, errors, warnings };
   if (!result.ok || (defaultPlatform !== "android" && defaultPlatform !== "ios")) return { project: null, result };
-  return { project: { id, name, repoPath, personaFile, reportsDir, defaultPackage, defaultPlatform }, result };
+  return { project: { id, name, repoPath, personaFile, reportsDir, defaultPackage, defaultPlatform, ...(agent ? { agent } : {}) }, result };
 }
 
 function problemsOf(errors: Errors): string[] {

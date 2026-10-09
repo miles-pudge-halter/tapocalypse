@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { mcpLaunchArgs, PLUGIN_NAME, prefixesFromState } from "../src/omp/provision";
+import { mcpLaunchArgs, PLUGIN_NAME, prefixesFromState } from "../src/harness/omp/provision";
 
 const MOBILE_MCP = { type: "stdio", command: "npx", args: ["-y", "@mobilenext/mobile-mcp@latest"] };
 

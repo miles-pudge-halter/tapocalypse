@@ -175,6 +175,17 @@ describe("detectProject", () => {
     expect(d.suggestion.reportsDir).toBe("qa");
   });
 
+  test("lists Codex persona files after the omp and Claude ones", async () => {
+    const root = fixture("personas-codex", {
+      ".omp/agents/mobile-qa.md": "body",
+      ".claude/agents/qa-bot.md": "body",
+      ".codex/agents/qa-codex.md": "body",
+      ".codex/agents/reviewer.md": "body",
+    });
+    const d = await detectProject(root);
+    expect(d.personaCandidates).toEqual([".omp/agents/mobile-qa.md", ".claude/agents/qa-bot.md", ".codex/agents/qa-codex.md"]);
+  });
+
   test("a repo with nothing recognisable falls back to the directory name", async () => {
     const root = fixture("my_empty-repo", { "README.md": "x" });
     const d = await detectProject(root);

@@ -4,6 +4,7 @@ import path from "node:path";
 import { fetchHandler } from "../src/api";
 import { scheduler } from "../src/app";
 import { config, MAX_STEER_CHARS } from "../src/config";
+import { HARNESS_IDS } from "../src/harness/types";
 import { getProject } from "../src/projects/registry";
 import { appendStderr, runDir } from "../src/runs/store";
 import type { Run } from "../src/runs/types";
@@ -281,5 +282,75 @@ describe("suites, templates, stats, mcp status", () => {
       lastTool: "qa_list_suites",
       lastRequester: "omp-test",
     });
+  });
+});
+
+describe("harnesses", () => {
+  test("GET /api/harnesses lists every harness with install state and capabilities", async () => {
+    const res = await call("/api/harnesses");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { default: string; harnesses: { id: string; label: string; installed: boolean; capabilities: { steer: boolean; backends: string[] } }[] };
+    expect(body.harnesses.map((h) => h.id)).toEqual([...HARNESS_IDS]);
+    expect(HARNESS_IDS as readonly string[]).toContain(body.default);
+    for (const h of body.harnesses) {
+      expect(h.label).toBeTruthy();
+      // The test preload points every harness binary at a path that does not exist.
+      expect(h.installed).toBe(false);
+      expect(typeof h.capabilities.steer).toBe("boolean");
+      expect(h.capabilities.backends).toContain("mobile-mcp");
+    }
+  });
+
+  test("GET /api/models answers per harness and rejects an unknown one", async () => {
+    for (const id of HARNESS_IDS) {
+      const res = await call(`/api/models?harness=${id}`);
+      expect(res.status).toBe(200);
+      expect(Array.isArray(((await res.json()) as { models: unknown }).models)).toBe(true);
+    }
+    expect((await call("/api/models?harness=gemini")).status).toBe(400);
+    expect((await call("/api/models")).status).toBe(200);
+  });
+
+  test("run, batch and rerun requests reject an unknown harness before queueing", async () => {
+    const body = { projectId: "test-proj", title: "t", brief: "b", harness: "gemini" };
+    const run = await call("/api/runs", { method: "POST", json: body });
+    expect(run.status).toBe(400);
+    expect(((await run.json()) as { error: string }).error).toContain("harness");
+    expect((await call("/api/batches", { method: "POST", json: { ...body, devices: [{ platform: "android" }] } })).status).toBe(400);
+    const done = await makeRun({ status: "done", verdict: "PASS" });
+    expect((await call(`/api/runs/${done.id}/rerun`, { method: "POST", json: { only: "all", harness: "gemini" } })).status).toBe(400);
+  });
+
+  test("a run request can pick a harness, and a rerun can switch it", async () => {
+    const created = await call("/api/runs", { method: "POST", json: { projectId: "test-proj", title: "t", brief: "b", harness: "codex" } });
+    expect(created.status).toBe(201);
+    const run = (await created.json()) as { id: string; harness: string };
+    expect(run.harness).toBe("codex");
+    Object.assign(scheduler.getLive(run.id)!, { status: "done", verdict: "PASS" });
+    scheduler.update(scheduler.getLive(run.id)!);
+    const rerun = await call(`/api/runs/${run.id}/rerun`, { method: "POST", json: { only: "all", harness: "claude" } });
+    expect(rerun.status).toBe(201);
+    expect(((await rerun.json()) as { harness: string }).harness).toBe("claude");
+  });
+});
+
+describe("run-scoped MCP endpoint", () => {
+  const rpc = { jsonrpc: "2.0", id: 1, method: "tools/list" };
+  const mcpHeaders = { accept: "application/json, text/event-stream" };
+
+  test("refuses a foreign Host and a non-JSON body", async () => {
+    const host = await call("/mcp/runs/abc", { method: "POST", json: rpc, headers: { host: "evil.example", ...mcpHeaders } });
+    expect(host.status).toBe(403);
+    const plain = await call("/mcp/runs/abc", { method: "POST", headers: { "content-type": "text/plain", ...mcpHeaders }, body: JSON.stringify(rpc) });
+    expect(plain.status).toBe(415);
+  });
+
+  test("only POST is routed, and an unknown run is refused without leaking whether it exists", async () => {
+    expect((await call("/mcp/runs/abc", { headers: mcpHeaders })).status).toBe(405);
+    const unknown = await call("/mcp/runs/does-not-exist", { method: "POST", json: rpc, headers: { authorization: "Bearer nope", ...mcpHeaders } });
+    expect(unknown.status).toBe(401);
+    const noToken = await call("/mcp/runs/another-id", { method: "POST", json: rpc, headers: mcpHeaders });
+    expect(noToken.status).toBe(401);
+    expect(await noToken.text()).toBe(await unknown.text());
   });
 });

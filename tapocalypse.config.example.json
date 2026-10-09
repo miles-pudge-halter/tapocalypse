@@ -3,6 +3,12 @@
   "maxConcurrentRuns": 2,
   "runMaxTime": "60m",
   "projects": [],
+  "agent": {
+    "harnesses": {
+      "claude": { "permissions": "bypass" },
+      "codex": { "sandbox": "danger-full-access" }
+    }
+  },
   "devicePool": {
     "android": {
       "avds": [],

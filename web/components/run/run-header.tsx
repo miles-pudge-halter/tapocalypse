@@ -18,7 +18,7 @@ import { UsageStrip } from "@/components/usage-strip";
 import { VerdictBadge } from "@/components/verdict-badge";
 import { batchHash, isActive, reportHash, transcriptUrl, type Device, type RunView } from "@/lib/api";
 import { deviceDisplayName } from "@/lib/format";
-import { useNow } from "@/lib/hooks";
+import { useHarness, useNow } from "@/lib/hooks";
 import { DetailsSheet } from "./details-sheet";
 import { failedChecks, type RunActions } from "./use-run-actions";
 
@@ -38,6 +38,7 @@ export function RunHeader({
 }) {
   const active = isActive(run.status);
   const now = useNow(active ? 1000 : 60_000);
+  const { label: harnessLabel } = useHarness(run.harness);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [cancelOpen, setCancelOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -149,10 +150,17 @@ export function RunHeader({
 
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
         <SourceChips source={run.source} build={run.build} />
-        <UsageStrip run={run} now={now} />
+        <UsageStrip run={run} now={now} harnessLabel={harnessLabel} />
       </div>
 
-      <DetailsSheet run={run} device={device} projectName={projectName} open={detailsOpen} onOpenChange={setDetailsOpen} />
+      <DetailsSheet
+        run={run}
+        device={device}
+        projectName={projectName}
+        harnessLabel={harnessLabel}
+        open={detailsOpen}
+        onOpenChange={setDetailsOpen}
+      />
 
       <Dialog open={cancelOpen} onOpenChange={(open) => !actions.busy && setCancelOpen(open)}>
         <DialogContent>

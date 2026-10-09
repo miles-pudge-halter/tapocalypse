@@ -280,6 +280,11 @@ function describe(tool: string, args: unknown): HumanisedTool {
       const base = pattern ? `Search "${clip(pattern, 60)}"` : "Search files";
       return { family: "file", label: where ? `${base} in ${shortPath(where, 40)}` : base };
     }
+    case "search": {
+      // canonical web search of the claude/codex adapters; omp's file search stays `grep`
+      const query = str(a, "query");
+      return { family: "other", label: query ? `Web search "${clip(query, 100)}"` : "Web search" };
+    }
     case "glob": {
       const p = str(a, "path");
       return { family: "file", label: p ? `Find files ${shortPath(p)}` : "Find files" };

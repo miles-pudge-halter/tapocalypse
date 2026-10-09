@@ -1,3 +1,5 @@
+import type { HarnessId } from "../harness/types";
+
 export type Backend = "mobile-mcp" | "artemis";
 export type Platform = "android" | "ios";
 export type RunStatus =
@@ -31,7 +33,7 @@ export interface Check {
   endedAt?: string;
 }
 
-/** Normalized from omp `get_session_stats`; null `cost` when the provider reports none. */
+/** Normalized per harness (omp `get_session_stats`, Claude `result`, Codex `turn.completed`); null `cost` when the harness reports none. */
 export interface RunUsage {
   cost: number | null;
   tokensIn: number;
@@ -124,9 +126,14 @@ export interface Run {
   suiteId: string | null;
   /** Id/title pairs the agent must use in qa_plan (set from the suite). */
   suiteChecks: { id: string; title: string }[] | null;
-  /** Model actually passed to omp (run > suite > persona > config). */
+  /** Agent CLI that runs this run; runs persisted before harnesses existed are omp. */
+  harness: HarnessId;
+  /** Model actually passed to the harness (harness-native string). */
   model: string | null;
+  /** Reasoning level for omp (`--thinking`); other harnesses mirror it in `effort`. */
   thinking: string | null;
+  /** Reasoning effort actually passed to the harness; alias of `thinking` for omp. */
+  effort: string | null;
   errorKind: ErrorKind | null;
   verdictSource: VerdictSource | null;
   usage: RunUsage | null;

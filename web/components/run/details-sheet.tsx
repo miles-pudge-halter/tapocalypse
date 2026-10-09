@@ -28,12 +28,15 @@ export function DetailsSheet({
   run,
   device,
   projectName,
+  harnessLabel,
   open,
   onOpenChange,
 }: {
   run: RunView;
   device: Device | null;
   projectName: string;
+  /** Display name of the run's agent CLI (undefined while the harness list loads). */
+  harnessLabel: string | undefined;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
@@ -70,9 +73,12 @@ export function DetailsSheet({
               )}
             </Field>
             <Field label="Backend">{run.backend}</Field>
+            <Field label="Agent runtime">{harnessLabel ?? run.harness}</Field>
             <Field label="Model">
               {model ?? "—"}
-              {run.thinking ? <span className="text-muted-foreground"> · thinking {run.thinking}</span> : null}
+              {run.effort ?? run.thinking ? (
+                <span className="text-muted-foreground"> · {run.harness === "omp" ? "thinking" : "effort"} {run.effort ?? run.thinking}</span>
+              ) : null}
             </Field>
             <Field label="Requested by">{run.requestedBy}</Field>
             <Field label="Created">{formatTime(run.createdAt)}</Field>

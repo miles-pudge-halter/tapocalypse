@@ -28,7 +28,7 @@ export interface Detection {
 
 const MAX_READ_BYTES = 4 * 1024 * 1024;
 const REPORTS_DIR_CANDIDATES = ["qa", "docs/qa", "test/qa", "reports/qa"];
-const PERSONA_DIRS = [".omp/agents", ".claude/agents"];
+const PERSONA_DIRS = [".omp/agents", ".claude/agents", ".codex/agents"];
 const ANDROID_APP_DIRS = ["android/app", "app", "androidApp", "composeApp"];
 const XCODE_PARENT_DIRS = ["", "ios", "iosApp"];
 const DEV_SUFFIX = /\.(dev|debug)$/;

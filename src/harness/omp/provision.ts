@@ -26,9 +26,10 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { DATA_DIR } from "../config";
-import type { Project } from "../projects/registry";
-import type { Backend } from "../runs/types";
+import { DATA_DIR } from "../../config";
+import type { Project } from "../../projects/registry";
+import type { Backend } from "../../runs/types";
+import { MOBILE_MCP_PACKAGE } from "../types";
 import type { OmpRpc } from "./rpc";
 
 export interface ToolPrefixes {
@@ -55,7 +56,6 @@ export interface ProvisionOptions {
   pluginRoot?: string;
 }
 
-const MOBILE_MCP_PACKAGE = "@mobilenext/mobile-mcp";
 /** Short on purpose: the plugin name is part of every tool name and omp truncates names near 64 chars. */
 export const PLUGIN_NAME = "tpc";
 const PLUGIN_SERVER = "mobile-mcp";

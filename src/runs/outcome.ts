@@ -1,6 +1,7 @@
+import type { HarnessExit } from "../harness/types";
 import type { Check, ErrorKind, RunUsage, Verdict } from "./types";
 
-/** omp sends SIGTERM-induced exits as 128 + 15. */
+/** Shells (and omp) report SIGTERM-induced exits as 128 + 15. */
 export const SIGTERM_EXIT = 143;
 
 /** At least one check reached a terminal status (pass/fail/blocked/skipped). */
@@ -8,7 +9,7 @@ export function hasResolvedCheck(checks: readonly Check[]): boolean {
   return checks.some((c) => c.status !== "pending" && c.status !== "running");
 }
 
-/** Parses omp `--max-time` strings such as `90m`, `1h30m`, `45s`, `2h`; null when unparseable. A bare number is minutes. */
+/** Parses duration strings (`runMaxTime`, omp `--max-time`) such as `90m`, `1h30m`, `45s`, `2h`; null when unparseable. A bare number is minutes. */
 export function parseDurationMs(text: string): number | null {
   const s = text.trim().toLowerCase();
   if (/^\d+(\.\d+)?$/.test(s)) return Math.round(Number(s) * 60_000);
@@ -69,11 +70,10 @@ export interface ExitInput {
   /** The agent called qa_finish. */
   verdictRecorded: boolean;
   checks: readonly Check[];
-  /** The agent's final `prompt_result`, if any. */
-  promptResult: { status: string; error: string | null } | null;
-  exitCode: number;
-  /** The session reported settled before the process ended. */
-  settled: boolean;
+  /** How the harness session ended. */
+  exit: HarnessExit;
+  /** Display name of the harness, for messages (`omp`, `Claude Code`, `Codex CLI`). */
+  harnessLabel: string;
   /** Time since spawn; null if the agent never started. */
   elapsedMs: number | null;
   /** Parsed `runMaxTime`; null when unparseable. */
@@ -90,59 +90,53 @@ export interface Outcome {
   derived: { verdict: Verdict; summary: string } | null;
 }
 
-/** Maps how the omp process ended to the run's terminal state. */
+const LIMIT_NAMES: Record<NonNullable<HarnessExit["limit"]>, string> = {
+  turns: "turn limit",
+  budget: "budget limit",
+  time: "time limit",
+};
+
+/** Maps how the harness process ended to the run's terminal state. */
 export function classifyExit(i: ExitInput): Outcome {
   if (i.cancelled) return { status: "cancelled", errorKind: "cancelled", error: null, derived: null };
   if (i.verdictRecorded) return { status: "done", errorKind: null, error: null, derived: null };
 
+  const { exit, harnessLabel: label } = i;
   const timedOut = i.budgetMs !== null && i.elapsedMs !== null && i.elapsedMs >= i.budgetMs;
   const resolved = hasResolvedCheck(i.checks);
   let cause: string;
   let crashed = false;
+  let limited = false;
   if (timedOut) {
     cause = `Run exceeded its time budget (${i.budgetLabel})`;
-  } else if (i.promptResult?.status === "error") {
-    cause = i.promptResult.error ?? "agent run failed";
-  } else if (!i.settled && i.exitCode === SIGTERM_EXIT) {
-    cause = "omp was stopped (SIGTERM): the run was cancelled or Tapocalypse shut down";
-  } else if (!i.settled && i.exitCode !== 0) {
-    cause = `omp exited with code ${i.exitCode}; see stderr.log`;
+  } else if (exit.limit) {
+    limited = true;
+    cause = `${label} stopped at its ${LIMIT_NAMES[exit.limit]}${exit.error ? `: ${exit.error}` : ""}`;
+  } else if (!exit.started) {
+    cause = exit.error ?? `${label} could not be started; see stderr.log`;
+    crashed = true;
+  } else if (exit.error !== null) {
+    cause = exit.error;
+  } else if (!exit.settled && exit.code === SIGTERM_EXIT) {
+    cause = `${label} was stopped (SIGTERM): the run was cancelled or Tapocalypse shut down`;
+  } else if (!exit.settled && exit.code !== 0) {
+    cause = `${label} exited with code ${exit.code}; see stderr.log`;
     crashed = true;
   } else {
     cause = "agent ended without qa_finish";
   }
-  const errorKind: ErrorKind = timedOut ? "timeout" : crashed && !resolved ? "infra" : "agent";
+  const errorKind: ErrorKind = timedOut || limited ? "timeout" : crashed && !resolved ? "infra" : "agent";
 
   const derived = deriveVerdict(i.checks);
   if (derived) return { status: "done", errorKind, error: cause, derived };
   return { status: "error", errorKind, error: cause, derived: null };
 }
 
-function num(v: unknown): number {
-  return typeof v === "number" && Number.isFinite(v) ? v : 0;
-}
-
-/** Normalizes omp `get_session_stats` data; null when `stats` is not an object. */
-export function normalizeUsage(stats: unknown, model: string | null): RunUsage | null {
-  if (!stats || typeof stats !== "object") return null;
-  const s = stats as { tokens?: unknown; cost?: unknown; toolCalls?: unknown };
-  const t = (s.tokens && typeof s.tokens === "object" ? s.tokens : {}) as Record<string, unknown>;
-  return {
-    cost: typeof s.cost === "number" && Number.isFinite(s.cost) ? s.cost : null,
-    tokensIn: num(t.input),
-    tokensOut: num(t.output),
-    cacheRead: num(t.cacheRead),
-    cacheWrite: num(t.cacheWrite),
-    toolCalls: num(s.toolCalls),
-    model,
-  };
-}
-
 /**
- * Totals usage from live frames (assistant `message_end` usage + tool starts) so a run that dies before
- * `get_session_stats` can answer (crash, timeout kill) still reports what it consumed.
+ * Totals the `usage` events of a session so a run that dies before the harness can report final usage (crash, timeout
+ * kill) still carries what it consumed. `cumulative` events replace the running totals instead of adding to them.
  */
-export class UsageAccumulator {
+export class UsageTotals {
   private tokensIn = 0;
   private tokensOut = 0;
   private cacheRead = 0;
@@ -152,27 +146,31 @@ export class UsageAccumulator {
   private toolCalls = 0;
   private model: string | null = null;
 
-  add(frame: { type: string; [key: string]: unknown }): void {
-    if (frame.type === "tool_execution_start") {
-      this.toolCalls++;
-      return;
+  add(usage: Partial<RunUsage>, cumulative: boolean): void {
+    if (cumulative) {
+      this.tokensIn = 0;
+      this.tokensOut = 0;
+      this.cacheRead = 0;
+      this.cacheWrite = 0;
+      this.cost = 0;
+      this.hasCost = false;
     }
-    if (frame.type !== "message_end") return;
-    const msg = frame.message as { role?: unknown; usage?: Record<string, unknown>; model?: unknown; provider?: unknown } | undefined;
-    if (msg?.role !== "assistant" || !msg.usage) return;
-    this.tokensIn += num(msg.usage.input);
-    this.tokensOut += num(msg.usage.output);
-    this.cacheRead += num(msg.usage.cacheRead);
-    this.cacheWrite += num(msg.usage.cacheWrite);
-    const cost = (msg.usage.cost as { total?: unknown } | undefined)?.total;
-    if (typeof cost === "number" && Number.isFinite(cost)) {
-      this.cost += cost;
+    if (usage.model) this.model = usage.model;
+    this.tokensIn += usage.tokensIn ?? 0;
+    this.tokensOut += usage.tokensOut ?? 0;
+    this.cacheRead += usage.cacheRead ?? 0;
+    this.cacheWrite += usage.cacheWrite ?? 0;
+    if (typeof usage.cost === "number" && Number.isFinite(usage.cost)) {
+      this.cost += usage.cost;
       this.hasCost = true;
     }
-    if (typeof msg.model === "string") this.model = typeof msg.provider === "string" ? `${msg.provider}/${msg.model}` : msg.model;
   }
 
-  /** Null when no assistant turn was observed. */
+  toolCall(): void {
+    this.toolCalls++;
+  }
+
+  /** Null when nothing was consumed. */
   snapshot(model: string | null): RunUsage | null {
     if (this.tokensIn + this.tokensOut + this.cacheRead + this.cacheWrite + this.toolCalls === 0) return null;
     return {

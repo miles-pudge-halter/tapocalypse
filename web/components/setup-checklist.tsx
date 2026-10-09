@@ -43,7 +43,22 @@ import { cn } from "@/lib/utils";
 const REPO_URL = "https://github.com/miles-pudge-halter/tapocalypse";
 const BANNER_DISMISSED_KEY = "tapocalypse.setupBannerDismissed";
 const MCP_SEEN_KEY = "tapocalypse.mcpConnected";
-const TOOL_CHECK_IDS: Record<string, true> = { bun: true, omp: true, node: true, git: true, gh: true, xcrun: true, adb: true, emulator: true };
+const TOOL_CHECK_IDS: Record<string, true> = {
+  bun: true,
+  "agent-runtime": true,
+  omp: true,
+  "omp-auth": true,
+  claude: true,
+  "claude-auth": true,
+  codex: true,
+  "codex-auth": true,
+  node: true,
+  git: true,
+  gh: true,
+  xcrun: true,
+  adb: true,
+  emulator: true,
+};
 const CODE_SPAN = /`([^`]+)`/g;
 
 const STATUS: Record<DoctorCheck["status"], { icon: LucideIcon; className: string }> = {
@@ -363,7 +378,9 @@ function MilestoneBody({ id, setup }: { id: MilestoneId; setup: SetupProgress })
     const required = report?.checks.filter((c) => c.required) ?? [];
     return (
       <>
-        <p className="text-sm text-muted-foreground">Tapocalypse needs these tools on this machine to drive devices and run the QA agent.</p>
+        <p className="text-sm text-muted-foreground">
+          Tapocalypse needs these tools on this machine to drive devices and run the QA agent, which runs on an agent runtime (omp, Claude Code or Codex).
+        </p>
         {required.length > 0 && (
           <ul className="divide-y">
             {required.map((c) => (

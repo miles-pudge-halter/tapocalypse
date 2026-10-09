@@ -27,10 +27,13 @@ const OLD_RUN = {
   transcriptHtml: false,
 };
 
-const newRun = (title: string): NewRun => {
+const newRun = (title: string, over: Partial<NewRun> = {}): NewRun => {
   const { id: _id, createdAt: _c, ...rest } = OLD_RUN;
-  return { ...rest, title, status: "queued", verdict: null, summary: null, deviceSerial: null, startedAt: null, endedAt: null, stats: null, source: null, build: null } as NewRun;
+  return { ...rest, title, status: "queued", verdict: null, summary: null, deviceSerial: null, startedAt: null, endedAt: null, stats: null, source: null, build: null, ...over } as NewRun;
 };
+
+const writeEvents = (id: string, frames: object[]): void =>
+  fs.writeFileSync(path.join(runDir(id), "events.jsonl"), frames.map((f) => JSON.stringify(f)).join("\n") + "\n");
 
 describe("store", () => {
   test("an old run.json without the newer fields loads with defaults and keeps its data", () => {
@@ -45,8 +48,10 @@ describe("store", () => {
       batchId: null,
       suiteId: null,
       suiteChecks: null,
+      harness: "omp",
       model: null,
       thinking: null,
+      effort: null,
       errorKind: null,
       verdictSource: null,
       usage: { cost: 1, tokensIn: 0, toolCalls: 0, model: null },
@@ -158,5 +163,104 @@ describe("readActivity", () => {
     const page = readActivity(r.id, { limit: 1 });
     expect(page.items).toHaveLength(1);
     expect(page.items[0]).toMatchObject({ kind: "tool_end", seq: 2, tool: "bash", ok: true, durationMs: 3000 });
+  });
+});
+
+describe("readActivity per harness", () => {
+  test("tapocalypse's own feed lines keep their check id and status", () => {
+    const r = createRun(newRun("activity lines"));
+    writeEvents(r.id, [
+      { type: "_activity", kind: "check", text: "C1: pass — ok", checkId: "C1", checkStatus: "pass", _ts: "2026-01-01T00:00:00.000Z" },
+      { type: "_activity", kind: "info", text: "booted" },
+    ]);
+    const { items } = readActivity(r.id, { limit: 10 });
+    expect(items[0]).toMatchObject({ kind: "check", text: "C1: pass — ok", checkId: "C1", checkStatus: "pass", seq: 0 });
+    expect(items[1]).toMatchObject({ kind: "info", text: "booted" });
+    expect(items[1]!.checkId).toBeUndefined();
+    deleteRun(r.id);
+  });
+
+  test("frames are replayed by the run's own harness adapter", () => {
+    const frames = [
+      { type: "assistant", message: { content: [{ type: "tool_use", id: "tu1", name: "Bash", input: { command: "ls" } }] }, _ts: "2026-01-01T00:00:00.000Z" },
+      { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu1", content: "boom", is_error: true }] }, _ts: "2026-01-01T00:00:02.000Z" },
+    ];
+    const claude = createRun(newRun("claude replay", { harness: "claude" }));
+    writeEvents(claude.id, frames);
+    const items = readActivity(claude.id, { limit: 10 }).items;
+    expect(items.map((a) => a.kind)).toEqual(["tool", "tool_end"]);
+    expect(items[1]).toMatchObject({ tool: "bash", ok: false, durationMs: 2000 });
+
+    const omp = createRun(newRun("omp ignores claude frames"));
+    writeEvents(omp.id, frames);
+    expect(readActivity(omp.id, { limit: 10 }).items).toEqual([]);
+    deleteRun(claude.id);
+    deleteRun(omp.id);
+  });
+
+  test("a call start in an earlier page resolves later pages, and new lines extend the same run's scan", () => {
+    const r = createRun(newRun("incremental"));
+    const start = { type: "tool_execution_start", toolCallId: "t", toolName: "bash", args: { command: "ls" }, _ts: "2026-01-01T00:00:00.000Z" };
+    writeEvents(r.id, [start]);
+    expect(readActivity(r.id, { limit: 5 }).items).toHaveLength(1);
+    appendEvent(r.id, { type: "tool_execution_end", toolCallId: "t", toolName: "bash", isError: false });
+    const items = readActivity(r.id, { limit: 5 }).items;
+    expect(items.at(-1)).toMatchObject({ kind: "tool_end", tool: "bash", ok: true });
+    deleteRun(r.id);
+  });
+
+  test("omp runs recorded before server-side check lines keep theirs; newer ones are not shown twice", () => {
+    const hostCall = { type: "tool_execution_start", toolCallId: "p", toolName: "qa_check", args: { id: "C1", status: "pass" } };
+    const old = createRun(newRun("legacy checks"));
+    writeEvents(old.id, [hostCall]);
+    expect(readActivity(old.id, { limit: 5 }).items).toMatchObject([{ kind: "check", checkId: "C1", checkStatus: "pass" }]);
+
+    const current = createRun(newRun("server-side checks"));
+    writeEvents(current.id, [hostCall, { type: "_activity", kind: "check", text: "C1: pass", checkId: "C1", checkStatus: "pass" }]);
+    const items = readActivity(current.id, { limit: 5 }).items;
+    expect(items).toHaveLength(1);
+    expect(items[0]!.seq).toBe(1);
+    deleteRun(old.id);
+    deleteRun(current.id);
+  });
+
+  test("an unknown harness id in run.json falls back to omp instead of breaking replay and start", () => {
+    const id = "20260101-000003-abcd-badharness";
+    fs.mkdirSync(runDir(id), { recursive: true });
+    fs.writeFileSync(path.join(runDir(id), "run.json"), JSON.stringify({ ...OLD_RUN, id, harness: "gemini" }));
+    expect(getRun(id)?.harness).toBe("omp");
+    deleteRun(id);
+  });
+
+  test("a Codex run keeps its tool rows after a reload: the scan pass and the page pass map the same frame", async () => {
+    const fixture = await Bun.file(path.join(import.meta.dir, "fixtures", "codex-exec.jsonl")).text();
+    const frames = fixture
+      .split("\n")
+      .filter(Boolean)
+      .map((l, i) => ({ ...JSON.parse(l), _ts: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString() }));
+    const r = createRun(newRun("codex replay", { harness: "codex" }));
+    writeEvents(r.id, frames);
+    const { items } = readActivity(r.id, { limit: 100 });
+    expect(items.filter((a) => a.kind === "tool").map((a) => a.tool)).toEqual([
+      "mcp__mobile_mcp_mobile_list_elements_on_screen",
+      "bash",
+      "bash",
+      "edit",
+      "search",
+    ]);
+    expect(items.find((a) => a.kind === "tool_end" && a.callId === "item_3")?.durationMs).toBe(1000);
+    deleteRun(r.id);
+  });
+
+  test("raw omp stats become usage only for omp runs", () => {
+    const withStats = (id: string, harness: string) => {
+      fs.mkdirSync(runDir(id), { recursive: true });
+      fs.writeFileSync(path.join(runDir(id), "run.json"), JSON.stringify({ ...OLD_RUN, id, harness }));
+      return getRun(id)!;
+    };
+    expect(withStats("20260101-000001-abcd-statsomp", "omp").usage).toMatchObject({ cost: 1 });
+    expect(withStats("20260101-000002-abcd-statsclaude", "claude").usage).toBeNull();
+    deleteRun("20260101-000001-abcd-statsomp");
+    deleteRun("20260101-000002-abcd-statsclaude");
   });
 });

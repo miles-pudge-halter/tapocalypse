@@ -1,7 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import path from "node:path";
-import { type Frame, LineParser } from "../src/omp/rpc";
-import { frameToActivity, type ToolStarts } from "../src/runs/prompt";
+import { legacyProgressActivity } from "../src/harness/omp/activity";
+import { harness } from "../src/harness/omp";
+import { type Frame, LineParser } from "../src/harness/omp/rpc";
+import type { ReplayContext } from "../src/harness/types";
+import type { Activity, Backend } from "../src/runs/types";
+
+type ToolStarts = ReplayContext["starts"];
+
+/** One frame through the omp adapter's replay mapping; pass the same `starts` across a session. */
+function frameToActivity(frame: unknown, backend: Backend, seq: number, starts: ToolStarts = new Map()): Activity | null {
+  return harness.toActivity(frame, { backend, seq, starts });
+}
 
 function parseChunks(data: Uint8Array, size: number): Frame[] {
   const frames: Frame[] = [];
@@ -106,10 +116,15 @@ describe("frameToActivity backend rules", () => {
     expect(frameToActivity(start("mcp__mobile_mcp_mobile_click"), "mobile-mcp", 0)?.kind).toBe("tool");
   });
 
-  test("Tapocalypse's plugin-namespaced mobile-mcp tools follow the same rules as the user-config form", () => {
+  test("Tapocalypse's plugin-namespaced mobile-mcp tools follow the same rules as the user-config form, under the canonical name", () => {
     const namespaced = "mcp__tpc_mobile_mcp_mobile_click_on_screen_at_coordinates";
-    expect(frameToActivity(start(namespaced), "artemis", 0)).toMatchObject({ kind: "warn", text: `backend violation: ${namespaced}` });
-    expect(frameToActivity(start(namespaced), "mobile-mcp", 0)?.kind).toBe("tool");
+    const canonical = "mcp__mobile_mcp_mobile_click_on_screen_at_coordinates";
+    expect(frameToActivity(start(namespaced), "artemis", 0)).toMatchObject({ kind: "warn", text: `backend violation: ${canonical}` });
+    expect(frameToActivity(start(namespaced), "mobile-mcp", 0)).toMatchObject({ kind: "tool", tool: canonical });
+  });
+
+  test("a user-configured server under another name still canonicalizes to its device server", () => {
+    expect(frameToActivity(start("mcp__my_phone_mobile_mcp_mobile_click"), "mobile-mcp", 0)).toMatchObject({ tool: "mcp__mobile_mcp_mobile_click" });
   });
 
   test("tapocalypse MCP tools are violations under both backends", () => {
@@ -143,30 +158,25 @@ describe("frameToActivity backend rules", () => {
 describe("frameToActivity enrichment", () => {
   const frame = (f: Record<string, unknown>): Frame => ({ type: "x", ...f }) as Frame;
 
-  test("host tools become check activities; their ends are dropped", () => {
+  test("progress tool calls add no feed line of their own (the progress recorder writes the check lines)", () => {
     const starts: ToolStarts = new Map();
-    const plan = frameToActivity(
-      frame({ type: "tool_execution_start", toolCallId: "p", toolName: "qa_plan", args: { checks: [{ id: "C1", title: "a" }, { id: "C2", title: "b" }] } }),
-      "mobile-mcp",
-      3,
-      starts,
-    );
-    expect(plan).toMatchObject({ kind: "check", text: "Test plan: 2 checks", seq: 3 });
-    const check = frameToActivity(
-      frame({ type: "tool_execution_start", toolCallId: "c", toolName: "qa_check", args: { id: "C2", status: "fail", note: "no title" } }),
-      "mobile-mcp",
-      4,
-      starts,
-    );
-    expect(check).toMatchObject({ kind: "check", checkId: "C2", checkStatus: "fail", text: "C2: fail — no title" });
-    const fin = frameToActivity(
-      frame({ type: "tool_execution_start", toolCallId: "f", toolName: "qa_finish", args: { verdict: "PASS", summary: "s", reportPath: "r" } }),
-      "mobile-mcp",
-      5,
-      starts,
-    );
-    expect(fin).toMatchObject({ kind: "check", text: "Finished: PASS" });
-    expect(frameToActivity(frame({ type: "tool_execution_end", toolCallId: "p", toolName: "qa_plan", isError: false }), "mobile-mcp", 6, starts)).toBeNull();
+    for (const [name, args] of [
+      ["qa_plan", { checks: [{ id: "C1", title: "a" }] }],
+      ["qa_check", { id: "C1", status: "pass" }],
+      ["qa_finish", { verdict: "PASS", summary: "s", reportPath: "r" }],
+    ] as const) {
+      expect(frameToActivity(frame({ type: "tool_execution_start", toolCallId: name, toolName: name, args }), "mobile-mcp", 0, starts)).toBeNull();
+      expect(frameToActivity(frame({ type: "tool_execution_end", toolCallId: name, toolName: name, isError: false }), "mobile-mcp", 1, starts)).toBeNull();
+    }
+  });
+
+  test("runs recorded before progress calls were logged server-side still show their check lines", () => {
+    const at = (toolName: string, args: Record<string, unknown>) => legacyProgressActivity(frame({ type: "tool_execution_start", toolName, args }), 3);
+    expect(at("qa_plan", { checks: [{ id: "C1", title: "a" }, { id: "C2", title: "b" }] })).toMatchObject({ kind: "check", text: "Test plan: 2 checks", seq: 3 });
+    expect(at("qa_check", { id: "C2", status: "fail", note: "no title" })).toMatchObject({ kind: "check", checkId: "C2", checkStatus: "fail", text: "C2: fail — no title" });
+    expect(at("qa_finish", { verdict: "PASS", summary: "s", reportPath: "r" })).toMatchObject({ kind: "check", text: "Finished: PASS" });
+    expect(at("qa_check", { id: "C2", status: "bogus" })).toBeNull();
+    expect(at("bash", { command: "ls" })).toBeNull();
   });
 
   test("a rejected host-tool call stays visible as a failed tool_end", () => {
@@ -201,14 +211,14 @@ describe("frameToActivity enrichment", () => {
       0,
       starts,
     );
-    expect(start).toMatchObject({ kind: "tool", tool: "mcp__tpc_mobile_mcp_mobile_click", args: { x: 1 } });
+    expect(start).toMatchObject({ kind: "tool", tool: "mcp__mobile_mcp_mobile_click", args: { x: 1 } });
     const end = frameToActivity(
       frame({ type: "tool_execution_end", toolCallId: "t1", toolName: "write", isError: true, result: { content: [{ type: "text", text: "boom" }] }, _ts: "2026-01-01T00:00:02.500Z" }),
       "mobile-mcp",
       1,
       starts,
     );
-    expect(end).toMatchObject({ kind: "tool_end", tool: "mcp__tpc_mobile_mcp_mobile_click", ok: false, durationMs: 2500 });
+    expect(end).toMatchObject({ kind: "tool_end", tool: "mcp__mobile_mcp_mobile_click", ok: false, durationMs: 2500 });
     expect(end?.text).toContain("boom");
   });
 

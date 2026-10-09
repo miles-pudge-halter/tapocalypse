@@ -2,9 +2,11 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renam
 import { randomBytes } from "node:crypto";
 import path from "node:path";
 import { DATA_DIR } from "../config";
-import { normalizeUsage } from "./outcome";
-import { frameToActivity, type ToolStarts } from "./prompt";
-import type { Activity, Backend, Run } from "./types";
+import { getHarness } from "../harness";
+import { legacyProgressActivity } from "../harness/omp/activity";
+import { normalizeUsage } from "../harness/omp/usage";
+import { HarnessIdSchema, type ReplayContext } from "../harness/types";
+import type { Activity, Backend, CheckStatus, Run } from "./types";
 
 const RUNS_DIR = path.join(DATA_DIR, "runs");
 
@@ -33,8 +35,10 @@ const RUN_DEFAULTS = {
   batchId: null,
   suiteId: null,
   suiteChecks: null,
+  harness: "omp",
   model: null,
   thinking: null,
+  effort: null,
   errorKind: null,
   verdictSource: null,
   usage: null,
@@ -53,8 +57,10 @@ export type NewRun = Omit<Run, "id" | "createdAt" | RunDefaultKey> & Partial<Pic
 function normalizeRun(raw: Run): Run {
   const run = raw as unknown as Record<string, unknown>;
   for (const [key, value] of Object.entries(RUN_DEFAULTS)) run[key] ??= value;
-  // Runs persisted before `usage` existed carry only the raw omp stats.
-  if (raw.usage === null && raw.stats) raw.usage = normalizeUsage(raw.stats, raw.model);
+  // A corrupt or foreign harness id would leave replay and start without an adapter.
+  raw.harness = HarnessIdSchema.catch("omp").parse(raw.harness);
+  // Runs persisted before `usage` existed carry only the raw omp stats (and were always omp runs).
+  if (raw.usage === null && raw.stats && raw.harness === "omp") raw.usage = normalizeUsage(raw.stats, raw.model);
   return raw;
 }
 
@@ -122,6 +128,7 @@ export function deleteRun(id: string): void {
   rmSync(runDir(id), { recursive: true, force: true });
   loadIndex().delete(id);
   eventCounts.delete(id);
+  replayStarts.delete(id);
   sorted = null;
 }
 
@@ -189,27 +196,59 @@ function parseLine(line: string): unknown {
   }
 }
 
+/** Tool-call starts seen so far per run, extended incrementally since events.jsonl is append-only. */
+const replayStarts = new Map<string, { harness: string; lines: number; starts: ReplayContext["starts"] }>();
+
+/** Tapocalypse's own feed lines (progress checks, info, warnings) are stored as `_activity` frames, whatever the harness. */
+function activityFrame(frame: unknown, seq: number): Activity | null {
+  const f = frame as { type?: unknown; _ts?: unknown; kind?: unknown; text?: unknown; checkId?: unknown; checkStatus?: unknown } | null;
+  if (f?.type !== "_activity") return null;
+  const ts = typeof f._ts === "string" ? f._ts : new Date().toISOString();
+  const activity: Activity = { ts, seq, kind: f.kind as Activity["kind"], text: String(f.text) };
+  if (typeof f.checkId === "string") activity.checkId = f.checkId;
+  if (typeof f.checkStatus === "string") activity.checkStatus = f.checkStatus as CheckStatus;
+  return activity;
+}
+
 /**
  * Activity page: the newest `limit` items with `seq < before` (or the newest overall), oldest first.
- * Only the lines it walks are JSON-parsed, plus tool-call starts (to resolve tool names and durations).
+ * Only the lines it walks are mapped to feed lines; the rest are scanned once for tool-call starts (to resolve tool
+ * names and durations), incrementally across calls.
  */
 export function readActivity(id: string, opts: { before?: number; limit: number }): { items: Activity[]; hasMore: boolean } {
   const file = path.join(runDir(id), "events.jsonl");
   if (!existsSync(file)) return { items: [], hasMore: false };
-  const lines = readFileSync(file, "utf8").split("\n");
-  const backend: Backend = getRun(id)?.backend ?? "mobile-mcp";
+  const text = readFileSync(file, "utf8");
+  const lines = text.split("\n");
+  const run = getRun(id);
+  const backend: Backend = run?.backend ?? "mobile-mcp";
+  const harnessId = run?.harness ?? "omp";
+  const harness = getHarness(harnessId);
+  // Runs recorded before progress calls were logged server-side have no `check` lines of their own (omp only).
+  const legacyChecks = harnessId === "omp" && !text.includes('"kind":"check"');
 
-  const starts: ToolStarts = new Map();
-  lines.forEach((line, seq) => {
-    if (line.startsWith('{"type":"tool_execution_start"')) frameToActivity(parseLine(line), backend, seq, starts);
-  });
+  let cached = replayStarts.get(id);
+  if (!cached || cached.harness !== harnessId) {
+    cached = { harness: harnessId, lines: 0, starts: new Map() };
+    replayStarts.set(id, cached);
+  }
+  // The last segment is empty after a trailing newline, or an unfinished line: never mark it scanned.
+  const complete = lines.length - 1;
+  for (let seq = cached.lines; seq < complete; seq++) {
+    const line = lines[seq]!;
+    if (line && !line.startsWith('{"type":"_activity"')) harness.toActivity(parseLine(line), { backend, seq, starts: cached.starts });
+  }
+  cached.lines = Math.max(cached.lines, complete);
+  const starts = cached.starts;
 
   const items: Activity[] = [];
   const need = Math.max(0, opts.limit) + 1;
   for (let seq = Math.min(opts.before ?? lines.length, lines.length) - 1; seq >= 0 && items.length < need; seq--) {
     const line = lines[seq]!;
     if (!line) continue;
-    const activity = frameToActivity(parseLine(line), backend, seq, starts);
+    const frame = parseLine(line);
+    const activity =
+      activityFrame(frame, seq) ?? (legacyChecks ? legacyProgressActivity(frame, seq) : null) ?? harness.toActivity(frame, { backend, seq, starts });
     if (activity) items.push(activity);
   }
   const hasMore = items.length === need;
