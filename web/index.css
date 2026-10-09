@@ -103,39 +103,53 @@
     }
   }
 
-  --animate-strike: strike 450ms linear 1 both;
+  --animate-strike: strike 520ms linear 1 both;
   @keyframes strike {
     0% {
-      transform: scaleY(0);
+      clip-path: inset(0 0 100% 0);
       opacity: 1;
-      animation-timing-function: cubic-bezier(0.2, 0.8, 0.2, 1);
+      animation-timing-function: cubic-bezier(0.1, 0.9, 0.2, 1);
     }
-    35% {
-      transform: scaleY(1);
+    22% {
+      clip-path: inset(0);
       opacity: 1;
       animation-timing-function: steps(1, end);
     }
-    45% {
-      transform: scaleY(1);
-      opacity: 0.25;
+    30% {
+      clip-path: inset(0);
+      opacity: 0.2;
       animation-timing-function: steps(1, end);
     }
-    55% {
-      transform: scaleY(1);
+    38% {
+      clip-path: inset(0);
+      opacity: 1;
+      animation-timing-function: steps(1, end);
+    }
+    46% {
+      clip-path: inset(0);
+      opacity: 0.5;
+      animation-timing-function: steps(1, end);
+    }
+    54% {
+      clip-path: inset(0);
       opacity: 1;
     }
     70% {
-      transform: scaleY(1);
+      clip-path: inset(0);
       opacity: 1;
       animation-timing-function: ease-out;
     }
     100% {
-      transform: scaleY(1);
+      clip-path: inset(0);
       opacity: 0;
     }
   }
 }
 
+/*
+ * A lightning bolt strikes down the left edge on hover / focus: a tapered zigzag (SVG mask over the brand gradient)
+ * revealed top-to-bottom, two flickers, then it fades. Height follows the element; `--strike-inset` trims it.
+ */
 @utility hover-strike {
   position: relative;
   &::before {
@@ -143,12 +157,13 @@
     position: absolute;
     inset-block: var(--strike-inset, 0.375rem);
     left: 0;
-    width: 3px;
-    border-radius: 9999px;
+    width: 8px;
     background-image: var(--brand-strike);
-    box-shadow: var(--brand-strike-glow);
-    transform: scaleY(0);
-    transform-origin: top;
+    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 100' preserveAspectRatio='none'%3E%3Cpolygon points='4,0 7.4,0 4.7,30 7,30 2.9,62 5.1,62 0.4,100 2.2,70 0.4,70 3.3,38 1.1,38'/%3E%3C/svg%3E");
+    mask-size: 100% 100%;
+    mask-repeat: no-repeat;
+    filter: var(--brand-strike-glow);
+    clip-path: inset(0 0 100% 0);
     opacity: 0;
     pointer-events: none;
   }
@@ -210,7 +225,7 @@
   --brand-tap: oklch(0.7253 0.1547 72.8);
   --brand-thunder: linear-gradient(90deg, #fff1b0 0%, #ffc21a 45%, #ff6a0d 100%);
   --brand-strike: linear-gradient(180deg, #ffc21a 0%, #ff6a0d 100%);
-  --brand-strike-glow: 0 0 6px 0 oklch(0.8464 0.1693 84.902 / 35%);
+  --brand-strike-glow: drop-shadow(0 0 3px oklch(0.8464 0.1693 84.902 / 45%));
   --toast-warning-bg: oklch(0.98 0.016 73.684);
   --toast-warning-border: oklch(0.901 0.076 70.697);
   --toast-warning-text: oklch(0.47 0.157 37.304);
@@ -254,7 +269,7 @@
   --brand-rim: oklch(0.8464 0.1693 84.902 / 45%);
   --brand-tap: oklch(0.8464 0.1693 84.902);
   --brand-strike: linear-gradient(180deg, #fff1b0 0%, #ffc21a 45%, #ff6a0d 100%);
-  --brand-strike-glow: 0 0 6px 0 oklch(0.8464 0.1693 84.902 / 55%);
+  --brand-strike-glow: drop-shadow(0 0 4px oklch(0.8464 0.1693 84.902 / 70%));
   --toast-warning-bg: oklch(0.2396 0.0567 38.809);
   --toast-warning-border: oklch(0.408 0.123 38.172);
   --toast-warning-text: oklch(0.837 0.128 66.29);
