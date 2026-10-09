@@ -1,4 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ExecResult } from "../src/devices/devices";
 import { type CodexProcess, type CodexSpawn, createCodexHarness, harness as realHarness } from "../src/harness/codex";
@@ -102,6 +104,16 @@ function fakeSpawn(configure: (p: FakeProc) => void = () => {}): { spawn: CodexS
   return { spawn, calls };
 }
 
+const tempDirs: string[] = [];
+afterAll(() => {
+  for (const d of tempDirs) rmSync(d, { recursive: true, force: true });
+});
+function tempRunDir(): string {
+  const dir = mkdtempSync(path.join(tmpdir(), "tpc-codex-"));
+  tempDirs.push(dir);
+  return dir;
+}
+
 const TPC: McpServerSpec = {
   name: "tpc",
   transport: "http",
@@ -123,7 +135,7 @@ function makeOpts(over: Partial<SpawnOptions> = {}) {
   const opts: SpawnOptions = {
     runId: "run1",
     cwd: "/repo",
-    runDir: "/data/runs/run1",
+    runDir: tempRunDir(),
     persona: "You are a QA agent.",
     personaFile: "/data/runs/run1/persona.md",
     model: null,
@@ -336,15 +348,19 @@ describe("codex session stream", () => {
 });
 
 describe("codex spawn", () => {
-  test("builds the exec argv with per-session MCP, persona in config and the token only in the environment", () => {
+  test("builds the exec argv with per-session MCP, persona in config and the progress server as a stdio bridge that reads its credentials from a file", async () => {
     const { spawn, calls } = fakeSpawn();
+    const runDir = tempRunDir();
     const { opts } = makeOpts({
+      runDir,
       model: "gpt-5.5",
       effort: "high",
       persona: 'Line one\nSay "hi" \\ done',
     });
     withCodexBin(undefined, () => createCodexHarness({ spawn }).spawn(opts));
     const call = calls[0];
+    const bridge = path.resolve(import.meta.dir, "../src/mcp/stdio-bridge.ts");
+    const credentials = path.join(runDir, "tpc-mcp.json");
     expect(call.cmd).toEqual([
       "codex",
       "exec",
@@ -359,9 +375,9 @@ describe("codex spawn", () => {
       "-c",
       'developer_instructions="Line one\\nSay \\"hi\\" \\\\ done"',
       "-c",
-      'mcp_servers.tpc.url="http://127.0.0.1:4310/mcp/runs/run1"',
+      `mcp_servers.tpc.command=${JSON.stringify(process.execPath)}`,
       "-c",
-      'mcp_servers.tpc.bearer_token_env_var="TPC_RUN_TOKEN"',
+      `mcp_servers.tpc.args=[${JSON.stringify(bridge)},${JSON.stringify(credentials)}]`,
       "-c",
       "mcp_servers.tpc.required=true",
       "-c",
@@ -391,8 +407,26 @@ describe("codex spawn", () => {
       "-",
     ]);
     expect(call.cwd).toBe("/repo");
-    expect(call.env.TPC_RUN_TOKEN).toBe("s3cret-token");
     expect(call.cmd.join(" ")).not.toContain("s3cret-token");
+    expect(call.cmd.join(" ")).not.toContain("mcp_servers.tpc.url");
+    expect(path.isAbsolute(bridge) && await Bun.file(bridge).exists()).toBe(true);
+  });
+
+  test("the progress server's url and token go to an owner-only credentials file in the run dir", async () => {
+    const { spawn } = fakeSpawn();
+    const runDir = tempRunDir();
+    createCodexHarness({ spawn }).spawn(makeOpts({ runDir }).opts);
+    const file = path.join(runDir, "tpc-mcp.json");
+    expect(await Bun.file(file).json()).toEqual({ url: "http://127.0.0.1:4310/mcp/runs/run1", token: "s3cret-token" });
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+  });
+
+  test("an http server without a bearer token fails the session instead of starting an unauthenticated bridge", async () => {
+    const { spawn, calls } = fakeSpawn();
+    const server: McpServerSpec = { name: "tpc", transport: "http", url: "http://x/mcp", headers: { "X-Run": "abc123" } };
+    const session = createCodexHarness({ spawn }).spawn(makeOpts({ runDir: tempRunDir(), mcpServers: [server] }).opts);
+    expect(calls).toHaveLength(0);
+    await expect(session.ready()).rejects.toThrow(/Bearer/);
   });
 
   test("settings choose the binary and sandbox (the adapter ignores CODEX_BIN: the runner resolves it into settings.bin); workspace-write gets network access", () => {
@@ -424,19 +458,6 @@ describe("codex spawn", () => {
     const exit = await session.exited;
     expect(exit).toMatchObject({ code: 127, started: false });
     expect(exit.error).toContain("ENOENT");
-  });
-
-  test("non-Authorization http headers travel via env vars, never argv", () => {
-    const { spawn, calls } = fakeSpawn();
-    const server: McpServerSpec = { name: "tpc", transport: "http", url: "http://x/mcp", headers: { "X-Run": "abc123" } };
-    createCodexHarness({ spawn }).spawn(makeOpts({ mcpServers: [server] }).opts);
-    const call = calls[0];
-    expect(call.cmd.join(" ")).not.toContain("abc123");
-    const entry = call.cmd.find((a) => a.startsWith("mcp_servers.tpc.env_http_headers="));
-    expect(entry).toBeDefined();
-    const envName = /=\{ X-Run = "(\w+)" \}/.exec(entry ?? "")?.[1];
-    expect(envName).toBeDefined();
-    expect(call.env[envName ?? ""]).toBe("abc123");
   });
 
   test("persona text stays a valid TOML basic string for control characters and lone surrogates", () => {
