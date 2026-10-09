@@ -19,18 +19,18 @@ The config file is created with the defaults below when it does not exist. It is
 | --- | --- | --- |
 | `port` | `4310` | HTTP port; the server only binds `127.0.0.1` |
 | `maxConcurrentRuns` | `2` | Runs executing at once (including ones waiting for an emulator to boot). Mind your RAM: each emulator needs several GB |
-| `runMaxTime` | `"60m"` | Time budget per run, shown to the agent and passed to omp as `--max-time` (the other harnesses have no time flag). Tapocalypse hard-kills Claude Code and Codex CLI at the budget and omp, which enforces it itself, 5 minutes after it. Must be a valid duration, checked at startup (`fatal: config: …`, exit 1): `90m`, `1h30m`, `45s`, `2h`; a bare number is minutes. At 80% of it the agent is told to wrap up; see [Run outcomes](../README.md#run-outcomes) |
-| `projects` | `[]` | Project objects, see [Projects](../README.md#projects). Normally managed from the UI |
+| `runMaxTime` | `"60m"` | Time budget per run, shown to the agent and passed to omp as `--max-time` (the other harnesses have no time flag). Tapocalypse hard-kills Claude Code and Codex CLI at the budget and omp, which enforces it itself, 5 minutes after it. Must be a valid duration, checked at startup (`fatal: config: …`, exit 1): `90m`, `1h30m`, `45s`, `2h`; a bare number is minutes. At 80% of it the agent is told to wrap up; see [Run outcomes](guide.md#run-outcomes) |
+| `projects` | `[]` | Project objects, see [Projects](guide.md#projects). Normally managed from the UI |
 | `agent.harness` | unset | Default [agent harness](#agent-harnesses): `omp`, `claude` or `codex`. Unset: the first of omp, Claude Code and Codex CLI that is installed and signed in, else the first installed, else omp |
 | `agent.harnesses.<id>` | unset | Settings for one harness (`omp`, `claude` or `codex`): `bin`, `model`, `effort`, `permissions`, `sandbox`. See [Agent harnesses](#agent-harnesses) |
 | `agent.maxTurns` | unset | Claude Code only (`--max-turns`): end the session after this many agent turns. Other harnesses ignore it. One mobile check takes 5-20 tool calls, so leave it unset unless you want a hard cap |
 | `agent.maxBudgetUsd` | unset | Claude Code only (`--max-budget-usd`): end the session once it has spent about this much. Other harnesses ignore it |
 | `agent.model`, `agent.thinking` | unset | Legacy omp keys, kept as they were: the omp model and thinking level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) for runs whose request, suite, project and persona name none. Prefer `agent.harnesses.omp.model` / `.effort` |
-| `projects[].agent` | unset | Per-project override `{ harness?, model?, effort? }`, see [Projects](../README.md#projects) |
+| `projects[].agent` | unset | Per-project override `{ harness?, model?, effort? }`, see [Projects](guide.md#projects) |
 | `retry.infra` | `1` | Automatic retries of a run that failed on infrastructure (boot failure, agent crash, MCP tools missing) before any check resolved. `0` disables retries |
 | `retention.days` | unset | Delete finished runs that ended more than this many days ago. Unset keeps them |
 | `retention.maxRuns` | unset | Keep only the newest this-many runs, deleting older finished ones. Unset keeps them |
-| `artemisPath` | unset | Path to a local Artemis clone; enables the optional [Artemis backend](../README.md#optional-artemis-backend) |
+| `artemisPath` | unset | Path to a local Artemis clone; enables the optional [Artemis backend](guide.md#optional-artemis-backend) |
 | `devicePool.android.avds` | `[]` | AVD names (`emulator -list-avds`) Tapocalypse may boot on demand. Wear OS, TV and Automotive AVDs are never booted automatically |
 | `devicePool.android.basePort` | `5560` | First emulator console port; booted emulators get even ports from here |
 | `devicePool.android.maxBooted` | `1` | Max emulators Tapocalypse keeps booted at once; `0` disables auto-boot |
@@ -41,7 +41,7 @@ The config file is created with the defaults below when it does not exist. It is
 | `devicePool.ios.simulators` | `[]` | Simulator UDIDs Tapocalypse may boot on demand (macOS only) |
 | `devicePool.ios.idleShutdownMinutes` | `20` | Same idle shutdown for simulators |
 
-`retention` is evaluated at startup and every 6 hours. It only removes run folders under the data directory; reports and screenshots in your repositories are never touched, and queued or active runs are never deleted. See [Data and retention](../README.md#data-and-retention).
+`retention` is evaluated at startup and every 6 hours. It only removes run folders under the data directory; reports and screenshots in your repositories are never touched, and queued or active runs are never deleted. See [Data and retention](guide.md#data-and-retention).
 
 A fresh config file contains the defaults above for `port`, `maxConcurrentRuns`, `runMaxTime`, `projects` and `devicePool`; `agent`, `retry`, `retention` and `artemisPath` are optional and can be added by hand.
 
@@ -78,9 +78,9 @@ A *harness* is the headless coding-agent CLI that plays the QA agent: `omp`, `cl
 
 **Model precedence:** the run's `model`, the suite's `model`, the project's `agent.model`, the persona's `model:` (only when the persona's `harness:` equals the run's harness; a persona without `harness:` counts as omp), `agent.harnesses.<harness>.model`, then, for omp only, the legacy `agent.model`. The harness's own default applies when nothing is set. **Effort** resolves the same way (run, suite, project `agent.effort`, persona, `agent.harnesses.<harness>.effort`, then for omp the legacy `agent.thinking`). The model and effort a run used are stored on the run (`model`, `effort`; `thinking` stays filled for omp runs).
 
-**Limits.** `runMaxTime` applies to every harness: omp enforces it with `--max-time` and Tapocalypse kills it 5 minutes after the budget; Claude Code and Codex CLI are killed at the budget. `agent.maxTurns` and `agent.maxBudgetUsd` apply to Claude Code only. A limit that ends a session is reported as a run with `errorKind: "timeout"` and the limit named in `error`; the verdict is derived from the resolved checks as for a time-out ([Run outcomes](../README.md#run-outcomes)).
+**Limits.** `runMaxTime` applies to every harness: omp enforces it with `--max-time` and Tapocalypse kills it 5 minutes after the budget; Claude Code and Codex CLI are killed at the budget. `agent.maxTurns` and `agent.maxBudgetUsd` apply to Claude Code only. A limit that ends a session is reported as a run with `errorKind: "timeout"` and the limit named in `error`; the verdict is derived from the resolved checks as for a time-out ([Run outcomes](guide.md#run-outcomes)).
 
-**What a harness can do.** Steering a running agent works with omp and Claude Code but not Codex CLI (`POST /api/runs/:id/steer` answers 409). Cost is reported by omp (when the provider says) and Claude Code; Codex CLI reports tokens only. An HTML transcript and the [Artemis backend](../README.md#optional-artemis-backend) are omp-only: a run that asks for `backend: "artemis"` on another harness is rejected with a 400. Each adapter writes its per-run configuration into the run's data folder, never into your repository or your home directory. The run's progress token reaches the agent by environment variable (Codex CLI, `TPC_RUN_TOKEN`) or an owner-only `mcp.json` (mode 0600) in the run's data folder (Claude Code), which stays until retention removes the run; omp uses host tools and needs no token. It is never on the command line or in `run.json`, `events.jsonl` or `stderr.log`. One side effect is outside Tapocalypse's control: the first `codex exec` in a repository makes Codex CLI add that path as trusted to `~/.codex/config.toml`; see [SECURITY.md](../SECURITY.md).
+**What a harness can do.** Steering a running agent works with omp and Claude Code but not Codex CLI (`POST /api/runs/:id/steer` answers 409). Cost is reported by omp (when the provider says) and Claude Code; Codex CLI reports tokens only. An HTML transcript and the [Artemis backend](guide.md#optional-artemis-backend) are omp-only: a run that asks for `backend: "artemis"` on another harness is rejected with a 400. Each adapter writes its per-run configuration into the run's data folder, never into your repository or your home directory. The run's progress token reaches the agent by environment variable (Codex CLI, `TPC_RUN_TOKEN`) or an owner-only `mcp.json` (mode 0600) in the run's data folder (Claude Code), which stays until retention removes the run; omp uses host tools and needs no token. It is never on the command line or in `run.json`, `events.jsonl` or `stderr.log`. One side effect is outside Tapocalypse's control: the first `codex exec` in a repository makes Codex CLI add that path as trusted to `~/.codex/config.toml`; see [SECURITY.md](../SECURITY.md).
 
 ## Environment variables
 
@@ -107,4 +107,4 @@ bun src/cli.ts serve [--port 4311] [--dev]
 bun run doctor
 ```
 
-`serve --dev` runs the same server with Bun's development server (hot module reloading for the UI and browser console forwarding); without it `serve` runs in production mode. The `run` and `status` commands are described in [CLI and CI](../README.md#cli-and-ci); `run --harness omp|claude|codex` picks the agent runtime for one run.
+`serve --dev` runs the same server with Bun's development server (hot module reloading for the UI and browser console forwarding); without it `serve` runs in production mode. The `run` and `status` commands are described in [CLI and CI](guide.md#cli-and-ci); `run --harness omp|claude|codex` picks the agent runtime for one run.

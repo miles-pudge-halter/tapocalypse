@@ -29,3 +29,6 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
       - run: bun test
+      - name: Frontend bundle
+        run: |
+          NODE_ENV=production bun -e 'const r = await Bun.build({ entrypoints: ["./web/index.html"], outdir: "/tmp/tb", plugins: [(await import("bun-plugin-tailwind")).default] }); if (!r.success) { console.error(r.logs); process.exit(1); }'

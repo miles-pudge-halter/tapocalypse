@@ -1,13 +1,13 @@
 # HTTP API and MCP tools
 
-Back to the [README](../README.md). Everything the web UI does goes through this API, so anything you can click you can script. The server binds `127.0.0.1` only; see the [security model](../README.md#security-model) for the request guards that apply to every route below.
+Back to the [README](../README.md). Everything the web UI does goes through this API, so anything you can click you can script. The server binds `127.0.0.1` only; see the [security model](guide.md#security-model) for the request guards that apply to every route below.
 
 ## Conventions
 
 - Errors are JSON `{ "error": "<message>" }` with the matching status (400 invalid input, 403 forbidden host or origin, 404 unknown id, 409 conflict, 415 wrong content type).
 - `POST`/`PUT` routes that take a body need `Content-Type: application/json`. Request bodies are limited to 1 MiB.
 - A `Run` in responses carries everything in `run.json` (status, checks, verdict, `verdictSource`, `errorKind`, `usage`, `source`, `build`, `attempt`, `retryOf`/`retriedBy`, `harness`, `model`, `effort`, …) plus `queuePosition`, `queueReason` (why a queued run is still waiting) and `durationMs`.
-- `harness` is `omp`, `claude` or `codex` (see [Agent runtimes](../README.md#agent-runtimes)); an unknown value is a 400. `model` is a harness-native string and `thinking` carries the reasoning level in that harness's terms (omp thinking, Claude Code `--effort`, Codex CLI `model_reasoning_effort`). A run records the `harness` it used, `effort` (the same level; omp runs also keep `thinking`), and runs from before harnesses existed read as `omp`.
+- `harness` is `omp`, `claude` or `codex` (see [Agent runtimes](guide.md#agent-runtimes)); an unknown value is a 400. `model` is a harness-native string and `thinking` carries the reasoning level in that harness's terms (omp thinking, Claude Code `--effort`, Codex CLI `model_reasoning_effort`). A run records the `harness` it used, `effort` (the same level; omp runs also keep `thinking`), and runs from before harnesses existed read as `omp`.
 - Run ids look like `20260101-093015-a1b2-dark-mode-toggle`, batch ids like `b-20260101-093015-a1b2`.
 
 ## HTTP routes
@@ -38,7 +38,7 @@ Back to the [README](../README.md). Everything the web UI does goes through this
 | Route | Purpose |
 | --- | --- |
 | `GET /api/projects` | Projects with `status` (`ok`/`invalid`) and problems |
-| `POST /api/projects` | Create a project (201). Body as in [Projects](../README.md#projects) |
+| `POST /api/projects` | Create a project (201). Body as in [Projects](guide.md#projects) |
 | `PUT /api/projects/:id` | Change fields of a project |
 | `DELETE /api/projects/:id` | Remove a project (409 while it has queued or active runs; the repo is untouched) |
 | `POST /api/projects/validate` | `{ input, mode: "create" \| "update", existingId? }` checks a project without saving |
@@ -69,7 +69,7 @@ Back to the [README](../README.md). Everything the web UI does goes through this
 
 ## MCP tools
 
-Register `http://127.0.0.1:<port>/mcp` in your agent; see [Dispatching runs from your coding agent](../README.md#dispatching-runs-from-your-coding-agent-mcp). Results are JSON text; failures are returned as MCP errors with the message.
+Register `http://127.0.0.1:<port>/mcp` in your agent; see [Dispatching runs from your coding agent](guide.md#dispatching-runs-from-your-coding-agent-mcp). Results are JSON text; failures are returned as MCP errors with the message.
 
 `source` is `{ path?, branch?, commit?, prNumber?, prTitle?, prUrl?, tickets?, labels? }`. Pass `source.path` = your working directory when you work in a git worktree, so the run records your branch, commit and PR.
 
@@ -112,7 +112,7 @@ Runs launched by Tapocalypse are told never to call `tapocalypse` tools, so regi
 
 Agents report their checks to Tapocalypse through a second MCP endpoint that exists once per run: `POST /mcp/runs/<runId>`. It is not for your own tools; Tapocalypse starts every harness with this endpoint (server name `tpc`) mounted, so a harness only needs MCP support to drive the UI's live checks. omp also registers the same three tools natively as host tools, and both paths feed one recorder.
 
-- **Transport.** Streamable HTTP, stateless, `POST` only, like `/mcp`. The request guards from the [security model](../README.md#security-model) apply, and the `/mcp/runs/:id` route needs `Content-Type: application/json`.
+- **Transport.** Streamable HTTP, stateless, `POST` only, like `/mcp`. The request guards from the [security model](guide.md#security-model) apply, and the `/mcp/runs/:id` route needs `Content-Type: application/json`.
 - **Auth.** `Authorization: Bearer <token>`. The token is 32 random bytes (hex), created when the run's agent is spawned and handed to it by environment variable (Codex CLI, `TPC_RUN_TOKEN`) or an owner-only `mcp.json` (mode 0600) in the run's data folder (Claude Code; the file stays until retention removes the run), never on the command line, in your repo, or in `run.json`, `events.jsonl` or `stderr.log`. omp uses host tools and needs no token. It is compared in constant time and stops working when the run ends. A missing or wrong token, an unknown run and a finished run all get the same JSON-RPC "Unauthorized" error with HTTP 401, so a caller cannot probe which run ids exist.
 - **Tools.**
 

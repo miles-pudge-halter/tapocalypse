@@ -4,7 +4,7 @@ Guidance for coding agents (omp, Claude Code, Cursor, …) working in this repos
 
 ## What this is
 
-Tapocalypse: a local Bun server + React UI + MCP endpoint that runs parallel, agent-driven mobile QA. A run = project + brief + device; the server spawns a headless agent in the app's repo through a *harness* adapter (`omp --mode rpc`, `claude -p` stream-json or `codex exec --json`), which drives an Android emulator / iOS simulator through mobile-mcp (optionally Artemis, omp only) and reports checks back through the progress tools (`qa_plan`, `qa_check`, `qa_finish`): the run-scoped MCP endpoint `POST /mcp/runs/<id>` for every harness, plus omp host tools. User docs: `README.md`, `docs/configuration.md`, `docs/api.md`.
+Tapocalypse: a local Bun server + React UI + MCP endpoint that runs parallel, agent-driven mobile QA. A run = project + brief + device; the server spawns a headless agent in the app's repo through a *harness* adapter (`omp --mode rpc`, `claude -p` stream-json or `codex exec --json`), which drives an Android emulator / iOS simulator through mobile-mcp (optionally Artemis, omp only) and reports checks back through the progress tools (`qa_plan`, `qa_check`, `qa_finish`): the run-scoped MCP endpoint `POST /mcp/runs/<id>` for every harness, plus omp host tools. User docs: `README.md`, `docs/guide.md`, `docs/configuration.md`, `docs/api.md`, `docs/agent-setup.md`.
 
 If `.agent-memory/MEMORY.md` exists (gitignored, maintainer-local), read it first: it holds project history, decisions, research and the next steps.
 

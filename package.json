@@ -51,6 +51,7 @@
     "dev": "bun --hot src/server.ts",
     "test": "bun test",
     "doctor": "bun scripts/doctor.ts",
+    "demo": "bun scripts/seed-demo.ts",
     "typecheck": "tsc --noEmit -p ."
   },
   "dependencies": {

@@ -49,7 +49,7 @@ const MAX_TARGETS = 8;
 const RECENT_BRIEFS = 5;
 const DRAFT_PREFIX = "tapocalypse:new-run-draft:";
 const BRIEF_PLACEHOLDER =
-  "Open the Plan tab. Verify the “My Plans” title is visible. Create a plan named “QA test” and verify it appears in the list.";
+  "Open Settings and turn on dark mode. Verify every screen switches. Force-quit the app, relaunch it and verify dark mode is still on.";
 
 interface Draft {
   title: string;

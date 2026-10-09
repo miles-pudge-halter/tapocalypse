@@ -4,7 +4,7 @@ Thanks for helping. Tapocalypse is a local developer tool: a Bun server, a React
 
 ## Setup
 
-You need [Bun](https://bun.sh) 1.3 or newer and, to exercise real runs, at least one of omp, Claude Code or Codex CLI (signed in) plus Android `adb` and/or Xcode. See the README's Prerequisites.
+You need [Bun](https://bun.sh) 1.3 or newer and, to exercise real runs, at least one of omp, Claude Code or Codex CLI (signed in) plus Android `adb` and/or Xcode. See [Prerequisites](docs/guide.md#prerequisites) in the guide.
 
 ```sh
 git clone https://github.com/miles-pudge-halter/tapocalypse.git

@@ -80,19 +80,19 @@ afterAll(() => {
 
 describe("extractTickets", () => {
   test("finds keys in branch names", () => {
-    expect(extractTickets("fix/CNA2-528-redact")).toEqual(["CNA2-528"]);
+    expect(extractTickets("fix/ACME-528-redact")).toEqual(["ACME-528"]);
   });
 
   test("dedupes across texts and keeps first-seen order", () => {
-    expect(extractTickets("fix/CNA2-528-redact", "Redact tokens [CNA2-528]", "ABC-7 and CNA2-528 and XY9-12", null, undefined)).toEqual([
-      "CNA2-528",
+    expect(extractTickets("fix/ACME-528-redact", "Redact tokens [ACME-528]", "ABC-7 and ACME-528 and XY9-12", null, undefined)).toEqual([
+      "ACME-528",
       "ABC-7",
       "XY9-12",
     ]);
   });
 
   test("ignores lowercase and number-less keys", () => {
-    expect(extractTickets("cna2-528 ABC- X-1 ABC-x")).toEqual([]);
+    expect(extractTickets("acme-528 ABC- X-1 ABC-x")).toEqual([]);
   });
 });
 
@@ -248,14 +248,14 @@ describe("runMatches", () => {
     ({
       source: {
         path: repo,
-        branch: "fix/CNA2-528-redact",
+        branch: "fix/ACME-528-redact",
         commit: "0123456789abcdef0123456789abcdef01234567",
         commitSubject: null,
         dirty: false,
         remoteUrl: null,
         pr: { number: 609, title: null, url: null, state: null, baseBranch: null, isDraft: null, author: null },
         prStatus: "found",
-        tickets: ["CNA2-528"],
+        tickets: ["ACME-528"],
         labels: {},
         ...over,
       },
@@ -263,20 +263,20 @@ describe("runMatches", () => {
 
   test("each filter matches on its own", () => {
     const run = withSource({});
-    expect(runMatches(run, { branch: "fix/CNA2-528-redact" })).toBe(true);
-    expect(runMatches(run, { branch: "fix/CNA2" })).toBe(false);
+    expect(runMatches(run, { branch: "fix/ACME-528-redact" })).toBe(true);
+    expect(runMatches(run, { branch: "fix/ACME" })).toBe(false);
     expect(runMatches(run, { pr: 609 })).toBe(true);
     expect(runMatches(run, { pr: 610 })).toBe(false);
-    expect(runMatches(run, { ticket: "CNA2-528" })).toBe(true);
-    expect(runMatches(run, { ticket: "cna2-528" })).toBe(true);
-    expect(runMatches(run, { ticket: "CNA2-5" })).toBe(false);
+    expect(runMatches(run, { ticket: "ACME-528" })).toBe(true);
+    expect(runMatches(run, { ticket: "acme-528" })).toBe(true);
+    expect(runMatches(run, { ticket: "ACME-5" })).toBe(false);
     expect(runMatches(run, { commit: "01234567" })).toBe(true);
     expect(runMatches(run, { commit: "0123abc" })).toBe(false);
   });
 
   test("all given filters must match", () => {
     const run = withSource({});
-    expect(runMatches(run, { pr: 609, ticket: "CNA2-528", commit: "0123" })).toBe(true);
+    expect(runMatches(run, { pr: 609, ticket: "ACME-528", commit: "0123" })).toBe(true);
     expect(runMatches(run, { pr: 609, ticket: "OTHER-1" })).toBe(false);
   });
 
