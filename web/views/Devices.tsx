@@ -92,12 +92,18 @@ function DeviceCard({
   } else chip = <StateChip tone="free">Free</StateChip>;
 
   return (
-    <Card className={cn("py-4", !qa && "opacity-75")}>
+    <Card className={cn("hover-strike py-4 [--strike-inset:1rem]", !qa && "opacity-75")}>
       <CardContent className="flex gap-4 px-4">
-        <DeviceFrame serial={placeholder || booting ? null : device.serial} live={qa} size="sm" />
+        <DeviceFrame
+          serial={placeholder || booting ? null : device.serial}
+          live={qa}
+          device={device}
+          platform={device.platform}
+          size="sm"
+        />
         <div className="flex min-w-0 flex-1 flex-col gap-2">
           <div className="min-w-0">
-            <DeviceName device={device} className="text-sm font-medium" />
+            <DeviceName device={device} className="max-w-full text-sm font-medium" />
             <p className="truncate text-xs text-muted-foreground" title={deviceSubtitle(device)}>
               {deviceSubtitle(device)}
             </p>

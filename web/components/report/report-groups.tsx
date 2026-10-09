@@ -62,7 +62,7 @@ function groupByDay(reports: ReportEntry[], now: number): DayGroup[] {
 
 function ReportRow({ report, projectId, now }: { report: ReportEntry; projectId: string; now: number }) {
   return (
-    <li className="relative flex items-center gap-3 px-4 py-3 transition-colors hover:bg-muted/50">
+    <li className="hover-strike flex items-center gap-3 px-4 py-3 transition-colors hover:bg-muted/50">
       <div className="min-w-0 flex-1">
         <a
           href={`#/p/${encodeURIComponent(projectId)}/reports/${encodeURIComponent(report.name)}`}

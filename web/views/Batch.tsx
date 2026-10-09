@@ -143,8 +143,8 @@ export function Batch({ id }: { id: string }) {
 function Lane({ run, device, now }: { run: RunView; device: Device | undefined; now: number }) {
   const live = isActive(run.status);
   return (
-    <Card className="relative flex-row gap-4 p-4">
-      {live && <DeviceFrame serial={run.deviceSerial} live className="w-[120px]" />}
+    <Card className="hover-strike relative flex-row gap-4 p-4 [--strike-inset:1rem]">
+      {live && <DeviceFrame serial={run.deviceSerial} live device={device} platform={run.deviceRequest.platform} size="tile" />}
       <div className="flex min-w-0 flex-1 flex-col gap-3">
         <div className="flex items-start gap-2">
           <RunStatusIcon status={run.status} verdict={run.verdict} className="mt-0.5 size-4 shrink-0" />

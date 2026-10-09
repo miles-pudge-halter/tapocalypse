@@ -419,7 +419,7 @@ function ProjectCard({
   const last = runs[0];
 
   return (
-    <Card className="gap-4 py-5">
+    <Card className="hover-strike gap-4 py-5 [--strike-inset:1rem]">
       <CardHeader className="px-5">
         <CardTitle className="flex min-w-0 items-center gap-2 text-base">
           <FrameworkGlyph className="size-4 shrink-0 text-muted-foreground" aria-hidden />

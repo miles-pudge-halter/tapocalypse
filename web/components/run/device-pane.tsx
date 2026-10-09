@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Download, ExternalLink, ImageOff, Smartphone, Radio } from "lucide-react";
 
+import { DeviceChrome, TYPE_ICON, deviceAspect } from "@/components/device-frame";
 import { DeviceName } from "@/components/device-name";
 import { EmptyState } from "@/components/empty-state";
 import { Button } from "@/components/ui/button";
@@ -50,32 +51,51 @@ function Freshness({ updatedAt, failed, latencyMs }: { updatedAt: number | null;
   );
 }
 
-function FrameShell({ children }: { children: ReactNode }) {
+function FrameShell({
+  device,
+  platform,
+  aspect,
+  children,
+}: {
+  device: Pick<Device, "deviceType" | "screen"> | null;
+  platform: Device["platform"];
+  aspect: number;
+  children: ReactNode;
+}) {
   return (
-    <div className="flex min-h-0 flex-1 items-center justify-center px-3 py-2">
-      <div className="flex max-h-full max-w-full overflow-hidden rounded-[1.75rem] bg-zinc-950 p-1.5 ring-2 ring-zinc-800 dark:ring-zinc-700">
-        <div className="flex max-h-full min-h-0 max-w-[300px] items-center justify-center overflow-hidden rounded-[1.35rem] bg-zinc-900">
-          {children}
-        </div>
-      </div>
+    <div className="@container-size flex min-h-0 flex-1 items-center justify-center px-3 py-2">
+      <DeviceChrome
+        deviceType={device?.deviceType ?? "unknown"}
+        platform={platform}
+        aspect={aspect}
+        style={{ width: `max(6rem, min(${aspect > 1 ? 480 : 300}px, 100cqw, calc((100cqh - 2rem) * ${aspect})))` }}
+      >
+        {children}
+      </DeviceChrome>
     </div>
   );
 }
 
-function StillImage({ item, onOpen }: { item: GalleryItem; onOpen: () => void }) {
+function StillImage({ item, onOpen, onAspect }: { item: GalleryItem; onOpen: () => void; onAspect: (aspect: number) => void }) {
   const [failed, setFailed] = useState(false);
   useEffect(() => setFailed(false), [item.url]);
   if (failed) {
     return (
-      <div className="flex h-64 w-48 flex-col items-center justify-center gap-1 text-zinc-500">
+      <div className="flex size-full flex-col items-center justify-center gap-1 text-zinc-500">
         <ImageOff className="size-5" />
         <span className="text-xs">Screenshot file is missing</span>
       </div>
     );
   }
   return (
-    <button type="button" onClick={onOpen} aria-label={`Open ${item.name}`} className="block max-h-full cursor-zoom-in">
-      <img src={item.url} alt={item.name} onError={() => setFailed(true)} className="max-h-full max-w-full object-contain" />
+    <button type="button" onClick={onOpen} aria-label={`Open ${item.name}`} className="block size-full cursor-zoom-in">
+      <img
+        src={item.url}
+        alt={item.name}
+        onLoad={(e) => onAspect(e.currentTarget.naturalWidth / e.currentTarget.naturalHeight)}
+        onError={() => setFailed(true)}
+        className="size-full object-contain"
+      />
     </button>
   );
 }
@@ -102,6 +122,11 @@ export function DevicePane({
   const showLive = deviceLive && pinned === null;
   const live = useLiveScreen(run.deviceSerial, showLive);
   const still = pinned ?? (showLive ? null : (gallery[gallery.length - 1] ?? null));
+  // A run's frames share an aspect: keep the last known one across live and still so the frame does not jump.
+  const [imgAspect, setImgAspect] = useState<number | null>(null);
+  const aspect = deviceAspect(device?.deviceType ?? "unknown", device?.screen ?? null, imgAspect);
+  const platform = device?.platform ?? run.deviceRequest.platform;
+  const Icon = TYPE_ICON[device?.deviceType ?? "unknown"];
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -133,16 +158,21 @@ export function DevicePane({
 
       {showLive && run.deviceSerial ? (
         <>
-          <FrameShell>
+          <FrameShell device={device} platform={platform} aspect={aspect}>
             {live.src ? (
-              <img src={live.src} alt={`Live screen of ${run.deviceSerial}`} className="max-h-full max-w-full object-contain" />
+              <img
+                src={live.src}
+                alt={`Live screen of ${run.deviceSerial}`}
+                onLoad={(e) => setImgAspect(e.currentTarget.naturalWidth / e.currentTarget.naturalHeight)}
+                className="size-full object-contain"
+              />
             ) : live.failed ? (
-              <div className="flex h-64 w-48 flex-col items-center justify-center gap-1 px-3 text-center text-zinc-500">
-                <Smartphone className="size-5" />
+              <div className="flex size-full flex-col items-center justify-center gap-1 px-3 text-center text-zinc-500">
+                <Icon className="size-5" />
                 <span className="text-xs">Screen unavailable</span>
               </div>
             ) : (
-              <Skeleton className="h-96 w-44 rounded-none bg-zinc-800" />
+              <Skeleton className="size-full rounded-none bg-zinc-800" />
             )}
           </FrameShell>
           <div className="flex items-center justify-center gap-1 pb-1">
@@ -163,8 +193,8 @@ export function DevicePane({
           </div>
         </>
       ) : still ? (
-        <FrameShell>
-          <StillImage item={still} onOpen={() => onOpenImage(still)} />
+        <FrameShell device={device} platform={platform} aspect={aspect}>
+          <StillImage item={still} onOpen={() => onOpenImage(still)} onAspect={setImgAspect} />
         </FrameShell>
       ) : (
         <div className="flex flex-1 items-center justify-center p-4">

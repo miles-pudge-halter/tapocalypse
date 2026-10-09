@@ -149,6 +149,7 @@ export function Dashboard() {
   const project = filters.project ?? scopeProject ?? undefined;
   const projectName = useMemo(() => new Map(projects.map((p) => [p.id, p.name])), [projects]);
   const deviceNames = useMemo(() => new Map(devices.map((d) => [d.serial, deviceDisplayName(d)])), [devices]);
+  const deviceBySerial = useMemo(() => new Map(devices.map((d) => [d.serial, d])), [devices]);
 
   const showsActive = filters.status?.some(isActive) ?? false;
   const historyFilters = useMemo<RunFilters>(
@@ -258,6 +259,7 @@ export function Dashboard() {
               <ActiveCard
                 key={run.id}
                 run={run}
+                device={run.deviceSerial ? deviceBySerial.get(run.deviceSerial) : undefined}
                 projectName={projectName.get(run.projectId) ?? run.projectId}
                 deviceName={run.deviceName ?? (run.deviceSerial ? (deviceNames.get(run.deviceSerial) ?? run.deviceSerial) : null)}
                 now={now}
@@ -387,12 +389,14 @@ function LiveStrip({
 
 function ActiveCard({
   run,
+  device,
   projectName,
   deviceName,
   now,
   onChanged,
 }: {
   run: RunView;
+  device: Device | undefined;
   projectName: string;
   deviceName: string | null;
   now: number;
@@ -405,10 +409,8 @@ function ActiveCard({
     (run.deviceRequest.serial ? `waiting for ${run.deviceRequest.serial}` : `waiting for a free ${run.deviceRequest.platform} device`);
 
   return (
-    <Card className="relative flex-row gap-3 p-3">
-      <div className="w-[120px] shrink-0">
-        <DeviceFrame serial={run.deviceSerial} live className="w-[120px]" />
-      </div>
+    <Card className="hover-strike relative flex-row gap-3 p-3 [--strike-inset:1rem]">
+      <DeviceFrame serial={run.deviceSerial} live device={device} platform={run.deviceRequest.platform} size="tile" />
       <div className="flex min-w-0 flex-1 flex-col gap-2">
         <div className="flex items-start gap-2">
           <RunStatusIcon status={run.status} verdict={run.verdict} className="mt-0.5 size-4 shrink-0" />
