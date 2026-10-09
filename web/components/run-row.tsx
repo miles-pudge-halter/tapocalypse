@@ -274,7 +274,7 @@ const COL_DURATION = "hidden w-16 shrink-0 text-right tabular-nums @xl:block";
 const COL_COST = "hidden w-14 shrink-0 text-right tabular-nums @3xl:block";
 const COL_TIME = "w-16 shrink-0 text-right";
 
-const ROW = "group flex items-center gap-3 px-3 py-2 hover:bg-muted/50 focus-within:bg-muted/50";
+const ROW = "group relative flex items-center gap-3 px-3 py-2 hover:bg-muted/50 focus-within:bg-muted/50";
 
 export interface RunRowProps {
   run: RunView;

@@ -387,7 +387,7 @@ function RunFormBody({
     if (e.key !== "Enter") return;
     if (e.metaKey || e.ctrlKey) {
       e.preventDefault();
-      if (!submittingRef.current) formRef.current?.requestSubmit();
+      if (!submittingRef.current && !noRuntime && !harnessesLoading) formRef.current?.requestSubmit();
     } else if (e.target instanceof HTMLInputElement) {
       // plain Enter in a single-line field must not trigger the browser's implicit submit
       e.preventDefault();
@@ -913,7 +913,7 @@ function DevicePicker({
 
 /** Harness-native effort levels the server accepts for `thinking`; the first entry of each list is the lowest. */
 const EFFORT_LEVELS: Record<HarnessId, string[]> = {
-  omp: ["off", "minimal", "low", "medium", "high", "xhigh"],
+  omp: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
   claude: ["low", "medium", "high", "xhigh", "max"],
   codex: ["minimal", "low", "medium", "high", "xhigh"],
 };
