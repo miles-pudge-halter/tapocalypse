@@ -35,7 +35,7 @@ export function Setup() {
                 : "Looking at this machine…"}
             </p>
           </div>
-          <Button variant="outline" size="sm" onClick={recheck} disabled={loading}>
+          <Button variant="outline" size="sm" className="strike" onClick={recheck} disabled={loading}>
             <RefreshCw className={cn("size-3.5", loading && "animate-spin")} />
             Re-check
           </Button>

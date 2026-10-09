@@ -112,7 +112,7 @@ export function Batch({ id }: { id: string }) {
               <span>{formatCost(batch.cost)}</span>
             </div>
           </div>
-          <Button variant="outline" disabled={active || failedLanes.length === 0 || rerunning} onClick={() => void rerunFailed()}>
+          <Button variant="outline" className="strike" disabled={active || failedLanes.length === 0 || rerunning} onClick={() => void rerunFailed()}>
             {rerunning ? <Loader2 className="animate-spin" /> : <RotateCcw />}
             Re-run failed lanes
           </Button>
@@ -143,7 +143,7 @@ export function Batch({ id }: { id: string }) {
 function Lane({ run, device, now }: { run: RunView; device: Device | undefined; now: number }) {
   const live = isActive(run.status);
   return (
-    <Card className="hover-strike relative flex-row gap-4 p-4">
+    <Card className="relative flex-row gap-4 p-4">
       {live && <DeviceFrame serial={run.deviceSerial} live device={device} platform={run.deviceRequest.platform} size="tile" />}
       <div className="flex min-w-0 flex-1 flex-col gap-3">
         <div className="flex items-start gap-2">

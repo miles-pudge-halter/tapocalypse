@@ -409,7 +409,7 @@ function ActiveCard({
     (run.deviceRequest.serial ? `waiting for ${run.deviceRequest.serial}` : `waiting for a free ${run.deviceRequest.platform} device`);
 
   return (
-    <Card className="hover-strike relative flex-row gap-3 p-3">
+    <Card className="relative flex-row gap-3 p-3">
       <DeviceFrame serial={run.deviceSerial} live device={device} platform={run.deviceRequest.platform} size="tile" />
       <div className="flex min-w-0 flex-1 flex-col gap-2">
         <div className="flex items-start gap-2">

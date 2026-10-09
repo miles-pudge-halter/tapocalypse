@@ -881,7 +881,7 @@ function BackendOption({ value, title, description, disabled }: { value: Backend
       htmlFor={id}
       className={cn(
         "flex items-start gap-3 rounded-lg border p-3 has-[[data-state=checked]]:border-ring has-[[data-state=checked]]:bg-accent",
-        disabled ? "cursor-not-allowed opacity-50" : "hover-strike cursor-pointer",
+        disabled ? "cursor-not-allowed opacity-50" : "strike cursor-pointer",
       )}
     >
       <RadioGroupItem id={id} value={value} disabled={disabled} className="mt-0.5" />

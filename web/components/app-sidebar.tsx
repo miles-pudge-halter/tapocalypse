@@ -106,7 +106,7 @@ function RunsNav({ active }: { active: boolean }) {
   const queued = runs.length - running;
   return (
     <SidebarMenuItem>
-      <SidebarMenuButton asChild isActive={active} tooltip="Runs" className="hover-strike">
+      <SidebarMenuButton asChild isActive={active} tooltip="Runs" className="strike">
         <a href="#/">
           <LayoutList />
           <span>Runs</span>
@@ -131,7 +131,7 @@ function DevicesNav({ active }: { active: boolean }) {
   const busy = usable.filter((d) => d.busyRunId).length;
   return (
     <SidebarMenuItem>
-      <SidebarMenuButton asChild isActive={active} tooltip="Devices" className="hover-strike">
+      <SidebarMenuButton asChild isActive={active} tooltip="Devices" className="strike">
         <a href="#/devices">
           <Smartphone />
           <span>Devices</span>
@@ -154,7 +154,7 @@ function ReportsNav({ active }: { active: boolean }) {
   if (target) {
     return (
       <SidebarMenuItem>
-        <SidebarMenuButton asChild isActive={active} tooltip="Reports" className="hover-strike">
+        <SidebarMenuButton asChild isActive={active} tooltip="Reports" className="strike">
           <a href={`#/p/${encodeURIComponent(target.id)}/reports`}>
             <FileText />
             <span>Reports</span>
@@ -167,7 +167,7 @@ function ReportsNav({ active }: { active: boolean }) {
     <SidebarMenuItem>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <SidebarMenuButton isActive={active} tooltip="Reports" className="hover-strike">
+          <SidebarMenuButton isActive={active} tooltip="Reports" className="strike">
             <FileText />
             <span>Reports</span>
           </SidebarMenuButton>
@@ -194,7 +194,7 @@ function SetupNav({ active }: { active: boolean }) {
         asChild
         isActive={active}
         tooltip={blocked ? "Setup — a required prerequisite is missing" : "Setup"}
-        className="hover-strike"
+        className="strike"
       >
         <a href="#/setup">
           <Settings2 />
@@ -222,7 +222,7 @@ function ThemeMenu() {
     <SidebarMenuItem>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <SidebarMenuButton tooltip={`Theme: ${THEME_LABEL[theme]}`} className="hover-strike">
+          <SidebarMenuButton tooltip={`Theme: ${THEME_LABEL[theme]}`} className="strike">
             <Icon />
             <span>Theme: {THEME_LABEL[theme]}</span>
           </SidebarMenuButton>
@@ -283,7 +283,7 @@ export function AppSidebar() {
                 <SidebarMenuButton
                   tooltip={`Search (${MOD_KEY_LABEL} K)`}
                   onClick={openCommandPalette}
-                  className="hover-strike text-muted-foreground"
+                  className="strike text-muted-foreground"
                 >
                   <Search />
                   <span>Search…</span>
@@ -294,7 +294,7 @@ export function AppSidebar() {
               <DevicesNav active={route.name === "devices"} />
               <ReportsNav active={route.name === "reports" || route.name === "report"} />
               <SidebarMenuItem>
-                <SidebarMenuButton asChild isActive={route.name === "projects"} tooltip="Projects" className="hover-strike">
+                <SidebarMenuButton asChild isActive={route.name === "projects"} tooltip="Projects" className="strike">
                   <a href="#/projects">
                     <FolderKanban />
                     <span>Projects</span>

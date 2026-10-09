@@ -419,7 +419,7 @@ function ProjectCard({
   const last = runs[0];
 
   return (
-    <Card className="hover-strike gap-4 py-5">
+    <Card className="gap-4 py-5">
       <CardHeader className="px-5">
         <CardTitle className="flex min-w-0 items-center gap-2 text-base">
           <FrameworkGlyph className="size-4 shrink-0 text-muted-foreground" aria-hidden />
@@ -549,7 +549,7 @@ function ProjectCard({
               New run
             </Button>
             {runs.length === 0 && (
-              <Button size="sm" variant="outline" onClick={() => startSmokeRun(project)}>
+              <Button size="sm" variant="outline" className="strike" onClick={() => startSmokeRun(project)}>
                 Run a smoke test
               </Button>
             )}
@@ -1029,7 +1029,7 @@ function ProjectForm({
                 aria-invalid={errors.repoPath || detectError ? true : undefined}
                 aria-describedby="pj-repo-hint pj-repo-error"
               />
-              <Button type="button" variant="outline" disabled={detecting || !form.repoPath.trim()} onClick={() => void detect()}>
+              <Button type="button" variant="outline" className="strike" disabled={detecting || !form.repoPath.trim()} onClick={() => void detect()}>
                 {detecting ? <Loader2 className="animate-spin" /> : <RefreshCw />}
                 Re-detect
               </Button>

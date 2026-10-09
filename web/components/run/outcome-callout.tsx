@@ -219,12 +219,12 @@ export function OutcomeCallout({ run, actions }: { run: RunView; actions: RunAct
             ) : null}
             {problem.showStderr ? <StderrTail runId={run.id} /> : null}
             <div className="flex flex-wrap items-center gap-2 pt-1">
-              <Button size="sm" variant="outline" disabled={actions.busy} onClick={() => void actions.rerun("all")}>
+              <Button size="sm" variant="outline" className="strike" disabled={actions.busy} onClick={() => void actions.rerun("all")}>
                 {actions.busy ? <Loader2 className="animate-spin" /> : <RotateCcw />}
                 Retry
               </Button>
               {canRerunFailed ? (
-                <Button size="sm" variant="outline" disabled={actions.busy} onClick={() => void actions.rerun("failed")}>
+                <Button size="sm" variant="outline" className="strike" disabled={actions.busy} onClick={() => void actions.rerun("failed")}>
                   Re-run failed
                 </Button>
               ) : null}

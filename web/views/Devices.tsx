@@ -92,7 +92,7 @@ function DeviceCard({
   } else chip = <StateChip tone="free">Free</StateChip>;
 
   return (
-    <Card className={cn("hover-strike py-4", !qa && "opacity-75")}>
+    <Card className={cn("py-4", !qa && "opacity-75")}>
       <CardContent className="flex gap-4 px-4">
         <DeviceFrame
           serial={placeholder || booting ? null : device.serial}
@@ -167,7 +167,7 @@ function GhostCard({ target, booting, capped, onBoot }: { target: BootableDevice
             <p className="text-xs text-muted-foreground">{target.platform === "ios" ? "iOS simulator" : "Android emulator"} · not running</p>
           </div>
           <div className="mt-auto space-y-1.5 pt-1">
-            <Button size="sm" variant="outline" disabled={booting || capped} onClick={onBoot}>
+            <Button size="sm" variant="outline" className="strike" disabled={booting || capped} onClick={onBoot}>
               {booting ? <Loader2 className="animate-spin" /> : <Power />}
               {booting ? "Booting…" : "Boot"}
             </Button>
@@ -287,6 +287,7 @@ export function Devices() {
         actions={
           <Button
             variant="outline"
+            className="strike"
             onClick={() => {
               refreshDevices();
               refreshPool();

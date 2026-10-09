@@ -4,7 +4,7 @@
 
 @custom-variant dark (&:is(.dark *));
 
-/* head position of the hover-strike discharge, in % of the host width; registered so it interpolates */
+/* head position of the strike discharge and of the running-segment loop, in % of the host width; registered so it interpolates */
 @property --strike-x {
   syntax: "<percentage>";
   inherits: false;
@@ -75,31 +75,32 @@
     }
   }
 
-  --animate-charge: charge 1.4s linear infinite;
-  @keyframes charge {
+  --animate-strike-bar: strike-bar-travel 1.8s linear infinite, strike-bar-flicker 1.8s linear infinite;
+  @keyframes strike-bar-travel {
     from {
-      background-position: 150% 0, 0 0;
+      --strike-x: -20%;
     }
     to {
-      background-position: -50% 0, 0 0;
+      --strike-x: 160%;
     }
   }
-
-  --animate-glint: glint 650ms ease-out 1;
-  @keyframes glint {
-    0% {
-      transform: translateX(-100%) skewX(-20deg);
-      opacity: 0;
-    }
-    15% {
+  @keyframes strike-bar-flicker {
+    0%,
+    100% {
       opacity: 1;
     }
-    100% {
-      transform: translateX(420%) skewX(-20deg);
-      opacity: 0;
+    46% {
+      opacity: 1;
+      animation-timing-function: steps(1, end);
+    }
+    49% {
+      opacity: 0.55;
+      animation-timing-function: steps(1, end);
+    }
+    53% {
+      opacity: 1;
     }
   }
-
   --animate-verdict-strike: verdict-strike 700ms ease-out 1;
   @keyframes verdict-strike {
     0% {
@@ -110,8 +111,8 @@
     }
   }
 
-  --animate-strike: strike-travel 600ms cubic-bezier(0.5, 0.1, 0.4, 1) 1 both, strike-flicker 600ms linear 1 both;
-  --animate-strike-crackle: strike-crackle 600ms linear 1 both;
+  --animate-strike: strike-travel 480ms cubic-bezier(0.5, 0.1, 0.4, 1) 1 both, strike-flicker 480ms linear 1 both;
+  --animate-strike-crackle: strike-crackle 480ms linear 1 both;
   @keyframes strike-travel {
     from {
       --strike-x: 0%;
@@ -171,13 +172,14 @@
 }
 
 /*
- * Hover / focus discharge: a jagged lightning channel arcs across the element left to right, once per entry.
- * ::before is the channel: a fixed bolt path (repeating 240 px SVG tile, glow baked into the mask) lit by a gradient
- * anchored at --strike-x, so a bright head leads and an orange tail fades behind it. ::after is the soft halo at the head.
- * Both sit at z-index -1 inside the host's own stacking context (isolation), i.e. above the host background and below
- * all content. The pseudo-elements only exist while the effect plays, so idle rows cost nothing.
+ * Activation discharge: when a host is activated (click, tap, Enter, Space) a jagged lightning channel arcs across it
+ * left to right, once. A delegated click listener sets data-strike="" on the nearest .strike host and removes it on the
+ * strike-travel animationend. ::before is the channel: a fixed bolt path (repeating 240 px SVG tile, glow baked into the
+ * mask) lit by a gradient anchored at --strike-x, so a bright head leads and an orange tail fades behind it. ::after is
+ * the soft halo at the head. Both sit at z-index -1 inside the host's own stacking context (isolation), i.e. above the
+ * host background and below all content. The pseudo-elements only exist while data-strike is set.
  */
-@utility hover-strike {
+@utility strike {
   position: relative;
   isolation: isolate;
   &::before,
@@ -203,13 +205,66 @@
     background-image: radial-gradient(40px min(48%, 24px) at var(--strike-x) 50%, var(--brand-strike-halo), transparent);
   }
   @media (prefers-reduced-motion: no-preference) {
-    &:is(:hover, :focus-visible, :has(:focus-visible), [data-selected="true"]):not([data-active="true"])::before {
+    &[data-strike]::before {
       content: "";
       animation: var(--animate-strike), var(--animate-strike-crackle);
     }
-    &:is(:hover, :focus-visible, :has(:focus-visible), [data-selected="true"]):not([data-active="true"])::after {
+    &[data-strike]::after {
       content: "";
       animation: var(--animate-strike);
+    }
+  }
+}
+
+/* The strike on an amber bg-primary host: white-hot head and halo, because the amber head disappears on amber. --primary is the same in both themes, so this is too. */
+@utility strike-on-primary {
+  --brand-strike-head: #fffdf2;
+  --brand-strike-mid: color-mix(in oklch, #fff6d6 80%, transparent);
+  --brand-strike-tail: color-mix(in oklch, #ff6a0d 45%, transparent);
+  --brand-strike-halo: color-mix(in oklch, #ffffff 45%, transparent);
+}
+
+/*
+ * Running-segment lightning. A fine bolt channel (repeating 120 px tile drawn for 6–10 px bars) rests faintly inside the
+ * segment at all times: that is the colour-independent "in progress" texture, and it stays under reduced motion. With
+ * motion allowed, a white-gold head runs along the channel on a 1.8 s loop. ::before is the channel (lit layer over the
+ * rest layer, both masked by the tile); ::after is the halo at the head. Both paint above the host background; the host
+ * must not have children (the segment <span> has none).
+ */
+@utility strike-bar {
+  position: relative;
+  &::before,
+  &::after {
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+  }
+  &::before {
+    content: "";
+    --strike-x: -60%;
+    background-image:
+      linear-gradient(
+        90deg,
+        transparent calc(var(--strike-x) - 60%),
+        var(--brand-strike-bar-tail) calc(var(--strike-x) - 30%),
+        var(--brand-strike-bar-mid) calc(var(--strike-x) - 6%),
+        var(--brand-strike-bar-head) calc(var(--strike-x) - 1px),
+        transparent calc(var(--strike-x) + 2px)
+      ),
+      linear-gradient(var(--brand-strike-bar-rest), var(--brand-strike-bar-rest));
+    mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 8' preserveAspectRatio='none'%3E%3Cdefs%3E%3Cfilter id='a' filterUnits='userSpaceOnUse' x='-20' y='-8' width='160' height='24'%3E%3CfeGaussianBlur stdDeviation='.9'/%3E%3C/filter%3E%3C/defs%3E%3Cg fill='none' stroke='%23000' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M-16 2.1L-11 5.5L-6 2.9L0 4L6 2.4L11 5.4L17 3L21 4.6L27 1.9L33 5.8L37 4.4L41 6.2L47 2.2L51 5.3L56 3.4L61 4.4L66 1.8L71 5.9L76 2.4L80 5L85 2.8L90 6.2L95 3.6L98 4.6L104 2.1L109 5.5L114 2.9L120 4L126 2.4L131 5.4L137 3' stroke-width='2.6' opacity='.4' filter='url(%23a)'/%3E%3Cpath d='M-16 2.1L-11 5.5L-6 2.9L0 4L6 2.4L11 5.4L17 3L21 4.6L27 1.9L33 5.8L37 4.4L41 6.2L47 2.2L51 5.3L56 3.4L61 4.4L66 1.8L71 5.9L76 2.4L80 5L85 2.8L90 6.2L95 3.6L98 4.6L104 2.1L109 5.5L114 2.9L120 4L126 2.4L131 5.4L137 3' stroke-width='1.1'/%3E%3C/g%3E%3C/svg%3E") 0 50% / 120px 100% repeat-x;
+  }
+  &::after {
+    background-image: radial-gradient(10px 100% at var(--strike-x) 50%, var(--brand-strike-bar-halo), transparent);
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    &::before {
+      animation: var(--animate-strike-bar);
+    }
+    &::after {
+      content: "";
+      animation: var(--animate-strike-bar);
     }
   }
 }
@@ -268,6 +323,11 @@
   --brand-strike-mid: color-mix(in oklch, #ff8c14 80%, transparent);
   --brand-strike-tail: color-mix(in oklch, #ff6a0d 32%, transparent);
   --brand-strike-halo: color-mix(in oklch, #ffc21a 24%, transparent);
+  --brand-strike-bar-head: #fffbea;
+  --brand-strike-bar-mid: color-mix(in oklch, #ffe9a3 85%, transparent);
+  --brand-strike-bar-tail: color-mix(in oklch, #ffffff 30%, transparent);
+  --brand-strike-bar-halo: color-mix(in oklch, #fff3c4 55%, transparent);
+  --brand-strike-bar-rest: color-mix(in oklch, #ffffff 35%, transparent);
   --toast-warning-bg: oklch(0.98 0.016 73.684);
   --toast-warning-border: oklch(0.901 0.076 70.697);
   --toast-warning-text: oklch(0.47 0.157 37.304);

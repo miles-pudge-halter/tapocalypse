@@ -8,21 +8,10 @@ const SEGMENT_COLOR: Record<CheckStatus, string> = {
   blocked: "bg-rose-900 dark:bg-rose-700",
   skipped: "bg-stone-400 dark:bg-stone-600",
   pending: "bg-muted-foreground/25",
-  running: "bg-blue-500 motion-safe:animate-charge",
+  // A faint bolt channel inside the segment (the colour-independent "in progress" cue, also under reduced motion) with a
+  // white-gold head looping along it.
+  running: "bg-blue-500 strike-bar",
 };
-
-/** Diagonal stripes layered on the running segment so it reads as "in progress" even without colour. */
-const RUNNING_STRIPES =
-  "repeating-linear-gradient(135deg, rgba(255,255,255,0.35) 0 3px, transparent 3px 6px)";
-
-/** A highlight that slides across the running segment (animated by `animate-charge`), drawn above the stripes. */
-const RUNNING_STYLE = {
-  backgroundImage: `linear-gradient(90deg, transparent 0%, rgb(255 255 255 / .5) 50%, transparent 100%), ${RUNNING_STRIPES}`,
-  backgroundSize: "200% 100%, auto",
-  backgroundRepeat: "no-repeat, repeat",
-  // Parks the highlight off-screen when the animation does not run (reduced motion), so only the stripes show.
-  backgroundPosition: "150% 0, 0 0",
-} as const;
 
 function segmentLabel(check: Check): string {
   return `${check.id} · ${check.status} · ${check.title}`;
@@ -53,7 +42,6 @@ export function SegmentedProgress({
           <span
             key={check.id}
             className={cn("min-w-0.5 flex-1", SEGMENT_COLOR[check.status])}
-            style={check.status === "running" ? RUNNING_STYLE : undefined}
             title={size === "sm" ? segmentLabel(check) : undefined}
           />
         );
