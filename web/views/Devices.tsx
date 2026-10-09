@@ -92,7 +92,7 @@ function DeviceCard({
   } else chip = <StateChip tone="free">Free</StateChip>;
 
   return (
-    <Card className={cn("hover-strike py-4 [--strike-inset:1rem]", !qa && "opacity-75")}>
+    <Card className={cn("hover-strike py-4", !qa && "opacity-75")}>
       <CardContent className="flex gap-4 px-4">
         <DeviceFrame
           serial={placeholder || booting ? null : device.serial}

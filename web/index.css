@@ -4,6 +4,13 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/* head position of the hover-strike discharge, in % of the host width; registered so it interpolates */
+@property --strike-x {
+  syntax: "<percentage>";
+  inherits: false;
+  initial-value: 0%;
+}
+
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -103,72 +110,105 @@
     }
   }
 
-  --animate-strike: strike 520ms linear 1 both;
-  @keyframes strike {
-    0% {
-      clip-path: inset(0 0 100% 0);
-      opacity: 1;
-      animation-timing-function: cubic-bezier(0.1, 0.9, 0.2, 1);
+  --animate-strike: strike-travel 600ms cubic-bezier(0.5, 0.1, 0.4, 1) 1 both, strike-flicker 600ms linear 1 both;
+  --animate-strike-crackle: strike-crackle 600ms linear 1 both;
+  @keyframes strike-travel {
+    from {
+      --strike-x: 0%;
     }
-    22% {
-      clip-path: inset(0);
+    to {
+      --strike-x: 140%;
+    }
+  }
+  @keyframes strike-flicker {
+    0% {
+      opacity: 0;
+    }
+    4% {
       opacity: 1;
-      animation-timing-function: steps(1, end);
     }
     30% {
-      clip-path: inset(0);
-      opacity: 0.2;
-      animation-timing-function: steps(1, end);
-    }
-    38% {
-      clip-path: inset(0);
       opacity: 1;
       animation-timing-function: steps(1, end);
     }
-    46% {
-      clip-path: inset(0);
-      opacity: 0.5;
+    34% {
+      opacity: 0.45;
       animation-timing-function: steps(1, end);
     }
-    54% {
-      clip-path: inset(0);
+    40% {
       opacity: 1;
     }
-    70% {
-      clip-path: inset(0);
+    62% {
       opacity: 1;
-      animation-timing-function: ease-out;
+      animation-timing-function: steps(1, end);
+    }
+    65% {
+      opacity: 0.7;
+      animation-timing-function: steps(1, end);
+    }
+    70%,
+    78% {
+      opacity: 1;
     }
     100% {
-      clip-path: inset(0);
       opacity: 0;
+    }
+  }
+  @keyframes strike-crackle {
+    0% {
+      mask-position: 0 50%;
+      animation-timing-function: steps(1, end);
+    }
+    34% {
+      mask-position: -97px calc(50% + 1px);
+      animation-timing-function: steps(1, end);
+    }
+    65%,
+    100% {
+      mask-position: -173px calc(50% - 1px);
     }
   }
 }
 
 /*
- * A lightning bolt strikes down the left edge on hover / focus: a tapered zigzag (SVG mask over the brand gradient)
- * revealed top-to-bottom, two flickers, then it fades. Height follows the element; `--strike-inset` trims it.
+ * Hover / focus discharge: a jagged lightning channel arcs across the element left to right, once per entry.
+ * ::before is the channel: a fixed bolt path (repeating 240 px SVG tile, glow baked into the mask) lit by a gradient
+ * anchored at --strike-x, so a bright head leads and an orange tail fades behind it. ::after is the soft halo at the head.
+ * Both sit at z-index -1 inside the host's own stacking context (isolation), i.e. above the host background and below
+ * all content. The pseudo-elements only exist while the effect plays, so idle rows cost nothing.
  */
 @utility hover-strike {
   position: relative;
-  &::before {
-    content: "";
+  isolation: isolate;
+  &::before,
+  &::after {
     position: absolute;
-    inset-block: var(--strike-inset, 0.375rem);
-    left: 0;
-    width: 8px;
-    background-image: var(--brand-strike);
-    mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 100' preserveAspectRatio='none'%3E%3Cpolygon points='4,0 7.4,0 4.7,30 7,30 2.9,62 5.1,62 0.4,100 2.2,70 0.4,70 3.3,38 1.1,38'/%3E%3C/svg%3E");
-    mask-size: 100% 100%;
-    mask-repeat: no-repeat;
-    filter: var(--brand-strike-glow);
-    clip-path: inset(0 0 100% 0);
-    opacity: 0;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
     pointer-events: none;
+  }
+  &::before {
+    background-image: linear-gradient(
+      90deg,
+      transparent calc(var(--strike-x) - 40%),
+      var(--brand-strike-tail) calc(var(--strike-x) - 24%),
+      var(--brand-strike-mid) calc(var(--strike-x) - 6%),
+      var(--brand-strike-head) calc(var(--strike-x) - 3px),
+      transparent calc(var(--strike-x) + 3px)
+    );
+    mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 240 32' preserveAspectRatio='none'%3E%3Cdefs%3E%3Cfilter id='a' filterUnits='userSpaceOnUse' x='-40' y='-16' width='320' height='64'%3E%3CfeGaussianBlur stdDeviation='3'/%3E%3C/filter%3E%3Cfilter id='b' filterUnits='userSpaceOnUse' x='-40' y='-16' width='320' height='64'%3E%3CfeGaussianBlur stdDeviation='1.2'/%3E%3C/filter%3E%3C/defs%3E%3Cg fill='none' stroke='%23000' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M-14 13L-7 17L0 16L9 13L17 18L29 11L34 15L46 21L55 17L63 22L70 12L84 15L91 9L99 14L112 19L118 15L131 22L140 18L147 23L158 13L166 16L178 10L185 14L197 20L206 15L214 21L226 13L233 17L240 16L249 13L257 18' stroke-width='7' opacity='.22' filter='url(%23a)'/%3E%3Cpath d='M-14 13L-7 17L0 16L9 13L17 18L29 11L34 15L46 21L55 17L63 22L70 12L84 15L91 9L99 14L112 19L118 15L131 22L140 18L147 23L158 13L166 16L178 10L185 14L197 20L206 15L214 21L226 13L233 17L240 16L249 13L257 18' stroke-width='3' opacity='.5' filter='url(%23b)'/%3E%3Cpath d='M-14 13L-7 17L0 16L9 13L17 18L29 11L34 15L46 21L55 17L63 22L70 12L84 15L91 9L99 14L112 19L118 15L131 22L140 18L147 23L158 13L166 16L178 10L185 14L197 20L206 15L214 21L226 13L233 17L240 16L249 13L257 18' stroke-width='1.25'/%3E%3Cpath d='M46 21L51 25L55 24L58 27M91 9L97 6L101 7M147 23L152 26L157 25M178 10L183 7L189 8L192 5' stroke-width='.75' opacity='.65'/%3E%3C/g%3E%3C/svg%3E") 0 50% / 240px min(75%, 32px) repeat-x;
+  }
+  &::after {
+    background-image: radial-gradient(40px min(48%, 24px) at var(--strike-x) 50%, var(--brand-strike-halo), transparent);
   }
   @media (prefers-reduced-motion: no-preference) {
     &:is(:hover, :focus-visible, :has(:focus-visible), [data-selected="true"]):not([data-active="true"])::before {
+      content: "";
+      animation: var(--animate-strike), var(--animate-strike-crackle);
+    }
+    &:is(:hover, :focus-visible, :has(:focus-visible), [data-selected="true"]):not([data-active="true"])::after {
+      content: "";
       animation: var(--animate-strike);
     }
   }
@@ -224,8 +264,10 @@
   --brand-rim: transparent;
   --brand-tap: oklch(0.7253 0.1547 72.8);
   --brand-thunder: linear-gradient(90deg, #fff1b0 0%, #ffc21a 45%, #ff6a0d 100%);
-  --brand-strike: linear-gradient(180deg, #ffc21a 0%, #ff6a0d 100%);
-  --brand-strike-glow: drop-shadow(0 0 3px oklch(0.8464 0.1693 84.902 / 45%));
+  --brand-strike-head: #ffb81f;
+  --brand-strike-mid: color-mix(in oklch, #ff8c14 80%, transparent);
+  --brand-strike-tail: color-mix(in oklch, #ff6a0d 32%, transparent);
+  --brand-strike-halo: color-mix(in oklch, #ffc21a 24%, transparent);
   --toast-warning-bg: oklch(0.98 0.016 73.684);
   --toast-warning-border: oklch(0.901 0.076 70.697);
   --toast-warning-text: oklch(0.47 0.157 37.304);
@@ -268,8 +310,10 @@
   --brand-tile: oklch(0.1899 0.0201 66.111);
   --brand-rim: oklch(0.8464 0.1693 84.902 / 45%);
   --brand-tap: oklch(0.8464 0.1693 84.902);
-  --brand-strike: linear-gradient(180deg, #fff1b0 0%, #ffc21a 45%, #ff6a0d 100%);
-  --brand-strike-glow: drop-shadow(0 0 4px oklch(0.8464 0.1693 84.902 / 70%));
+  --brand-strike-head: #fff1b0;
+  --brand-strike-mid: color-mix(in oklch, #ffc21a 75%, transparent);
+  --brand-strike-tail: color-mix(in oklch, #ff6a0d 40%, transparent);
+  --brand-strike-halo: color-mix(in oklch, #ffc21a 34%, transparent);
   --toast-warning-bg: oklch(0.2396 0.0567 38.809);
   --toast-warning-border: oklch(0.408 0.123 38.172);
   --toast-warning-text: oklch(0.837 0.128 66.29);
