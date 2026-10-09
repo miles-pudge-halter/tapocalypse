@@ -1,4 +1,4 @@
-import { config, EMULATOR_BIN, HttpError } from "../config";
+import { config, EMULATOR_BIN, HttpError, XCRUN_BIN } from "../config";
 import type { Platform } from "../runs/types";
 import {
   adb,
@@ -146,10 +146,10 @@ async function launchIos(udid: string, opts: BootOptions): Promise<string> {
   if (!opts.allowNonQaDevice && type && QA_INCAPABLE.includes(type)) {
     throw new Error(`simulator ${udid} is a ${type}; only phones and tablets can run QA`);
   }
-  const r = await exec(["xcrun", "simctl", "boot", udid], { timeoutMs: 60_000 });
+  const r = await exec([XCRUN_BIN, "simctl", "boot", udid], { timeoutMs: 60_000 });
   const alreadyBooted = r.code !== 0 && /current state: Booted|already booted/i.test(r.stderr);
   if (r.code !== 0 && !alreadyBooted) throw new Error(`simctl boot ${udid} failed: ${r.stderr.trim()}`);
-  const s = await exec(["xcrun", "simctl", "bootstatus", udid], { timeoutMs: 180_000 });
+  const s = await exec([XCRUN_BIN, "simctl", "bootstatus", udid], { timeoutMs: 180_000 });
   if (s.code !== 0) throw new Error(`simulator ${udid} did not boot in 180s`);
   // A simulator that was already running is the user's: never claim it, or the idle reaper would shut it down.
   if (!alreadyBooted) booted.set(udid, { platform: "ios", target: udid, lastReleasedAt: null });
@@ -170,7 +170,7 @@ setIdleShutdownLookup(idleShutdownAt);
 async function shutdownEntry(serial: string, b: BootedEntry): Promise<void> {
   booted.delete(serial);
   if (b.platform === "android") await adb(serial, ["emu", "kill"], 10_000);
-  else await exec(["xcrun", "simctl", "shutdown", serial], { timeoutMs: 60_000 });
+  else await exec([XCRUN_BIN, "simctl", "shutdown", serial], { timeoutMs: 60_000 });
   invalidateDeviceProbes(serial);
 }
 

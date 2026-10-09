@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ADB_BIN, ARTEMIS_LOCK_DIR, config } from "../config";
+import { ADB_BIN, ARTEMIS_LOCK_DIR, config, XCRUN_BIN } from "../config";
 import type { Platform } from "../runs/types";
 
 export interface ArtemisOwner {
@@ -278,7 +278,7 @@ export function lastDeviceSnapshot(): { devices: readonly Device[]; simulators: 
 }
 
 async function listIos(): Promise<Device[]> {
-  const r = await exec(["xcrun", "simctl", "list", "devices", "-j"], { timeoutMs: 10_000 });
+  const r = await exec([XCRUN_BIN, "simctl", "list", "devices", "-j"], { timeoutMs: 10_000 });
   simulators = r.code === 0 ? parseSimctlDevices(r.text) : [];
   return simulators
     .filter((s) => s.booted)
@@ -318,7 +318,7 @@ export async function screencap(device: Pick<Device, "serial" | "platform">): Pr
   }
   const tmp = path.join(os.tmpdir(), `tapocalypse-${device.serial}-${Date.now()}.png`);
   try {
-    const r = await exec(["xcrun", "simctl", "io", device.serial, "screenshot", "--type=png", tmp], { timeoutMs: 15_000 });
+    const r = await exec([XCRUN_BIN, "simctl", "io", device.serial, "screenshot", "--type=png", tmp], { timeoutMs: 15_000 });
     if (r.code !== 0) throw new Error(`screenshot failed: ${r.stderr.trim()}`);
     return new Uint8Array(await Bun.file(tmp).arrayBuffer());
   } finally {
@@ -342,7 +342,7 @@ export async function appVersion(
     const versionCode = /^\s*versionCode=(\d+)/m.exec(r.text)?.[1] ?? null;
     return versionName === null && versionCode === null ? null : { versionName, versionCode };
   }
-  const r = await exec(["xcrun", "simctl", "appinfo", device.serial, packageId], { timeoutMs: 15_000 });
+  const r = await exec([XCRUN_BIN, "simctl", "appinfo", device.serial, packageId], { timeoutMs: 15_000 });
   if (r.code !== 0) return null;
   const field = (key: string) => new RegExp(`${key}"?\\s*=\\s*"?([^";\\n]+)`).exec(r.text)?.[1].trim() ?? null;
   let versionName = field("CFBundleShortVersionString");

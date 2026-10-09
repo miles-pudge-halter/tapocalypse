@@ -50,6 +50,7 @@ fs.writeFileSync(
 // Tests must never reach a real emulator or adb server: an unrunnable binary fails fast (ENOENT) instead.
 process.env.EMULATOR_BIN = path.join(root, "no-emulator");
 process.env.ADB_BIN = path.join(root, "no-adb");
+process.env.XCRUN_BIN = path.join(root, "no-xcrun");
 // Likewise for agent harnesses: `/api/harnesses` and doctor probes must never launch a real omp/claude/codex.
 process.env.OMP_BIN = path.join(root, "no-omp");
 process.env.CLAUDE_BIN = path.join(root, "no-claude");

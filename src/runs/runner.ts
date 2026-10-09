@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { config, HttpError, MAX_STEER_CHARS } from "../config";
+import { config, HttpError, MAX_STEER_CHARS, XCRUN_BIN } from "../config";
 import { adb, appVersion, artemisLockOwner, type Device, ensureArtemisHelper, exec, listDevices, mobileMcpDeviceId, stopMobileMcpDeviceServer } from "../devices/devices";
 import { bootAndroid, bootIos } from "../devices/pool";
 import { getHarness as registryHarness, harnessBin } from "../harness";
@@ -310,7 +310,7 @@ export function createRunner(scheduler: RunnerScheduler, deps: RunnerDeps = {}):
     const r =
       run.deviceRequest.platform === "android"
         ? await adb(serial, ["install", "-r", "-d", file], INSTALL_TIMEOUT_MS)
-        : await exec(["xcrun", "simctl", "install", serial, file], { timeoutMs: INSTALL_TIMEOUT_MS });
+        : await exec([XCRUN_BIN, "simctl", "install", serial, file], { timeoutMs: INSTALL_TIMEOUT_MS });
     const output = `${r.text}\n${r.stderr}`.trim();
     if (r.code !== 0 || /\bFailure\b/.test(output)) {
       const last = output.split("\n").map((l) => l.trim()).filter(Boolean).at(-1) ?? `exit code ${r.code}`;

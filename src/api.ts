@@ -11,7 +11,7 @@ import {
   runView,
   scheduler,
 } from "./app";
-import { config, HttpError, MAX_STEER_CHARS } from "./config";
+import { config, HttpError, MAX_STEER_CHARS, XCRUN_BIN } from "./config";
 import { runDoctor } from "./doctor";
 import { connectedAndroidSerials, exec, listDevices, screencap } from "./devices/devices";
 import { bootTarget, isBootedByTapocalypse, poolView, shutdownDevice } from "./devices/pool";
@@ -62,7 +62,7 @@ let screenLookup: { at: number; serials: Promise<ConnectedSerials> } | null = nu
 async function probeSerials(): Promise<ConnectedSerials> {
   const [android, simctl] = await Promise.all([
     connectedAndroidSerials(),
-    exec(["xcrun", "simctl", "list", "devices", "booted", "-j"], { timeoutMs: 10_000 }),
+    exec([XCRUN_BIN, "simctl", "list", "devices", "booted", "-j"], { timeoutMs: 10_000 }),
   ]);
   const ios = new Set<string>();
   if (simctl.code === 0) {

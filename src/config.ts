@@ -144,6 +144,8 @@ export const config: Config = loadConfig();
 export const DATA_DIR = resolveDataDir();
 export const OMP_BIN = process.env.OMP_BIN ?? "omp";
 export const ADB_BIN = process.env.ADB_BIN ?? "adb";
+/** `xcrun` for simctl; overridable so tests and non-Xcode machines never start CoreSimulator. */
+export const XCRUN_BIN = process.env.XCRUN_BIN ?? "xcrun";
 export const GIT_BIN = process.env.GIT_BIN ?? "git";
 export const GH_BIN = process.env.GH_BIN ?? "gh";
 export const ARTEMIS_LOCK_DIR = path.join(os.tmpdir(), "artemis", "device-locks");
