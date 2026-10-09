@@ -24,13 +24,7 @@ function Tile({ item, onOpen }: { item: GalleryItem; onOpen: () => void }) {
           <span className="text-xs">missing</span>
         </div>
       ) : (
-        <img
-          src={item.url}
-          alt={item.name}
-          loading="lazy"
-          onError={() => setFailed(true)}
-          className="aspect-[9/16] w-full object-cover object-top"
-        />
+        <img src={item.url} alt={item.name} loading="lazy" onError={() => setFailed(true)} className="h-auto w-full" />
       )}
       <div className="truncate border-t px-2 py-1 text-xs text-muted-foreground group-hover:text-foreground">{item.name}</div>
     </button>
@@ -95,7 +89,7 @@ export function ScreenshotsGallery({
             )}
             <span className="ml-auto text-xs font-normal text-muted-foreground">{g.items.length}</span>
           </h3>
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5 xl:grid-cols-6">
+          <div className="grid grid-cols-2 items-start gap-3 sm:grid-cols-3 lg:grid-cols-5 xl:grid-cols-6">
             {g.items.map((item) => (
               <Tile key={item.key} item={item} onOpen={() => onOpenImage(item)} />
             ))}

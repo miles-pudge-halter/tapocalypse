@@ -230,7 +230,7 @@ export function DevicePane({
                     still?.key === item.key && "ring-2 ring-ring",
                   )}
                 >
-                  <img src={item.url} alt="" loading="lazy" className="h-full w-auto object-cover" />
+                  <img src={item.url} alt="" loading="lazy" className="h-full w-auto" />
                   {item.checkId ? (
                     <span className="absolute bottom-0 left-0 rounded-tr bg-background/80 px-1 font-mono text-[9px]">{item.checkId}</span>
                   ) : null}

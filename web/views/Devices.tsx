@@ -155,7 +155,7 @@ function GhostCard({ target, booting, capped, onBoot }: { target: BootableDevice
   return (
     <Card className="border-dashed bg-transparent py-4 shadow-none">
       <CardContent className="flex gap-4 px-4">
-        <div className="flex aspect-[9/19] w-24 shrink-0 items-center justify-center rounded-[1.5rem] border-2 border-dashed text-muted-foreground/60">
+        <div className="flex aspect-[9/19.5] w-24 shrink-0 items-center justify-center rounded-[1.5rem] border-2 border-dashed text-muted-foreground/60">
           {booting ? <Loader2 className="size-5 animate-spin" /> : <Power className="size-5" />}
         </div>
         <div className="flex min-w-0 flex-1 flex-col gap-2">

@@ -50,7 +50,7 @@ function Thumb({ item, label, onOpen }: { item: GalleryItem; label: string; onOp
       aria-label={`Open screenshot: ${label}`}
       className="block overflow-hidden rounded-md border transition-opacity hover:opacity-80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
     >
-      <img src={item.url} alt={label} loading="lazy" onError={() => setFailed(true)} className="max-h-40 w-24 object-cover object-top" />
+      <img src={item.url} alt={label} loading="lazy" onError={() => setFailed(true)} className="h-auto max-h-40 w-24 object-contain object-top" />
     </button>
   );
 }

@@ -90,7 +90,8 @@ export function DeviceChrome({
   const C = CHROME[deviceType];
   const watch = deviceType === "watch";
   const round = watch && Math.abs(aspect - 1) < 0.03;
-  const portraitPhone = deviceType === "phone" && aspect <= 1;
+  // Only tall, edge-to-edge phones (≤ 1:2) have a notch or punch-hole; 16:9 phones with a forehead/home button do not.
+  const portraitPhone = deviceType === "phone" && aspect <= 0.5;
   const vars: CSSProperties & Record<"--u", string> = { ...style, "--u": aspect > 1 ? `calc(1cqw / ${aspect})` : "1cqw" };
   return (
     <div className={cn("@container shrink-0", className)} style={vars}>

@@ -117,11 +117,11 @@ export function Lightbox({
                   aria-label={img.caption ?? `Image ${i + 1}`}
                   onClick={() => onIndexChange(i)}
                   className={cn(
-                    "h-16 w-10 shrink-0 overflow-hidden rounded border-2 opacity-60 transition hover:opacity-100",
+                    "h-16 w-10 shrink-0 overflow-hidden rounded border-2 bg-black opacity-60 transition hover:opacity-100",
                     i === index ? "border-white opacity-100" : "border-transparent",
                   )}
                 >
-                  <img src={img.src} alt="" loading="lazy" className="size-full object-cover object-top" />
+                  <img src={img.src} alt="" loading="lazy" className="size-full object-contain" />
                 </button>
               ))}
             </div>

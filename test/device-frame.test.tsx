@@ -65,6 +65,14 @@ describe("DeviceChrome", () => {
     expect(has(android, "notch")).toBe(false);
   });
 
+  test("a 16:9 phone (forehead and home button) gets no notch or punch-hole", () => {
+    for (const platform of ["ios", "android"] as const) {
+      const html = chrome("phone", platform, 9 / 16);
+      expect(has(html, "notch")).toBe(false);
+      expect(has(html, "punch")).toBe(false);
+    }
+  });
+
   test("a phone in landscape has neither", () => {
     for (const platform of ["ios", "android"] as const) {
       const html = chrome("phone", platform, 19.5 / 9);
