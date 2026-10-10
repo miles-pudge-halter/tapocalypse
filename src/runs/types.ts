@@ -24,7 +24,7 @@ export interface Check {
   title: string;
   status: CheckStatus;
   note?: string;
-  /** Relative to the project repoPath. */
+  /** `storage: "data"`: relative to the run's artefact dir (`screenshots/<name>`). Legacy: relative to the project repoPath. */
   screenshot?: string;
   updatedAt: string;
   /** First time the check reported "running". */
@@ -111,7 +111,7 @@ export interface Run {
   status: RunStatus;
   verdict: Verdict | null;
   summary: string | null;
-  /** Relative to the project repoPath. */
+  /** `storage: "data"`: `"report.md"` relative to the run's artefact dir. Legacy: relative to the project repoPath. */
   reportPath: string | null;
   checks: Check[];
   error: string | null;
@@ -145,6 +145,8 @@ export interface Run {
   /** Run this one was re-run from. */
   rerunOf: string | null;
   install: InstallRequest | null;
+  /** Where this run's report and screenshots live: Tapocalypse's data dir (`runs/<id>/`) or, for runs from before that, the project repo. */
+  storage: "data" | "repo";
 }
 
 export interface Activity {

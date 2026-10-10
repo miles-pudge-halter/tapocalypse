@@ -16,7 +16,7 @@
 {"type":"item.started","item":{"id":"item_8","type":"web_search","query":"flutter semantics label"}}
 {"type":"item.completed","item":{"id":"item_8","type":"web_search","query":"flutter semantics label"}}
 {"type":"item.updated","item":{"id":"item_9","type":"todo_list","items":[{"text":"Check C1","completed":true},{"text":"Check C2","completed":false}]}}
-{"type":"item.started","item":{"id":"item_10","type":"mcp_tool_call","server":"tpc","tool":"qa_finish","arguments":{"verdict":"PASS","summary":"All good","reportPath":"reports/QA-REPORT-demo.md"},"result":null,"error":null,"status":"in_progress"}}
-{"type":"item.completed","item":{"id":"item_10","type":"mcp_tool_call","server":"tpc","tool":"qa_finish","arguments":{"verdict":"PASS","summary":"All good","reportPath":"reports/QA-REPORT-demo.md"},"result":{"content":[{"type":"text","text":"recorded"}],"structured_content":null},"error":null,"status":"completed"}}
+{"type":"item.started","item":{"id":"item_10","type":"mcp_tool_call","server":"tpc","tool":"qa_finish","arguments":{"verdict":"PASS","summary":"All good","reportMarkdown":"# Report"},"result":null,"error":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_10","type":"mcp_tool_call","server":"tpc","tool":"qa_finish","arguments":{"verdict":"PASS","summary":"All good","reportMarkdown":"# Report"},"result":{"content":[{"type":"text","text":"recorded"}],"structured_content":null},"error":null,"status":"completed"}}
 {"type":"item.completed","item":{"id":"item_11","type":"agent_message","text":"All checks passed. Report written."}}
 {"type":"turn.completed","usage":{"input_tokens":12000,"cached_input_tokens":8000,"cache_write_input_tokens":300,"output_tokens":540,"reasoning_output_tokens":120}}

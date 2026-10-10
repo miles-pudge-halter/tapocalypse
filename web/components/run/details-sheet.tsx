@@ -57,6 +57,22 @@ export function DetailsSheet({
                 <CopyButton value={run.id} label="Copy run id" />
               </span>
             </Field>
+            {run.storage === "data" ? (
+              <Field label="Artefacts">
+                <span className="flex items-center gap-1">
+                  <span className="min-w-0 break-all font-mono text-xs">{run.runDir}</span>
+                  <CopyButton value={run.runDir} label="Copy artefact folder" />
+                </span>
+              </Field>
+            ) : null}
+            {run.reportFile ? (
+              <Field label="Report file">
+                <span className="flex items-center gap-1">
+                  <span className="min-w-0 break-all font-mono text-xs">{run.reportFile}</span>
+                  <CopyButton value={run.reportFile} label="Copy report path" />
+                </span>
+              </Field>
+            ) : null}
             <Field label="Project">{projectName}</Field>
             <Field label="Package">
               <span className="font-mono text-xs">{run.packageId}</span>

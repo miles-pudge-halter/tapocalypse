@@ -18,6 +18,8 @@ Back to the [README](../README.md). This is the long-form reference: every page 
 - [Run metadata](#run-metadata)
 - [Batches](#batches)
 - [CLI and CI](#cli-and-ci)
+- [Reading reports and screenshots](#reading-reports-and-screenshots)
+- [Running as a service](#running-as-a-service)
 - [Brief templates and suites](#brief-templates-and-suites)
 - [Configuration](#configuration)
 - [Data and retention](#data-and-retention)
@@ -32,9 +34,9 @@ Back to the [README](../README.md). This is the long-form reference: every page 
 
 - You give Tapocalypse a **project** (your app's repo), a free-text **brief** ("open Settings, toggle dark mode, verify it survives a restart") and a platform or a specific device.
 - A device is assigned: a free emulator or simulator, or one booted for you from your configured AVDs/simulators. If everything is busy the run waits in a queue and the UI says why.
-- A headless QA agent starts inside your repo and drives the app through [mobile-mcp](https://github.com/mobile-next/mobile-mcp) (tapping, typing, screenshots, `adb`/`simctl`). Several runs execute side by side on different devices.
+- A headless QA agent starts inside your repo (to read the code; it is told never to write there) and drives the app through [mobile-mcp](https://github.com/mobile-next/mobile-mcp) (tapping, typing, screenshots, `adb`/`simctl`). Several runs execute side by side on different devices.
 - The agent declares its checks up front and reports each as it goes; the UI shows every check turn pending → running → pass/fail, a live device screen and the agent's activity feed. You can cancel mid-run, and steer it on harnesses that support steering.
-- The agent writes `QA-REPORT-<run-id>.md` with embedded screenshots into your repo (`qa/` by default). Reports are browsable in the UI.
+- The agent hands in a markdown report with embedded screenshots, and Tapocalypse stores both in its own data folder (`<data dir>/runs/<run-id>/report.md` and `screenshots/`), not in your repo. Reports are browsable in the UI and readable from your coding agent ([Reading reports and screenshots](#reading-reports-and-screenshots)).
 - The run ends with a verdict (`PASS`, `PASS WITH ISSUES`, `FAIL`, `BLOCKED` or `PARTIAL`), a summary, what it cost and, on harnesses that export one, a full transcript. See [Run outcomes](#run-outcomes).
 
 ## Prerequisites
@@ -95,6 +97,8 @@ bun run doctor     # fix anything marked ✗
 bun start          # → tapocalypse listening on http://127.0.0.1:4310
 ```
 
+To keep Tapocalypse running in the background and start it at login (macOS and Linux), run `bun src/cli.ts service install` instead of `bun start`; see [Running as a service](#running-as-a-service).
+
 1. Open <http://127.0.0.1:4310>. The first start creates a config file (`~/.config/tapocalypse/config.json`, or next to the code if you already had a `tapocalypse.config.json` there; see [Data and retention](#data-and-retention)). The **Setup** page walks you through the rest.
 2. Make sure an emulator or simulator with your app installed is running, or list an AVD in `devicePool.android.avds` ([Devices](#devices)) and let Tapocalypse boot it.
 3. **Projects → Add project**: pick a suggested folder or paste the absolute path of your app's repository. Detection fills in the name, package/bundle id, platform and persona; check them and save.
@@ -142,12 +146,12 @@ A project tells Tapocalypse where your app's repository is and how to test it. A
 | `name` | Display name, 1-60 chars |
 | `repoPath` | Absolute path of the repo (`~` is expanded). The agent runs with this as its working directory |
 | `personaFile` | QA persona markdown, relative to the repo. `null`/omitted = the built-in persona |
-| `reportsDir` | Where reports and screenshots are written, relative to the repo. Default `qa` (created on first run) |
+| `reportsDir` | Legacy and optional; not offered when you create or edit a project. Only read to show reports that earlier runs wrote into that folder of your repo (default `qa`). New runs never use it: their reports live in Tapocalypse's data folder |
 | `defaultPackage` | Android `applicationId` or iOS bundle id of the app under test, e.g. `com.example.app.dev` |
 | `defaultPlatform` | `android` or `ios`, used when a run names no platform or device |
 | `agent` | Optional per-project override `{ harness?, model?, effort? }` of the [harness](#agent-runtimes), model and effort for this project's runs |
 
-**Detection.** The UI wizard and `qa_detect_project` inspect the repo without running anything and suggest every field. They read: `pubspec.yaml` (Flutter), `package.json` dependencies (Expo, React Native), `app.json`/`app.config.json` (Expo ids), Gradle files and `AndroidManifest.xml` (`applicationId`, flavors and suffixes in `android/app`, `app`, `androidApp`, `composeApp`), Xcode `project.pbxproj` (`PRODUCT_BUNDLE_IDENTIFIER`), `shared`/`composeApp` modules (Kotlin Multiplatform), `.omp/agents/`, `.claude/agents/` and `.codex/agents/` for QA-looking persona files, existing report folders (`qa`, `docs/qa`, `test/qa`, `reports/qa`) and whether the folder is a git repo. When several package ids exist it prefers one ending in `.dev` or `.debug`. The wizard also suggests app folders it finds under common code directories (`~/Projects`, `~/code`, `~/src`, `~/Developer`, …).
+**Detection.** The UI wizard and `qa_detect_project` inspect the repo without running anything and suggest every field. They read: `pubspec.yaml` (Flutter), `package.json` dependencies (Expo, React Native), `app.json`/`app.config.json` (Expo ids), Gradle files and `AndroidManifest.xml` (`applicationId`, flavors and suffixes in `android/app`, `app`, `androidApp`, `composeApp`), Xcode `project.pbxproj` (`PRODUCT_BUNDLE_IDENTIFIER`), `shared`/`composeApp` modules (Kotlin Multiplatform), `.omp/agents/`, `.claude/agents/` and `.codex/agents/` for QA-looking persona files and whether the folder is a git repo. When several package ids exist it prefers one ending in `.dev` or `.debug`. The wizard also suggests app folders it finds under common code directories (`~/Projects`, `~/code`, `~/src`, `~/Developer`, …).
 
 **From your agent.** `qa_detect_project { repoPath }` then `qa_create_project { repoPath }`; omitted fields are filled from detection, and you are told which ones to supply if something cannot be inferred. See [MCP](#dispatching-runs-from-your-coding-agent-mcp).
 
@@ -165,7 +169,7 @@ You are the QA agent for our app. Known quirks: ...
 
 `model` is a harness-native string: for omp `<provider>/<model>[:thinking]` (the suffix after the last `:` is the thinking level when it is one of `off minimal low medium high xhigh max`, otherwise it stays part of the model name), for Claude Code an alias or full id, for Codex CLI a `gpt-…` id. A persona's `model:` applies only when its `harness:` equals the harness the run uses; a persona without `harness:` counts as an omp persona, so existing personas keep working and are simply ignored on other harnesses (their `harness:` can also pick the harness, see [Agent runtimes](#agent-runtimes)).
 
-The model for a run is, in order: the run's own `model`, the suite's, the project's `agent.model`, the persona's (when its harness matches), `agent.harnesses.<harness>.model` from the config, for omp the legacy `agent.model`, and finally the harness's own default. Effort (thinking level) resolves the same way, with `agent.thinking` as the legacy omp key. Whatever the persona says, every run's prompt adds the device, package, run id, time budget, report/screenshot paths and the progress-reporting protocol, and the built-in persona defers to them.
+The model for a run is, in order: the run's own `model`, the suite's, the project's `agent.model`, the persona's (when its harness matches), `agent.harnesses.<harness>.model` from the config, for omp the legacy `agent.model`, and finally the harness's own default. Effort (thinking level) resolves the same way, with `agent.thinking` as the legacy omp key. Whatever the persona says, every run's prompt adds the device, package, run id, time budget, screenshot folder and the progress-reporting protocol, and the built-in persona defers to them.
 
 ## Devices
 
@@ -245,11 +249,13 @@ tool_timeout_sec = 120
 | `qa_rerun` | New run from a finished one, re-testing only the failed checks or everything; optional `harness` to repeat it on another runtime (default: the original's) |
 | `qa_steer_run` | Send an instruction to a running agent |
 | `qa_cancel_run` | Cancel a queued or active run |
-| `qa_get_run` | Status, checks, verdict (and whether derived), summary, error and `errorKind`, usage, absolute `reportPath` and `screenshotsDir`, source, build |
+| `qa_get_run` | Status, checks, verdict (and whether derived), summary, error and `errorKind`, usage, absolute `reportPath` and `screenshotsDir` (in Tapocalypse's data folder), source, build |
 | `qa_wait_run` | Block until a run finishes or `timeoutSec` (default 90, clamped to 5-110) passes; check `timedOut` and call again |
 | `qa_wait_runs` | The same for several runs or a whole batch (`mode` `all` or `any`) |
 | `qa_list_runs` | Recent runs, newest first, filtered by project, branch, PR, ticket, commit or status; see [Run metadata](#run-metadata) |
-| `qa_get_report` | The markdown report of a finished run |
+| `qa_get_report` | The markdown report of a finished run, read from Tapocalypse's data folder |
+| `qa_get_screenshots` | The run's screenshots: `[{ checkId, name, path, url }]`, `path` absolute so you can open the image |
+| `qa_export` | Copy the report and screenshots of a run into a folder you name (`{ runId, dir }`, `dir` absolute), for example inside your repo |
 
 Parameters for every tool are in [docs/api.md](api.md#mcp-tools). `source` is `{ path?, branch?, commit?, prNumber?, prTitle?, prUrl?, tickets?, labels? }`.
 
@@ -262,7 +268,7 @@ The agent typically does this:
 1. `qa_list_projects` to find the project id (or `qa_detect_project` + `qa_create_project` the first time).
 2. `qa_start_run { projectId, title: "Dark mode toggle", brief: "...", requester: "my-agent", source: { path: "<its cwd>" } }`. `source.path` must be the project's repo root or one of its git worktrees; it makes the run record the agent's branch, commit and PR rather than the main checkout's.
 3. `qa_wait_run { runId }` in a loop until `timedOut` is `false`, optionally narrating the `checks` it sees.
-4. Reads the verdict and summary, and opens the markdown file at `reportPath` (or calls `qa_get_report`) to fix what failed, then `qa_rerun { runId, only: "failed" }` to confirm.
+4. Reads the verdict and summary, then the report with `qa_get_report` (and the evidence with `qa_get_screenshots`) to fix what failed, then `qa_rerun { runId, only: "failed" }` to confirm.
 
 Starting several runs back to back is fine: they are scheduled in parallel across devices. QA agents launched by Tapocalypse are told never to call `tapocalypse` tools, so registering the server at user level cannot cause recursion.
 
@@ -299,9 +305,11 @@ A batch is one brief fanned out to several devices at once, for example the same
 
 ```sh
 bun src/cli.ts serve [--port 4311] [--dev]   # same as `bun start`; --dev = Bun's dev server (hot reload)
+bun src/cli.ts service install|uninstall|start|stop|restart|status|logs   # run it in the background, start at login
 bun src/cli.ts doctor                        # same as `bun run doctor`
 bun src/cli.ts run --project my-app --brief "Launch the app and verify the home screen loads." --wait
 bun src/cli.ts status <runId|batchId> [--json]
+bun src/cli.ts report <runId> [--export <dir>] [--json]   # print a run's report, or copy it and its screenshots to <dir>
 ```
 
 `run` options:
@@ -321,6 +329,8 @@ bun src/cli.ts status <runId|batchId> [--json]
 | `--junit <file>` | Write a JUnit XML report (implies `--wait`): one `<testsuite>` per run, one `<testcase>` per check; failed checks are failures, skipped, blocked and unfinished checks are skipped, and an errored run adds an `<error>` case |
 | `--fail-on <list>` | Verdicts that make the exit code 1 (default `FAIL,BLOCKED,PARTIAL`; e.g. `FAIL` to tolerate the rest) |
 | `--url <url>` | Server to use (default `$TAPOCALYPSE_URL`, else `http://127.0.0.1:4310`) |
+
+`run --wait` and `status` print the absolute path of the report (inside Tapocalypse's data folder). `report <runId>` prints the markdown (`--json`: `{ runId, reportPath, markdown }`); with `--export <dir>` it copies the report as `QA-REPORT-<runId>.md` and the screenshots as `screenshots/<name>` into `<dir>` instead.
 
 Without `--wait` the command prints the run id and URL and exits 0 right away. When `--serial` is used without `--platform`, the platform is looked up from the connected device; otherwise the project's `defaultPlatform` applies. An infrastructure failure that Tapocalypse retries automatically is followed to the retry, so the exit code reflects the final attempt.
 
@@ -348,7 +358,39 @@ With several runs the worst code wins (2 over 1 over 0).
     path: qa-junit.xml
 ```
 
-Reports and screenshots are written into the repository checkout (`qa/` by default), so upload that directory too if you want them.
+Reports and screenshots live in Tapocalypse's data folder, not in the checkout, so nothing is written into the workspace. To attach them to the build, export them after the run with `tapocalypse report <run-id> --export qa-report` (or `qa_export`, or `POST /api/runs/:id/export`) and upload that folder, or read a report through the API (`GET /api/runs/:id/report`). On a machine that is not the one running the server, call these against `--url` / `$TAPOCALYPSE_URL`.
+
+## Reading reports and screenshots
+
+A run's report and screenshots live in Tapocalypse's data folder, `<data dir>/runs/<run-id>/report.md` and `screenshots/`. The agent never writes into your repository, so a QA run leaves your working tree clean. You read them with:
+
+| From | How |
+| --- | --- |
+| The UI | **Open report** on the run page, the **Reports** page, and the Screenshots tab |
+| Your coding agent (MCP) | `qa_get_report { runId }`, `qa_get_screenshots { runId }` (absolute `path` per image) and `qa_get_run` (absolute `reportPath`, `screenshotsDir`) |
+| The CLI | `tapocalypse report <runId>`; `run --wait` and `status` print the report path |
+| HTTP | `GET /api/runs/:id/report`, `GET /api/runs/:id/screenshots`, `GET /api/runs/:id/files/screenshots/<name>` |
+
+To keep a copy outside Tapocalypse, for example in the repo or as a CI artefact, **export** it: `qa_export { runId, dir }`, `tapocalypse report <runId> --export <dir>` or `POST /api/runs/:id/export { dir }`. Nothing is exported automatically, and retention deletes a run's report and screenshots with the run.
+
+**Older runs.** Runs from before this change wrote `QA-REPORT-<run-id>.md` and `screenshots/<run-id>/` into `<repo>/<reportsDir>` (default `qa/`). They keep rendering from there, and a project's legacy `reportsDir` is still read so those reports stay in the Reports list, but nothing new is written to it. Delete those files from your repo whenever you like.
+
+## Running as a service
+
+`tapocalypse service install` keeps Tapocalypse running in the background and starts it at login, so your coding agent's MCP calls always find it. On macOS it installs a launchd agent (`~/Library/LaunchAgents/dev.tapocalypse.server.plist`); on Linux a systemd user unit (`~/.config/systemd/user/tapocalypse.service`). Both run `<bun> <checkout>/src/cli.ts serve`, restart it if it exits with an error (a clean exit stays stopped), and write its output to `<data dir>/logs/service.log` (Linux: `journalctl --user -u tapocalypse`). The unit records your `PATH`, `HOME`, `NODE_ENV=production` and any `TAPOCALYPSE_*`, `ANDROID_HOME` / `ANDROID_SDK_ROOT` and harness binary variables (`OMP_BIN`, `CLAUDE_BIN`, `CODEX_BIN`, `ADB_BIN`, `XCRUN_BIN`, `EMULATOR_BIN`) set when you install, so run it from the shell that works with `bun start`; run `install` again after you change them.
+
+```sh
+bun src/cli.ts service install     # write the unit and start it
+bun src/cli.ts service status      # installed? running? does /api/mcp/status answer?
+bun src/cli.ts service logs        # the last lines of the log
+bun src/cli.ts service stop        # stop it (it starts again at next login)
+bun src/cli.ts service restart     # after pulling a new version
+bun src/cli.ts service uninstall   # stop it and remove the unit
+```
+
+**Install and restart interrupt active runs.** `service install` (when a server is already running) and `service restart` restart the server, and the agents of runs in progress end as `interrupted` (queued runs are queued again afterwards). Both commands print this warning; run them when nothing important is running. If the log directory cannot be created, `install` stops with that error before loading the service.
+
+`service` only ever addresses its own unit (`dev.tapocalypse.server` / `tapocalypse.service`); it never kills processes by name or port, so a server you started yourself with `bun start` is left alone. Windows is not supported: there `service` says so, and you keep using `bun start`.
 
 ## Brief templates and suites
 
@@ -392,7 +434,7 @@ The full key list (`agent` and its per-harness settings, `artemisPath`, ports, s
 
 ## Data and retention
 
-Tapocalypse keeps two things outside your repositories: its config and its run history.
+Tapocalypse keeps three things outside your repositories: its config, its run history and every run's report and screenshots.
 
 | What | Default location |
 | --- | --- |
@@ -402,9 +444,9 @@ Tapocalypse keeps two things outside your repositories: its config and its run h
 `TAPOCALYPSE_CONFIG` and `TAPOCALYPSE_DATA_DIR` override both. **Legacy fallback:** if a `tapocalypse.config.json` or a `data/` folder already exists in the Tapocalypse checkout, those keep being used, so upgrading moves nothing. To switch to the XDG locations, move them and restart.
 
 ```text
-<your repo>/<reportsDir>/QA-REPORT-<run-id>.md          the report (stays in your repo)
-<your repo>/<reportsDir>/screenshots/<run-id>/*.png     its screenshots
 <data dir>/runs/<run-id>/
+  report.md        the QA report the agent handed in (images link to screenshots/<name>)
+  screenshots/     the run's screenshots (png, jpg, jpeg, webp, gif), one file per image
   run.json         full run state: status, checks, verdict, source, build, usage, stats
   brief.md         your brief
   persona.md       the persona used (frontmatter stripped)
@@ -415,9 +457,10 @@ Tapocalypse keeps two things outside your repositories: its config and its run h
   transcript.html  full agent transcript (omp runs only)
 <data dir>/batches/                                     batch titles
 <data dir>/omp-plugins/tpc/.mcp.json                    the mobile-mcp plugin for omp runs, if provisioned
+<data dir>/logs/service.log                             output of the background service, if installed
 ```
 
-Run ids look like `20260101-093015-a1b2-dark-mode-toggle`. By default nothing is ever deleted. To cap history, set `retention` in the config: `days` removes finished runs that ended longer ago, `maxRuns` keeps only the newest N. It runs at startup and every 6 hours, only touches run folders in the data dir, and never deletes queued or active runs or the reports in your repositories. You can also delete a single finished run from its page (**Delete**) or with `DELETE /api/runs/:id`; that removes its run folder (events, transcript, session), not the report in your repo.
+Run ids look like `20260101-093015-a1b2-dark-mode-toggle`. By default nothing is ever deleted. To cap history, set `retention` in the config: `days` removes finished runs that ended longer ago, `maxRuns` keeps only the newest N. It runs at startup and every 6 hours, only touches run folders in the data dir, and never deletes queued or active runs. A run's report and screenshots are part of its folder, so retention and **Delete** remove them with the run: export anything you want to keep first (see [Reading reports and screenshots](#reading-reports-and-screenshots)). Reports that old runs wrote into a repo (`<repo>/qa/…`) are never touched. You can delete a single finished run from its page (**Delete**) or with `DELETE /api/runs/:id`; that removes its run folder (report, screenshots, events, transcript, session).
 
 **Restarts.** Stopping Tapocalypse (Ctrl-C) kills running agents. On the next start those runs are marked `interrupted`, and runs that were still queued are queued again. Emulators Tapocalypse booted keep running.
 
@@ -427,8 +470,8 @@ Run ids look like `20260101-093015-a1b2-dark-mode-toggle`. By default nothing is
 2. **Preflight.** If a device had to be booted, that happens first. Then the app is installed if requested, its version is read from the device, and Tapocalypse works out the device id mobile-mcp expects (the AVD name for Android emulators, the UDID for simulators, the serial for physical devices).
 3. **Spawn.** It starts the run's [harness](#agent-runtimes) headless, with your repo as the working directory, the persona as its system prompt, the model and effort when known, and the harness's non-interactive approval setting (see [Security model](#security-model)). **omp** runs `omp --mode rpc --no-ui` with `--append-system-prompt`, `--session-dir`, `--auto-approve`, `--max-time <runMaxTime>` and `--no-title`; **Claude Code** runs `claude -p` with stream-json input and output, `--append-system-prompt-file`, `--no-session-persistence`, `--strict-mcp-config`, a permission mode, and `--max-turns` / `--max-budget-usd` when configured; **Codex CLI** runs `codex exec --json` with `--sandbox`, `approval_policy="never"`, the persona as developer instructions, and the prompt on stdin. Tapocalypse sends the prompt and receives every tool call and message as events, which feed the activity feed and `events.jsonl`. The raw events are stored as the harness emitted them and replayed through that harness's adapter, so old runs stay readable.
 4. **mobile-mcp, mounted for you.** Every harness gets mobile-mcp for the run only; your own agent config is never modified. omp has no per-session MCP switch, so Tapocalypse checks omp's user and project MCP config files (`~/.omp/agent/mcp.json`, `.mcp.json` and `.omp/mcp.json` variants in the repo) for an enabled server that runs `@mobilenext/mobile-mcp`. If there is one, it is used as is. Otherwise Tapocalypse passes `--plugin-dir <data dir>/omp-plugins/tpc`, a tiny plugin that runs `npx -y @mobilenext/mobile-mcp@latest`. Claude Code gets a per-run `--mcp-config` file in the run folder plus `--strict-mcp-config`, so none of your other MCP servers (including a global Tapocalypse entry) are loaded; Codex CLI gets `-c mcp_servers.…` overrides on its command line. MCP servers connect a moment after the agent starts, so Tapocalypse waits until the tools are mounted (omp: it polls until they appear and learns their real name prefix; Claude Code: the session's init event; Codex CLI: the servers are marked `required`), and only then sends the prompt, with the tool names exactly as that harness spells them. If they never appear, the run fails with a message pointing back to [Prerequisites](#prerequisites).
-5. **Progress tools.** Three tools are how the UI gets its data: `qa_plan { checks: [{id, title}] }` declares every check before the first device action; `qa_check { id, status, note?, screenshot? }` (`status` is `running`, `pass`, `fail`, `blocked` or `skipped`; `screenshot` is a repo-relative path) reports each one; `qa_finish { verdict, summary, reportPath }` is called once after the report is written. Claude Code and Codex CLI reach them through a run-scoped MCP endpoint on the server, `POST /mcp/runs/<run-id>` (server name `tpc`, authenticated with a random per-run bearer token that stops working when the run ends). The token never appears on a command line, in your repo or in `run.json`, `events.jsonl` or `stderr.log`: Codex CLI gets it in an owner-only (mode 0600) `tpc-mcp.json` that a small stdio bridge (`src/mcp/stdio-bridge.ts`, which Codex starts as a stdio MCP server, so it works on every Codex version) reads by path, Claude Code in an owner-only `mcp.json`, both in the run's data folder, which stays until retention removes the run (see [docs/api.md](api.md#run-progress-endpoint)). omp registers the tools natively as host tools and needs no token. Both paths feed the same recorder, which validates the arguments and writes the check into the activity feed itself. Paths the agent reports must resolve inside your repo.
-6. **The prompt.** Besides your brief, the agent is told: its device (and the mobile-mcp device id), that it must not touch other devices or boot its own, the app package, the run id, the time budget, the code under test ([Run metadata](#run-metadata)), which driver tools to use and not use, to never spawn subagents or ask the user questions, and the reporting protocol: save screenshots to `<reportsDir>/screenshots/<run-id>/` and the report to `<reportsDir>/QA-REPORT-<run-id>.md`. Unique paths keep parallel runs from colliding. If it is blocked it records why and finishes with `BLOCKED`.
+5. **Progress tools.** Three tools are how the UI gets its data: `qa_plan { checks: [{id, title}] }` declares every check before the first device action; `qa_check { id, status, note?, screenshot? }` (`status` is `running`, `pass`, `fail`, `blocked` or `skipped`; `screenshot` is an absolute or working-directory-relative path of an image, which Tapocalypse copies into the run's `screenshots/` folder) reports each one; `qa_finish { verdict, summary, reportMarkdown | reportPath }` is called once, with the report text or the path of a file the agent wrote, which Tapocalypse stores as the run's `report.md`. Claude Code and Codex CLI reach them through a run-scoped MCP endpoint on the server, `POST /mcp/runs/<run-id>` (server name `tpc`, authenticated with a random per-run bearer token that stops working when the run ends). The token never appears on a command line, in your repo or in `run.json`, `events.jsonl` or `stderr.log`: Codex CLI gets it in an owner-only (mode 0600) `tpc-mcp.json` that a small stdio bridge (`src/mcp/stdio-bridge.ts`, which Codex starts as a stdio MCP server, so it works on every Codex version) reads by path, Claude Code in an owner-only `mcp.json`, both in the run's data folder, which stays until retention removes the run (see [docs/api.md](api.md#run-progress-endpoint)). omp registers the tools natively as host tools and needs no token. Both paths feed the same recorder, which validates the arguments and writes the check into the activity feed itself. Files the agent names are checked (extension, image content, size) and copied into the run's folder in the data directory.
+6. **The prompt.** Besides your brief, the agent is told: its device (and the mobile-mcp device id), that it must not touch other devices or boot its own, the app package, the run id, the time budget, the code under test ([Run metadata](#run-metadata)), which driver tools to use and not use, to never spawn subagents or ask the user questions, and the reporting protocol: save every screenshot into the absolute screenshot folder it is given (`<data dir>/runs/<run-id>/screenshots/`), never write anything into the repository, and finish with `qa_finish { verdict, summary, reportMarkdown }` embedding images as `screenshots/<name>`. A folder per run keeps parallel runs from colliding. If it is blocked it records why and finishes with `BLOCKED`.
 7. **Finish.** After the agent ends, Tapocalypse collects usage (omp: session statistics; Claude Code: the final result; Codex CLI: token counts), exports `transcript.html` on harnesses that can (omp), closes the agent's stdin and waits for it to exit, then applies the rules in [Run outcomes](#run-outcomes) (reported or derived verdict, error kind, retry). Cancelling interrupts the agent and kills it after 10 s; "steer" sends your message to the live agent on harnesses that support it (omp and Claude Code; others answer `409 steering is not supported by <harness>`).
 
 ## Optional: Artemis backend
@@ -458,7 +501,7 @@ Tapocalypse is a local developer tool with no login.
 - **Content-Security-Policy.** The UI page allows only same-origin scripts, styles and connections, images from itself or `data:`/`blob:`, fonts from itself or `data:` (the bundled monospace font is inlined), and no plugins, base tags or foreign form targets.
 - **Frame protection.** Every API and file response carries `X-Frame-Options: DENY` and `frame-ancestors 'none'`; the UI page itself refuses to render inside another page. This stops clickjacking of a running instance.
 - **Guards on destructive actions.** Only finished runs can be deleted, only devices Tapocalypse booted (and no run is using) can be shut down from the UI, projects with active runs cannot be removed, and retention only deletes run folders inside the data directory.
-- **Path safety.** File serving is limited to a project's `reportsDir` and a short list of extensions (images, `.txt`, `.json`). Agent-reported report and screenshot paths, persona files and `reportsDir` must resolve inside the repo (symlinks included), and `source.path` must be the project's repo or one of its git worktrees.
+- **Path safety.** A run's files are served only from that run's own folder in the data directory, and only images (`png`, `jpg`, `jpeg`, `webp`, `gif`) whose first bytes really are an image (served with `X-Content-Type-Options: nosniff`). Files that old runs wrote into a repo are served only from the project's legacy `reportsDir`, with a short extension list. Screenshots and reports an agent names must lie inside the repo, the run's folder or the OS temp directory (a screenshot is capped at 25 MB, a report at 2 MB), are copied in and are never served from where they were; `qa_export` and `--export` write only into the folder you give, never inside Tapocalypse's data folder or a `.git` folder. Persona files and a legacy `reportsDir` must resolve inside the repo (symlinks included), and `source.path` must be the project's repo or one of its git worktrees.
 
 See [SECURITY.md](../SECURITY.md) to report a vulnerability.
 
@@ -513,10 +556,12 @@ CI ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) runs `bun install
 | `src/devices/` | Device discovery, screenshots, emulator/simulator boot and idle shutdown |
 | `src/projects/` | Project registry, repo detection and folder suggestions |
 | `src/reports/` | Report listing, sanitized rendering and safe file serving |
+| `src/runs/artefacts.ts` | Where a run's report and screenshots live (`<data dir>/runs/<id>/`), path guards and export |
+| `src/service/` | The background service behind `tapocalypse service` (launchd on macOS, a systemd user unit on Linux) |
 | `src/batches.ts`, `src/suites.ts`, `src/stats.ts`, `src/retention.ts` | Batches, suites, usage statistics, history cleanup |
 | `src/mcp/server.ts`, `src/mcp/run-server.ts` | The MCP tools, and the run-scoped progress endpoint the agents call |
 | `src/doctor.ts`, `scripts/doctor.ts` | Prerequisite checks and their CLI |
-| `src/cli.ts` | The `tapocalypse` command: `serve`, `doctor`, `run`, `status` |
+| `src/cli.ts` | The `tapocalypse` command: `serve`, `service`, `doctor`, `run`, `status`, `report` |
 | `web/` | The UI: React 19, Tailwind 4 and [shadcn/ui](https://ui.shadcn.com) (`views/` pages, `components/`, `components/ui/` primitives) |
 | `templates/briefs/`, `personas/` | Built-in brief templates and the built-in QA persona |
 | `docs/`, `test/` | This guide, the [configuration](configuration.md) and [HTTP API / MCP](api.md) references and the [agent setup](agent-setup.md) instructions; tests and fixtures |

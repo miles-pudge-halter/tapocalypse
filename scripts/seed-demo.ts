@@ -2,6 +2,8 @@
 /**
  * Maintainer tool: seeds a throwaway demo instance (fictional "Acme Shop" project, ~22 finished runs over the last four
  * days) for screenshots and demos. `bun scripts/seed-demo.ts [--dir <dataDir>] [--config <file>] [--repo <dir>]`.
+ * Runs are stored like real ones (`storage: "data"`: `report.md` and `screenshots/` in the run dir) except the two oldest, which
+ * are legacy `storage: "repo"` runs with report and screenshots under the temp repo's `qa/`.
  * Never touches the real data dir unless `--dir` points at it, and refuses to write into a data dir that already has runs.
  */
 import { createHash } from "node:crypto";
@@ -316,6 +318,8 @@ interface RunSpec {
   /** This run is the successor of the (infra-failed) run with this key. */
   retryOf?: string;
   key?: string;
+  /** Stored the pre-data-dir way: report and screenshots under the temp repo's `qa/` (`storage: "repo"`). */
+  legacy?: boolean;
 }
 
 const BLOCKED_LOGIN: Record<number, Override> = {
@@ -443,8 +447,8 @@ const RUN_SPECS: RunSpec[] = [
     outcomes: { 3: { status: "blocked", note: "Blocked: uiautomator dump timed out three times on the cart screen." } },
   },
   { scenario: "gallery", harness: "omp", device: "pixel", branch: "main", agoMin: 4540, durationMin: 4.4, summary: "The product gallery opens, swipes through all photos and resets zoom on close." },
-  { scenario: "checkout", title: "Smoke on release candidate", harness: "claude", device: "pixel", branch: "release/2.4", agoMin: 5560, durationMin: 6.8, summary: "The release candidate passes the checkout smoke test." },
-  { scenario: "checkout", harness: "omp", device: "pixel", branch: "main", agoMin: 5660, durationMin: 6, summary: "The happy path from catalog to order summary works." },
+  { scenario: "checkout", title: "Smoke on release candidate", harness: "claude", device: "pixel", branch: "release/2.4", agoMin: 5560, durationMin: 6.8, legacy: true, summary: "The release candidate passes the checkout smoke test." },
+  { scenario: "checkout", harness: "omp", device: "pixel", branch: "main", agoMin: 5660, durationMin: 6, legacy: true, summary: "The happy path from catalog to order summary works." },
 ];
 
 function mulberry32(seed: number): () => number {
@@ -611,7 +615,7 @@ interface Finished {
   run: Run;
   events: string;
   report: string | null;
-  /** Evidence screenshots to copy into the repo: reports-dir relative path → screen name. */
+  /** Evidence screenshots: path relative to the run's artefact root (the run dir for data runs, the repo's `qa/` for legacy ones) → screen name. */
   screenshots: { rel: string; screen: Screen }[];
 }
 
@@ -698,6 +702,7 @@ const STATUS_ICON: Record<string, string> = { pass: "✅ pass", fail: "❌ fail"
 interface BuildContext {
   now: number;
   repoDir: string;
+  dataDir: string;
   index: number;
   /** Ids of earlier-built runs by spec key (retry links point at the failed attempt). */
   ids: Map<string, string>;
@@ -719,7 +724,10 @@ function buildRun(spec: RunSpec, ctx: BuildContext): Finished {
   const id = runId(runTitle, createdAt, `${runTitle}:${ctx.index}`);
   const durationMs = Math.round(spec.durationMin * MIN);
   const endMs = startMs + durationMs;
-  const runDirRel = `qa/screenshots/${id}`;
+  // Data runs keep artefacts in `<runDir>/screenshots`; legacy runs in the repo's `qa/screenshots/<id>`.
+  const legacy = spec.legacy === true;
+  const runDir = path.join(ctx.dataDir, "runs", id);
+  const shotPrefix = legacy ? `qa/screenshots/${id}` : "screenshots";
   const infra = spec.ending === "infra";
 
   const feed = new Feed(spec.harness, startMs + 4000);
@@ -822,10 +830,10 @@ function buildRun(spec: RunSpec, ctx: BuildContext): Finished {
       const calls = c.steps.flatMap((s) => stepCalls(s, ctxStep));
       const evidence =
         finalStatus === "pass" || finalStatus === "fail"
-          ? `${runDirRel}/${pad(i + 1)}-${c.screen}.png`
+          ? `${shotPrefix}/${pad(i + 1)}-${c.screen}.png`
           : null;
       if (evidence) {
-        calls.push({ call: { kind: "mcp", name: "mobile_save_screenshot", args: { device: device.label, saveTo: evidence }, result: `Saved screenshot to ${evidence}` }, weight: 1.2 });
+        calls.push({ call: { kind: "mcp", name: "mobile_save_screenshot", args: { device: device.label, saveTo: legacy ? evidence : path.join(runDir, evidence) }, result: `Saved screenshot to ${legacy ? evidence : path.join(runDir, evidence)}` }, weight: 1.2 });
       }
       // Device calls take seconds; the rest of the slice is the model thinking between them.
       const durations = calls.map(({ weight }) => Math.round(weight * (700 + rand() * 900)));
@@ -874,9 +882,9 @@ function buildRun(spec: RunSpec, ctx: BuildContext): Finished {
       const statuses = checks.map((c) => c.status);
       verdict = spec.verdict ?? (statuses.includes("fail") ? "FAIL" : "PASS");
       summary = spec.summary ?? "All checks passed.";
-      reportPath = `qa/QA-REPORT-${id}.md`;
+      reportPath = legacy ? `qa/QA-REPORT-${id}.md` : "report.md";
       feed.say(`All checks are resolved. Writing the report with the evidence, then I'll finish the run with ${verdict}.`);
-      feed.tool({ kind: "write", path: reportPath }, 1400);
+      feed.tool({ kind: "write", path: legacy ? reportPath : path.join(runDir, reportPath) }, 1400);
       feed.t += 1200;
       feed.activity("check", `Finished: ${verdict}`);
       report = writeReport({ id, title: runTitle, device, harness: spec.harness, branch: spec.branch, branchInfo: branch, spec, checks, verdict, summary, commit, durationMs, startMs });
@@ -904,6 +912,7 @@ function buildRun(spec: RunSpec, ctx: BuildContext): Finished {
     verdict,
     summary,
     reportPath,
+    storage: legacy ? "repo" : "data",
     checks,
     error,
     createdAt: createdAt.toISOString(),
@@ -1066,7 +1075,7 @@ function describeStep(step: string): string {
 export interface SeedOptions {
   dataDir: string;
   configFile: string;
-  /** Throwaway git repo that holds `qa/` (reports and screenshots). */
+  /** Throwaway git repo the project points at; holds `qa/` (report and screenshots) only for the two legacy runs. */
   repoDir: string;
   now?: Date;
 }
@@ -1102,7 +1111,6 @@ export function seedDemo(opts: SeedOptions): SeedResult {
   const now = (opts.now ?? new Date()).getTime();
 
   initRepo(repoDir);
-  mkdirSync(path.join(repoDir, "qa"), { recursive: true });
   mkdirSync(path.dirname(configFile), { recursive: true });
   writeFileSync(
     configFile,
@@ -1112,7 +1120,7 @@ export function seedDemo(opts: SeedOptions): SeedResult {
         maxConcurrentRuns: 2,
         runMaxTime: RUN_MAX_TIME,
         projects: [
-          { id: PROJECT_ID, name: "Acme Shop", repoPath: repoDir, reportsDir: "qa", defaultPackage: PACKAGE_ID, defaultPlatform: "android" },
+          { id: PROJECT_ID, name: "Acme Shop", repoPath: repoDir, defaultPackage: PACKAGE_ID, defaultPlatform: "android" },
         ],
         retry: { infra: 1 },
         devicePool: {
@@ -1137,7 +1145,7 @@ export function seedDemo(opts: SeedOptions): SeedResult {
       const first = new Date(now - spec.agoMin * MIN - 30_000);
       batchId = `b-${stamp(first)}-${sha("onboarding-batch").slice(0, 4)}`;
     }
-    const finished = buildRun(spec, { now, repoDir, index, ids, batchId: spec.batch ? batchId : null });
+    const finished = buildRun(spec, { now, repoDir, dataDir, index, ids, batchId: spec.batch ? batchId : null });
     if (spec.key) ids.set(spec.key, finished.run.id);
     built.push(finished);
     runIds.push(finished.run.id);
@@ -1157,13 +1165,16 @@ export function seedDemo(opts: SeedOptions): SeedResult {
     writeFileSync(path.join(dir, "brief.md"), run.brief);
     writeFileSync(path.join(dir, "persona.md"), persona);
     writeFileSync(path.join(dir, "events.jsonl"), events);
+    // Data runs keep their artefacts in the run dir; legacy runs in the repo's `qa/` folder.
+    const artefactRoot = run.storage === "repo" ? path.join(repoDir, "qa") : dir;
     for (const shot of screenshots) {
-      const target = path.join(repoDir, "qa", shot.rel);
+      const target = path.join(artefactRoot, shot.rel);
       mkdirSync(path.dirname(target), { recursive: true });
       copyFileSync(path.join(SCREENS_DIR, `${shot.screen}.png`), target);
     }
     if (report && run.reportPath) {
-      const file = path.join(repoDir, run.reportPath);
+      const file = run.storage === "repo" ? path.join(repoDir, run.reportPath) : path.join(dir, run.reportPath);
+      mkdirSync(path.dirname(file), { recursive: true });
       writeFileSync(file, report);
       // Report lists sort by mtime: keep them in run order.
       const ended = new Date(run.endedAt ?? run.createdAt);

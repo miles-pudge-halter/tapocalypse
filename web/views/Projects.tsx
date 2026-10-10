@@ -100,7 +100,7 @@ const STRIP_RUNS = 12;
 const CUSTOM = ":custom";
 const BUILTIN = ":builtin";
 const SAVE_ERROR = /^(\w+): (.+)$/s;
-const PROJECT_FIELDS: (keyof Project)[] = ["id", "name", "repoPath", "personaFile", "reportsDir", "defaultPackage", "defaultPlatform"];
+const PROJECT_FIELDS: (keyof Project)[] = ["id", "name", "repoPath", "personaFile", "defaultPackage", "defaultPlatform"];
 
 type FieldErrors = Partial<Record<keyof Project, string>>;
 
@@ -661,8 +661,8 @@ function DeleteDialog({
         <DialogHeader>
           <DialogTitle>Delete {project?.name}?</DialogTitle>
           <DialogDescription>
-            This only removes the project from Tapocalypse. Your repository and any QA reports in it are not touched, and past runs stay in the
-            run history.
+            This only removes the project from Tapocalypse. Your repository is not touched, and past runs and their reports stay in the run
+            history.
           </DialogDescription>
         </DialogHeader>
         {activeCount > 0 && (
@@ -707,7 +707,6 @@ interface FormState {
   /** BUILTIN, CUSTOM, or a detected / current repo-relative persona path. */
   persona: string;
   customPersona: string;
-  reportsDir: string;
 }
 
 type Fields = Omit<ProjectInput, "id">;
@@ -723,7 +722,6 @@ function formFromProject(p: Project): FormState {
     packageCustom: false,
     persona: p.personaFile ?? BUILTIN,
     customPersona: "",
-    reportsDir: p.reportsDir,
   };
 }
 
@@ -739,7 +737,6 @@ function formFromDetection(d: Detection): FormState {
     packageCustom: false,
     persona: suggestion.personaFile ?? BUILTIN,
     customPersona: "",
-    reportsDir: suggestion.reportsDir,
   };
 }
 
@@ -780,7 +777,6 @@ function buildFields(form: FormState, options: string[]): Built {
       name: form.name.trim(),
       repoPath: form.repoPath.trim(),
       personaFile,
-      reportsDir: form.reportsDir.trim(),
       defaultPackage: form.packageId.trim(),
       defaultPlatform: form.platform,
     },
@@ -881,8 +877,7 @@ function ProjectForm({
       } else {
         const next = formFromDetection(d);
         setForm(next);
-        // Nothing to decide when the persona and reports folder are just what detection suggested.
-        setQaOpen(!((next.persona === BUILTIN || next.persona === d.suggestion.personaFile) && next.reportsDir === d.suggestion.reportsDir));
+        setQaOpen(false);
         setStage("details");
       }
     } catch (err) {
@@ -995,7 +990,6 @@ function ProjectForm({
   }
 
   const detectedName = detection?.suggestion.name === form.name.trim();
-  const reportsDetected = detection?.reportsDirCandidates.includes(form.reportsDir.trim()) ?? false;
 
   return (
     <form onSubmit={(e) => void save(e)} className="flex flex-col gap-5 p-4 pt-2">
@@ -1012,7 +1006,7 @@ function ProjectForm({
           <Field
             id="pj-repo"
             label="Repository folder"
-            hint="Re-detect refreshes the package, persona and report-folder suggestions below."
+            hint="Re-detect refreshes the package and persona suggestions below."
             error={errors.repoPath ?? detectError ?? undefined}
           >
             <div className="flex gap-2">
@@ -1185,7 +1179,7 @@ function ProjectForm({
       </section>
 
       <Collapsible
-        open={qaOpen || Boolean(errors.personaFile || errors.reportsDir)}
+        open={qaOpen || Boolean(errors.personaFile)}
         onOpenChange={setQaOpen}
         className="rounded-lg border"
       >
@@ -1193,7 +1187,7 @@ function ProjectForm({
           <span className="min-w-0 flex-1">
             <span className="block text-sm font-semibold">QA agent</span>
             <span className="block truncate text-xs text-muted-foreground">
-              {personaSummary(form)} · reports in {form.reportsDir.trim() || "…"}/
+              {personaSummary(form)}
             </span>
           </span>
           <ChevronDown className="size-4 shrink-0 text-muted-foreground transition-transform group-data-[state=closed]:-rotate-90" />
@@ -1241,25 +1235,6 @@ function ProjectForm({
         )}
         {errors.personaFile && <FieldError id="pj-persona-error">{errors.personaFile}</FieldError>}
       </fieldset>
-
-      <Field
-        id="pj-reports"
-        label="Reports folder"
-        detected={reportsDetected}
-        hint="Where QA reports and screenshots are written, relative to the repository. Created on the first run if it doesn't exist."
-        error={errors.reportsDir}
-      >
-        <Input
-          id="pj-reports"
-          className="font-mono"
-          value={form.reportsDir}
-          onChange={(e) => patch({ reportsDir: e.target.value })}
-          autoComplete="off"
-          spellCheck={false}
-          aria-invalid={errors.reportsDir ? true : undefined}
-          aria-describedby="pj-reports-hint pj-reports-error"
-        />
-      </Field>
         </CollapsibleContent>
       </Collapsible>
 
@@ -1304,7 +1279,6 @@ function emptyForm(): FormState {
     packageCustom: false,
     persona: BUILTIN,
     customPersona: "",
-    reportsDir: "qa",
   };
 }
 

@@ -46,8 +46,8 @@ A harness is one folder, `src/harness/<id>/index.ts`, that exports `harness: Har
 
 - Strict TypeScript, no `any`.
 - Match the surrounding code; prefer small, boring modules. No one-line wrapper helpers unless they are reused.
-- Anything that touches a file path from a client or an agent goes through `resolveUnder` in `src/reports/reports.ts`.
-- Older persisted runs (missing newer fields) must keep loading: add defaults in the store, do not require a migration.
+- Anything that touches a file path from a client or an agent goes through `resolveUnder` in `src/reports/reports.ts`; where a run's report and screenshots live (and the guarded lookups for them) is `src/runs/artefacts.ts`. Agents never write into the user's repo: new artefacts go under the run's folder in the data dir.
+- Older persisted runs (missing newer fields) must keep loading: add defaults in the store, do not require a migration. In particular, runs with `storage: "repo"` (the default for runs without the field) keep repo-relative `reportPath` / `Check.screenshot` values, and must keep rendering from the project's `reportsDir`.
 
 ## UI (`web/`)
 

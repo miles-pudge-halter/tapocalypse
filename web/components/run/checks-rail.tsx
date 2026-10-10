@@ -125,7 +125,7 @@ export function ChecksRail({
         ) : (
           <ul className="divide-y">
             {visible.map((c) => {
-              const shot = screenshotOfCheck(run.projectId, c, gallery);
+              const shot = screenshotOfCheck(run, c, gallery);
               const duration = checkDurationMs(c, run.endedAt ? Date.parse(run.endedAt) : now);
               const isSelected = selected === c.id;
               return (

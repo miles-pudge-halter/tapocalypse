@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { normalizeUsage, UsageAccumulator } from "../src/harness/omp/usage";
 import type { HarnessExit } from "../src/harness/types";
-import type { Project } from "../src/projects/registry";
 import { classifyExit, deriveVerdict, type ExitInput, parseDurationMs, UsageTotals } from "../src/runs/outcome";
+import { screenshotsDir } from "../src/runs/artefacts";
 import { buildPrompt } from "../src/runs/prompt";
 import type { Check, CheckStatus, Run, Verdict } from "../src/runs/types";
 
@@ -222,7 +222,6 @@ describe("UsageTotals", () => {
 });
 
 describe("buildPrompt", () => {
-  const project = { id: "p", reportsDir: "qa" } as Project;
   const toolName = (server: string, tool: string) => (server === "tpc" ? tool : `mcp__${server}_${tool}`);
   const run = (over: Partial<Run> = {}): Run =>
     ({
@@ -241,24 +240,34 @@ describe("buildPrompt", () => {
     }) as Run;
 
   test("states the time budget", () => {
-    expect(buildPrompt(run(), project, toolName, { runMaxTime: "90m" })).toContain(
+    expect(buildPrompt(run(), toolName, { runMaxTime: "90m" })).toContain(
       "Time budget: 90m. If you are running out of time, stop testing, write the report with what you have and call qa_finish.",
     );
   });
 
+  test("gives the absolute screenshot directory, forbids writing into the repo and asks for reportMarkdown", () => {
+    const prompt = buildPrompt(run(), toolName, { runMaxTime: "60m" });
+    expect(prompt).toContain(`Screenshot directory: ${screenshotsDir("r1")}`);
+    expect(prompt).toContain(`${screenshotsDir("r1")}/01-launch.png`);
+    expect(prompt).toContain("qa_finish with the verdict, a 2-4 sentence summary and the whole report as reportMarkdown");
+    expect(prompt).toContain("screenshots/<name>");
+    expect(prompt).toMatch(/never write .*repository/i);
+    expect(prompt).not.toContain("QA-REPORT-");
+    expect(prompt).not.toContain("qa/screenshots");
+  });
+
   test("suite runs pin check ids and titles; ad-hoc runs do not", () => {
-    const suite = buildPrompt(run({ suiteId: "smoke", suiteChecks: [{ id: "C1", title: "Launch" }, { id: "C2", title: 'Say "hi"' }] }), project, toolName, { runMaxTime: "60m" });
+    const suite = buildPrompt(run({ suiteId: "smoke", suiteChecks: [{ id: "C1", title: "Launch" }, { id: "C2", title: 'Say "hi"' }] }), toolName, { runMaxTime: "60m" });
     expect(suite).toContain('Use exactly these check ids and titles in qa_plan: C1 "Launch", C2 "Say \\"hi\\""');
-    expect(buildPrompt(run(), project, toolName, { runMaxTime: "60m" })).not.toContain("Use exactly these check ids");
+    expect(buildPrompt(run(), toolName, { runMaxTime: "60m" })).not.toContain("Use exactly these check ids");
   });
 });
 
 describe("buildPrompt harness neutrality", () => {
-  const project = { id: "p", reportsDir: "qa" } as Project;
   const run = { id: "r1", brief: "do it", packageId: "com.x", backend: "mobile-mcp", deviceSerial: "emulator-5554", deviceLabel: "Pixel", deviceRequest: { platform: "android" }, source: null, build: null, suiteId: null, suiteChecks: null } as Run;
 
   test("names every tool through the harness's own tool names", () => {
-    const prompt = buildPrompt(run, project, (server, tool) => `<${server}.${tool}>`, { runMaxTime: "60m" });
+    const prompt = buildPrompt(run, (server, tool) => `<${server}.${tool}>`, { runMaxTime: "60m" });
     expect(prompt).toContain("<mobile_mcp.mobile_list_elements_on_screen>");
     expect(prompt).toContain("<tpc.qa_plan>");
     expect(prompt).toContain("<tpc.qa_finish>");
@@ -268,14 +277,14 @@ describe("buildPrompt harness neutrality", () => {
 
   test("the persona is prepended only when asked to", () => {
     const names = (_s: string, t: string) => t;
-    expect(buildPrompt(run, project, names, { runMaxTime: "60m" })).not.toContain("Be thorough.");
-    const withPersona = buildPrompt(run, project, names, { runMaxTime: "60m", prependPersona: "Be thorough.\n" });
+    expect(buildPrompt(run, names, { runMaxTime: "60m" })).not.toContain("Be thorough.");
+    const withPersona = buildPrompt(run, names, { runMaxTime: "60m", prependPersona: "Be thorough.\n" });
     expect(withPersona.startsWith("Your system instructions")).toBe(true);
     expect(withPersona).toContain("Be thorough.");
   });
 
   test("the artemis backend names the artemis tools and forbids run_task", () => {
-    const prompt = buildPrompt({ ...run, backend: "artemis" } as Run, project, (s, t) => `${s}:${t}`, { runMaxTime: "60m" });
+    const prompt = buildPrompt({ ...run, backend: "artemis" } as Run, (s, t) => `${s}:${t}`, { runMaxTime: "60m" });
     expect(prompt).toContain("artemis:mobile_click");
     expect(prompt).toContain("NEVER call artemis:mobile_run_task");
   });

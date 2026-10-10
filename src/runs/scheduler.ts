@@ -320,8 +320,12 @@ export class Scheduler {
     const serial = input.device?.serial || undefined;
     if (serial) {
       const devices = await this.deps.listDevices();
-      const device = devices.find((d) => d.serial === serial && d.platform === platform);
-      if (!device) throw new HttpError(400, `device ${serial} not connected`);
+      const named = devices.find((d) => d.serial === serial);
+      if (named && named.platform !== platform) {
+        throw new HttpError(400, `device ${serial} is an ${named.platform} device; this run targets ${platform} (set device.platform)`);
+      }
+      if (!named) throw new HttpError(400, `device ${serial} not connected`);
+      const device = named;
       if (!isQaDevice(device)) {
         throw new HttpError(400, `device ${serial} is a ${device.deviceType}; only phones and tablets can run QA`);
       }
@@ -348,6 +352,7 @@ export class Scheduler {
         verdict: null,
         summary: null,
         reportPath: null,
+        storage: "data",
         checks: [],
         error: null,
         startedAt: null,
@@ -501,6 +506,7 @@ export class Scheduler {
       verdict: null,
       summary: null,
       reportPath: null,
+      storage: "data",
       checks: [],
       error: null,
       startedAt: null,

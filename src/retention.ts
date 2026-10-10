@@ -32,7 +32,8 @@ export function selectExpiredRuns(runs: readonly Run[], policy: RetentionPolicy,
 }
 
 /**
- * Deletes expired run directories under the data dir; project reports in repos are never touched. `isHeld` marks runs whose
+ * Deletes expired run directories under the data dir, including each data-stored run's report and screenshots (`report.md`,
+ * `screenshots/`); legacy reports in repos are never touched. `isHeld` marks runs whose
  * runner is still winding down (e.g. cancelled mid-preflight): they are skipped. Returns the deleted ids.
  */
 export function applyRetention(opts: { now?: number; policy?: RetentionPolicy; isHeld?: (id: string) => boolean } = {}): string[] {

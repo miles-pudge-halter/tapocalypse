@@ -1,12 +1,13 @@
 #!/usr/bin/env bun
-// Command line entry: `tapocalypse serve | doctor | run | status`.
-// Everything except `serve`/`doctor` talks to a running server over HTTP. This module must not import config
+// Command line entry: `tapocalypse serve | service | doctor | run | status | report`.
+// Everything except `serve`/`service`/`doctor` talks to a running server over HTTP. This module must not import config
 // (or anything that does) at load time: the config reads TAPOCALYPSE_PORT when first imported, and `--help`
 // has to work without a config file.
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { parseArgs, type ParseArgsOptionsConfig } from "node:util";
 import { HARNESS_IDS, type HarnessId } from "./harness/types";
+import type { ServiceAction } from "./service";
 import { VERDICTS, type CheckStatus, type RunStatus, type Verdict } from "./runs/types";
 
 export const EXIT = { OK: 0, VERDICT: 1, ERROR: 2, USAGE: 3 } as const;
@@ -24,7 +25,7 @@ export class UsageError extends Error {}
 export class ServerUnreachableError extends Error {
   constructor(readonly baseUrl: string) {
     super(
-      `cannot reach Tapocalypse at ${baseUrl}. Start it with \`tapocalypse serve\` (or \`bun start\` in the Tapocalypse checkout), or point --url at a running instance.`,
+      `cannot reach Tapocalypse at ${baseUrl}. Start it with \`tapocalypse service start\` (the always-on service; \`tapocalypse service install\` sets it up once), \`tapocalypse serve\` or \`bun start\` in the Tapocalypse checkout, or point --url at a running instance.`,
     );
   }
 }
@@ -67,7 +68,11 @@ export type Command =
   | { name: "serve"; port: number | null; dev: boolean }
   | { name: "doctor" }
   | { name: "run"; options: RunOptions }
-  | { name: "status"; id: string; json: boolean; url: string };
+  | { name: "status"; id: string; json: boolean; url: string }
+  | { name: "report"; id: string; exportDir: string | null; json: boolean; url: string }
+  | { name: "service"; action: ServiceAction };
+
+const SERVICE_ACTIONS = ["install", "uninstall", "start", "stop", "restart", "status", "logs"] as const satisfies readonly ServiceAction[];
 
 export const USAGE = `tapocalypse - parallel, agent-driven QA runs on Android emulators and iOS simulators
 
@@ -79,7 +84,12 @@ Usage:
   tapocalypse run --project <id> (--brief <text> | --brief-file <file|-> | --suite <id>) [options]
       Start a QA run (or a batch) on a running server.
   tapocalypse status <runId|batchId> [--json] [--url <url>]
-      Show the state of a run or batch.
+      Show the state of a run or batch, including the absolute path of its report.
+  tapocalypse report <runId> [--export <dir>] [--json] [--url <url>]
+      Print a run's markdown report. Reports and screenshots live in Tapocalypse's data dir, not in your repository;
+      --export copies them (QA-REPORT-<runId>.md + screenshots/) into <dir>. --json prints { runId, reportPath, markdown }.
+  tapocalypse service ${SERVICE_ACTIONS.join("|")}
+      Manage the always-on background service (launchd on macOS, a systemd user unit on Linux) that keeps the server running.
 
 Run options:
   --project <id>        Project id (see the Projects page)
@@ -173,6 +183,23 @@ export function parseCli(argv: string[], env: Record<string, string | undefined>
       const { values, positionals } = tokenize(rest, { json: { type: "boolean" }, url: { type: "string" } });
       if (positionals.length !== 1) throw new UsageError("usage: tapocalypse status <runId|batchId> [--json] [--url <url>]");
       return { name: "status", id: positionals[0]!, json: values.json === true, url: baseUrl(values.url, env) };
+    }
+    case "report": {
+      const { values, positionals } = tokenize(rest, { export: { type: "string" }, json: { type: "boolean" }, url: { type: "string" } });
+      if (positionals.length !== 1) throw new UsageError("usage: tapocalypse report <runId> [--export <dir>] [--json] [--url <url>]");
+      return {
+        name: "report",
+        id: positionals[0]!,
+        exportDir: values.export === undefined ? null : path.resolve(values.export),
+        json: values.json === true,
+        url: baseUrl(values.url, env),
+      };
+    }
+    case "service": {
+      const { positionals } = tokenize(rest, {});
+      const action = SERVICE_ACTIONS.find((a) => a === positionals[0]);
+      if (positionals.length !== 1 || !action) throw new UsageError(`usage: tapocalypse service <${SERVICE_ACTIONS.join("|")}>`);
+      return { name: "service", action };
     }
     case "run":
       return { name: "run", options: parseRunOptions(rest, env) };
@@ -279,7 +306,8 @@ export interface RunLite {
   checks: CheckLite[];
   startedAt: string | null;
   endedAt: string | null;
-  reportPath: string | null;
+  /** Absolute path of the run's report (additive, from `GET /api/runs/:id`); null when it has none. */
+  reportFile?: string | null;
   batchId?: string | null;
   retriedBy?: string | null;
   queuePosition?: number | null;
@@ -438,7 +466,7 @@ export function formatRun(run: RunLite, base: string): string {
   for (const c of run.checks) {
     if (c.status === "fail" || c.status === "blocked") lines.push(`  ${c.status.toUpperCase()} ${oneLine(c.id)} ${oneLine(c.title)}${c.note ? `: ${oneLine(c.note)}` : ""}`);
   }
-  if (run.reportPath) lines.push(`  report: ${oneLine(run.reportPath)}`);
+  if (run.reportFile) lines.push(`  report: ${oneLine(run.reportFile)}`);
   lines.push(`  ${runUrl(base, run.id)} (run ${run.id})`);
   return lines.join("\n");
 }
@@ -455,7 +483,7 @@ export function summarizeRun(run: RunLite, base: string) {
     error: run.error,
     errorKind: run.errorKind ?? null,
     deviceSerial: run.deviceSerial,
-    reportPath: run.reportPath,
+    reportPath: run.reportFile ?? null,
     durationMs: runDurationMs(run),
     checks: run.checks.map((c) => ({ id: c.id, title: c.title, status: c.status, note: c.note ?? null })),
     url: runUrl(base, run.id),
@@ -582,7 +610,7 @@ export function renderJUnit(runs: RunLite[], base: string): string {
       ["verdict.source", run.verdictSource],
       ["device", run.deviceSerial],
       ["batch", run.batchId],
-      ["report", run.reportPath],
+      ["report", run.reportFile],
     ];
     for (const [name, value] of props) if (value) out.push(`      <property name="${name}" value="${xmlEscape(value)}"/>`);
     out.push("    </properties>");
@@ -834,6 +862,43 @@ export async function executeStatus(id: string, json: boolean, deps: Pick<RunDep
   return EXIT.OK;
 }
 
+/** `tapocalypse report <runId>`: markdown to stdout, or (with --export) copy the artefacts into a directory. */
+export async function executeReport(
+  options: { id: string; exportDir: string | null; json: boolean },
+  deps: Pick<RunDeps, "api" | "io">,
+): Promise<number> {
+  const { api, io } = deps;
+  const id = encodeURIComponent(options.id);
+  if (options.exportDir !== null) {
+    const result = await api.request<{ report: string | null; screenshots: string[] }>("POST", `/api/runs/${id}/export`, { dir: options.exportDir });
+    if (options.json) io.out(JSON.stringify(result, null, 2));
+    else {
+      io.out(result.report ? `report: ${result.report}` : "report: none (the run wrote no report)");
+      io.out(`${result.screenshots.length} screenshots in ${path.join(options.exportDir, "screenshots")}`);
+    }
+    return EXIT.OK;
+  }
+  const { markdown } = await api.request<{ markdown: string }>("GET", `/api/runs/${id}/report`);
+  if (options.json) {
+    const run = await api.request<RunLite>("GET", `/api/runs/${id}`);
+    io.out(JSON.stringify({ runId: options.id, reportPath: run.reportFile ?? null, markdown }, null, 2));
+  } else {
+    io.out(markdown);
+  }
+  return EXIT.OK;
+}
+
+/** `tapocalypse service <action>`: prints the service's lines; exits 2 when the action did not succeed. */
+export async function executeService(
+  action: ServiceAction,
+  serviceCommand: (action: ServiceAction) => Promise<{ ok: boolean; lines: string[] }>,
+  io: Io,
+): Promise<number> {
+  const { ok, lines } = await serviceCommand(action);
+  for (const line of lines) (ok ? io.out : io.err)(line);
+  return ok ? EXIT.OK : EXIT.ERROR;
+}
+
 async function packageVersion(): Promise<string> {
   const pkg = (await Bun.file(new URL("../package.json", import.meta.url)).json()) as { version: string };
   return pkg.version;
@@ -868,14 +933,26 @@ export async function main(argv: string[], env: Record<string, string | undefine
       // scripts/doctor.ts runs its checks as a top-level side effect, so it can only be loaded on demand.
       await import("../scripts/doctor");
       return EXIT.OK;
+    case "service": {
+      // The service module reads config and probes devices at import time; keep it out of the other commands.
+      const service = await import("./service");
+      const serviceDeps = service.defaultServiceDeps();
+      try {
+        return await executeService(command.action, (action) => service.serviceCommand(action, serviceDeps), consoleIo);
+      } catch (e) {
+        console.error(`error: ${oneLine(e instanceof Error ? e.message : String(e))}`);
+        return EXIT.ERROR;
+      }
+    }
     case "run":
-    case "status": {
+    case "status":
+    case "report": {
       const base = command.name === "run" ? command.options.url : command.url;
       const deps = defaultRunDeps(base, env);
       try {
-        return command.name === "run"
-          ? await executeRun(command.options, deps)
-          : await executeStatus(command.id, command.json, deps);
+        if (command.name === "run") return await executeRun(command.options, deps);
+        if (command.name === "status") return await executeStatus(command.id, command.json, deps);
+        return await executeReport(command, deps);
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
         console.error(`error: ${oneLine(message)}`);

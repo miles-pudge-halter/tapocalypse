@@ -108,7 +108,7 @@ export function RunHeader({
           )}
           {!active && run.reportPath ? (
             <Button asChild size="sm">
-              <a href={reportHash(run.projectId, run.reportPath)}>
+              <a href={reportHash(run.projectId, run)}>
                 <FileText />
                 Open report
               </a>
@@ -193,7 +193,7 @@ export function RunHeader({
           <DialogHeader>
             <DialogTitle>Delete this run?</DialogTitle>
             <DialogDescription>
-              The run's activity log, transcript and stats are removed. Reports and screenshots in your repository stay.
+              The run's activity log, transcript and stats are removed, along with its report and screenshots when Tapocalypse stores them. Reports in your repository stay.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

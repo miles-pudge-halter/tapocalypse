@@ -33,10 +33,13 @@ import {
 } from "./projects/registry";
 import { suggestProjectFolders } from "./projects/suggest";
 import { listReports, renderReport, reportFilePath } from "./reports/reports";
+import { exportRun, reportFile, screenshotFile } from "./runs/artefacts";
 import { readActivity, listRuns, runDir } from "./runs/store";
 import type { Activity, Platform, Run } from "./runs/types";
 import { computeStats } from "./stats";
 import { listSuites, listTemplates, saveSuite } from "./suites";
+
+const NOSNIFF = { "X-Content-Type-Options": "nosniff" };
 
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
@@ -97,7 +100,7 @@ function hasJsonBody(method: string, parts: string[]): boolean {
   if (parts.length === 3) {
     return (a === "projects" && (b === "validate" || b === "detect")) || (a === "devices" && b === "boot");
   }
-  if (parts.length === 4) return (a === "projects" && c === "suites") || (a === "runs" && (c === "steer" || c === "rerun"));
+  if (parts.length === 4) return (a === "projects" && c === "suites") || (a === "runs" && (c === "steer" || c === "rerun" || c === "export"));
   return false;
 }
 
@@ -290,6 +293,13 @@ function saveSuiteFromBody(p: Project, body: Record<string, unknown>): Response 
 }
 
 const BootBodySchema = z.object({ platform: z.enum(["android", "ios"]), target: z.string().min(1) });
+const ExportBodySchema = z.object({
+  dir: z
+    .string()
+    .min(1)
+    .refine((d) => !d.includes("\0"), "dir must not contain a NUL byte")
+    .refine((d) => path.isAbsolute(d), "dir must be an absolute path"),
+});
 
 /** Starts a pool boot; configuration/limit errors surface immediately, the long boot itself continues detached. */
 async function startBoot(platform: Platform, target: string): Promise<void> {
@@ -321,7 +331,7 @@ async function route(req: Request, url: URL): Promise<Response> {
     const abs = reportFilePath(p, parts.slice(2).join("/"));
     const file = abs ? Bun.file(abs) : null;
     if (!file || !(await file.exists())) throw new HttpError(404, "not found");
-    return new Response(file);
+    return new Response(file, { headers: NOSNIFF });
   }
 
   if (parts[0] !== "api") throw new HttpError(404, "not found");
@@ -511,6 +521,18 @@ async function route(req: Request, url: URL): Promise<Response> {
           return new Response(lines.slice(-tail).join("\n"), { headers: { "Content-Type": "text/plain; charset=utf-8" } });
         }
         if (action === "screenshots" && method === "GET") return json(runScreenshots(run(id)));
+        if (action === "report" && method === "GET") {
+          const r = run(id);
+          const file = reportFile(r, getProject(r.projectId) ?? null);
+          if (!file || !existsSync(file)) throw new HttpError(404, `run ${id} has no report`);
+          return json({ markdown: readFileSync(file, "utf8") });
+        }
+        if (action === "export" && method === "POST") {
+          const r = run(id);
+          const parsed = ExportBodySchema.safeParse(await readJsonObject(req));
+          if (!parsed.success) throw new HttpError(400, "dir (an absolute path) is required");
+          return json(await exportRun(r, getProject(r.projectId) ?? null, parsed.data.dir));
+        }
         if (action === "transcript" && method === "GET") {
           run(id);
           const file = Bun.file(path.join(runDir(id), "transcript.html"));
@@ -519,6 +541,13 @@ async function route(req: Request, url: URL): Promise<Response> {
             headers: { "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": "sandbox" },
           });
         }
+      }
+      if (parts.length >= 5 && action === "files" && method === "GET") {
+        const r = run(id);
+        const abs = screenshotFile(r, getProject(r.projectId) ?? null, parts.slice(4).join("/"));
+        const file = abs ? Bun.file(abs) : null;
+        if (!file || !(await file.exists())) throw new HttpError(404, "not found");
+        return new Response(file, { headers: NOSNIFF });
       }
     }
   }

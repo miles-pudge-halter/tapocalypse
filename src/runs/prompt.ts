@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { ARTEMIS_SERVER, HARNESS_IDS, type HarnessId, MOBILE_MCP_SERVER, PROGRESS_SERVER } from "../harness/types";
-import type { Project } from "../projects/registry";
+import { screenshotsDir } from "./artefacts";
 import type { Backend, Run } from "./types";
 
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -97,9 +97,9 @@ export interface PromptOptions {
   prependPersona?: string | null;
 }
 
-export function buildPrompt(run: Run, project: Project, toolName: ToolNamer, opts: PromptOptions): string {
-  const { reportsDir } = project;
+export function buildPrompt(run: Run, toolName: ToolNamer, opts: PromptOptions): string {
   const runId = run.id;
+  const shots = screenshotsDir(runId);
   const plan = toolName(PROGRESS_SERVER, "qa_plan");
   const check = toolName(PROGRESS_SERVER, "qa_check");
   const finish = toolName(PROGRESS_SERVER, "qa_finish");
@@ -115,8 +115,9 @@ ${sourceBlock(run)}${backendRules(run.backend, toolName)}
 Progress reporting (mandatory — the Tapocalypse UI is built from these calls):
 1. After writing your test plan and before your first device action, call ${plan} with every check (short ids like C1, C2...).
 2. Call ${check}(status "running") when you start a check, and ${check}(pass|fail|blocked|skipped, note, screenshot) when it resolves.
-3. Save screenshots under ${reportsDir}/screenshots/${runId}/ and write the report to ${reportsDir}/QA-REPORT-${runId}.md (these unique paths keep parallel runs from colliding), embedding screenshots with paths relative to the report (screenshots/${runId}/NN-name.png).
-4. Finally call ${finish} with the verdict, a 2-4 sentence summary and the report path.
+3. Screenshot directory: ${shots}
+   Save every screenshot there, e.g. ${shots}/01-launch.png (Android: \`adb -s <serial> exec-out screencap -p > ${shots}/01-launch.png\`; iOS: \`xcrun simctl io <udid> screenshot ${shots}/01-launch.png\`). Never write into the repository: it is the app under test. Tapocalypse stores your screenshots and report itself, and ${check} tells you the stored name (screenshots/<name>) of the screenshot you attach.
+4. Finally call ${finish} with the verdict, a 2-4 sentence summary and the whole report as reportMarkdown (do not write a report file). Embed screenshots in it as ![alt](screenshots/<name>), using the stored names.
 ${suiteBlock(run, plan)}
 Brief:
 ${run.brief}`;

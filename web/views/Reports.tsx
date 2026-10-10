@@ -159,16 +159,12 @@ export function ReportList({ projectId: routeProjectId }: { projectId?: string |
 }
 
 function ReportViewBody({ projectId, name }: { projectId: string; name: string }) {
-  const { projects } = useProjects();
   const { report, loading, error } = useReport(projectId, name);
   const { reports } = useReports(projectId);
   const articleRef = useRef<HTMLElement | null>(null);
 
-  const project = projects.find((p) => p.id === projectId);
   const entry = reports.find((r) => r.name === name);
-  const filePath = project
-    ? `${project.repoPath.replace(/\/+$/, "")}/${project.reportsDir.replace(/^\/+|\/+$/g, "")}/${name}`
-    : null;
+  const filePath = entry?.path ?? null;
   const documentKey = `${projectId}/${name}`;
 
   return (

@@ -163,7 +163,7 @@ describe("frameToActivity enrichment", () => {
     for (const [name, args] of [
       ["qa_plan", { checks: [{ id: "C1", title: "a" }] }],
       ["qa_check", { id: "C1", status: "pass" }],
-      ["qa_finish", { verdict: "PASS", summary: "s", reportPath: "r" }],
+      ["qa_finish", { verdict: "PASS", summary: "s", reportMarkdown: "# r" }],
     ] as const) {
       expect(frameToActivity(frame({ type: "tool_execution_start", toolCallId: name, toolName: name, args }), "mobile-mcp", 0, starts)).toBeNull();
       expect(frameToActivity(frame({ type: "tool_execution_end", toolCallId: name, toolName: name, isError: false }), "mobile-mcp", 1, starts)).toBeNull();
@@ -174,7 +174,7 @@ describe("frameToActivity enrichment", () => {
     const at = (toolName: string, args: Record<string, unknown>) => legacyProgressActivity(frame({ type: "tool_execution_start", toolName, args }), 3);
     expect(at("qa_plan", { checks: [{ id: "C1", title: "a" }, { id: "C2", title: "b" }] })).toMatchObject({ kind: "check", text: "Test plan: 2 checks", seq: 3 });
     expect(at("qa_check", { id: "C2", status: "fail", note: "no title" })).toMatchObject({ kind: "check", checkId: "C2", checkStatus: "fail", text: "C2: fail — no title" });
-    expect(at("qa_finish", { verdict: "PASS", summary: "s", reportPath: "r" })).toMatchObject({ kind: "check", text: "Finished: PASS" });
+    expect(at("qa_finish", { verdict: "PASS", summary: "s", reportMarkdown: "# r" })).toMatchObject({ kind: "check", text: "Finished: PASS" });
     expect(at("qa_check", { id: "C2", status: "bogus" })).toBeNull();
     expect(at("bash", { command: "ls" })).toBeNull();
   });

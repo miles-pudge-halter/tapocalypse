@@ -4,7 +4,7 @@ Guidance for coding agents (omp, Claude Code, Cursor, …) working in this repos
 
 ## What this is
 
-Tapocalypse: a local Bun server + React UI + MCP endpoint that runs parallel, agent-driven mobile QA. A run = project + brief + device; the server spawns a headless agent in the app's repo through a *harness* adapter (`omp --mode rpc`, `claude -p` stream-json or `codex exec --json`), which drives an Android emulator / iOS simulator through mobile-mcp (optionally Artemis, omp only) and reports checks back through the progress tools (`qa_plan`, `qa_check`, `qa_finish`): the run-scoped MCP endpoint `POST /mcp/runs/<id>` for every harness, plus omp host tools. User docs: `README.md`, `docs/guide.md`, `docs/configuration.md`, `docs/api.md`, `docs/agent-setup.md`.
+Tapocalypse: a local Bun server + React UI + MCP endpoint that runs parallel, agent-driven mobile QA. A run = project + brief + device; its report and screenshots are stored in `<data dir>/runs/<id>/` (`report.md`, `screenshots/`), never in the repo; the server spawns a headless agent in the app's repo through a *harness* adapter (`omp --mode rpc`, `claude -p` stream-json or `codex exec --json`), which drives an Android emulator / iOS simulator through mobile-mcp (optionally Artemis, omp only) and reports checks back through the progress tools (`qa_plan`, `qa_check`, `qa_finish`): the run-scoped MCP endpoint `POST /mcp/runs/<id>` for every harness, plus omp host tools. User docs: `README.md`, `docs/guide.md`, `docs/configuration.md`, `docs/api.md`, `docs/agent-setup.md`.
 
 If `.agent-memory/MEMORY.md` exists (gitignored, maintainer-local), read it first: it holds project history, decisions, research and the next steps.
 
@@ -18,7 +18,7 @@ If `.agent-memory/MEMORY.md` exists (gitignored, maintainer-local), read it firs
 | Tests | `bun test` (also run `bun test --randomize` a few times; tests must be order-independent) |
 | Types | `bun run typecheck` |
 | Setup check | `bun run doctor` |
-| CLI | `bun src/cli.ts --help` (`serve`, `doctor`, `run`, `status`) |
+| CLI | `bun src/cli.ts --help` (`serve`, `service`, `doctor`, `run`, `status`, `report`) |
 | Frontend bundle check | `NODE_ENV=production bun -e 'await Bun.build({entrypoints:["./web/index.html"],outdir:"/tmp/tb",plugins:[(await import("bun-plugin-tailwind")).default]})'` |
 
 Smoke a second instance without touching real data: `TAPOCALYPSE_PORT=43xx TAPOCALYPSE_CONFIG=$(mktemp -d)/c.json TAPOCALYPSE_DATA_DIR=$(mktemp -d) bun start`. Never restart or kill someone else's server on 4310; never `pkill` by pattern.
@@ -29,7 +29,8 @@ Smoke a second instance without touching real data: `TAPOCALYPSE_PORT=43xx TAPOC
 |---|---|
 | `src/server.ts`, `src/api.ts` | `Bun.serve` + routing (`fetchHandler`), Host/Origin/content-type guards, security headers, SSE |
 | `src/app.ts` | composition root: scheduler + runner + views (`runView`, `queryRuns`, `batchView`) |
-| `src/runs/` | `types.ts` (Run model), `store.ts` (run dirs + in-memory index), `scheduler.ts` (queue, devices, batches, rerun, retry), `runner.ts` (lifecycle), `outcome.ts` (pure: derived verdict, exit classification incl. harness limits, usage), `prompt.ts` (persona, prompt built with the harness's `toolName`, progress tool schemas), `progress.ts` (`ProgressRecorder`: records `qa_plan`/`qa_check`/`qa_finish` for both transports and writes the `check` activity), `source.ts` (git/PR metadata) |
+| `src/runs/` | `types.ts` (Run model), `store.ts` (run dirs + in-memory index), `scheduler.ts` (queue, devices, batches, rerun, retry), `runner.ts` (lifecycle), `outcome.ts` (pure: derived verdict, exit classification incl. harness limits, usage), `prompt.ts` (persona, prompt built with the harness's `toolName`, progress tool schemas), `progress.ts` (`ProgressRecorder`: records `qa_plan`/`qa_check`/`qa_finish` for both transports, copies screenshots and the report into the run dir, writes the `check` activity), `artefacts.ts` (`runArtefactDir`, `screenshotsDir`, `reportFile`, `screenshotFile`, `exportRun`: where a run's artefacts live for both `storage: "data"` and legacy `"repo"` runs, with the path guards), `source.ts` (git/PR metadata) |
+| `src/service/` | `tapocalypse service`: launchd agent (macOS) / systemd user unit (Linux) that runs `serve` in the background; `serviceCommand` with injectable deps, only ever addresses its own label/unit |
 | `src/harness/` | `types.ts` (the `Harness` interface, `HarnessId`, capabilities, `HarnessEvent`, canonical tool names; change it only deliberately), `index.ts` (registry, `getHarness`, `resolveHarnessId` precedence, cached `detectInstalled`), `omp/` (`rpc.ts` JSONL RPC client, `provision.ts` mobile-mcp via `--plugin-dir` + tool-prefix discovery, frame mapping), `claude/` (`claude -p` stream-json), `codex/` (`codex exec --json`) |
 | `src/devices/` | discovery, screencap, app version, boot/idle pool |
 | `src/projects/` | registry (config-backed CRUD), detection, folder suggestions |
@@ -44,7 +45,7 @@ Smoke a second instance without touching real data: `TAPOCALYPSE_PORT=43xx TAPOC
 
 - TypeScript strict. No `any`/`as any` — use `unknown` + zod or narrowing. `Promise.withResolvers()` instead of `new Promise(executor)`. `Bun.sleep` for delays. No one-expression helper wrappers unless exported or reused 3+ times. `Record` for static lookup tables.
 - External input (HTTP bodies, MCP args, config, run.json) is parsed with zod once. Mutating routes go through the existing guards; new JSON routes must be added to the JSON-body check.
-- Persisted run fields are additive: `store.getRun` normalizes old `run.json` files to defaults (`harness` defaults to `"omp"`). Never break old data: `events.jsonl` keeps raw harness frames and replays them through `harnesses[run.harness].toActivity`.
+- Persisted run fields are additive: `store.getRun` normalizes old `run.json` files to defaults (`harness` defaults to `"omp"`, `storage` to `"repo"`: old runs keep repo-relative report/screenshot paths and must keep rendering; `Project.reportsDir` is legacy and read-only). Never break old data: `events.jsonl` keeps raw harness frames and replays them through `harnesses[run.harness].toActivity`.
 - Harness code lives behind `src/harness/types.ts`: the runner never branches on a harness id, it reads `capabilities`. Adapters write temp config under the run dir (never the repo or the user's home), pass secrets by env, and map tool names to the canonical form (`mcp__<server>_<tool>`, `bash`, `read`, `write`, `edit`, `search`). Progress tool calls are recorded server-side; `toActivity` returns null for them so they are not shown twice.
 - Shell commands use argument arrays, never strings; package ids must match `PACKAGE_RE` before reaching `adb shell`.
 - UI: every state has loading (Skeleton), error (Alert) and empty (EmptyState) handling and works in light + dark. Render agent text via JSX only; the single allowed `dangerouslySetInnerHTML` is the server-sanitized report HTML. Add shadcn components with `bunx --bun shadcn@latest add <name>` and then remove any bogus `cn` dependency / `import … from "cn"` the CLI injects.

@@ -1,4 +1,3 @@
-import { readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { type BatchSummary, getBatchMeta, summarizeBatch } from "./batches";
 import { config } from "./config";
@@ -14,7 +13,7 @@ import {
   startIdleReaper,
 } from "./devices/pool";
 import { getProject, initProjects } from "./projects/registry";
-import { reportFilePath } from "./reports/reports";
+import { LEGACY_REPORTS_DIR, reportLocation, runArtefactDir, runImages } from "./runs/artefacts";
 import { startRetention } from "./retention";
 import { createRunner } from "./runs/runner";
 import { Scheduler } from "./runs/scheduler";
@@ -47,6 +46,10 @@ export type RunView = Run & {
   durationMs: number | null;
   /** Why a queued run is still waiting; null once it has a slot. */
   queueReason: string | null;
+  /** Absolute path where the run's report is stored (either storage), derived from the run record without touching the disk; null when it has none. */
+  reportFile: string | null;
+  /** Absolute path of the run's folder in Tapocalypse's data dir (events, and for data runs the report and screenshots). */
+  runDir: string;
 };
 
 export function runDurationMs(run: Run): number | null {
@@ -61,6 +64,8 @@ export function runView(run: Run): RunView {
     queuePosition: scheduler.queuePosition(run.id),
     durationMs: runDurationMs(run),
     queueReason: scheduler.queueReason(run.id),
+    reportFile: reportLocation(run, getProject(run.projectId) ?? null),
+    runDir: runArtefactDir(run.id),
   };
 }
 
@@ -155,7 +160,7 @@ export function batchView(id: string): BatchView | null {
 }
 
 export interface RunScreenshot {
-  /** Relative to the project repo (same form as `Check.screenshot`). */
+  /** Same form as `Check.screenshot`: relative to the run's artefact folder (data runs) or to the project repo (legacy runs). */
   path: string;
   url: string;
   name: string;
@@ -163,44 +168,24 @@ export interface RunScreenshot {
   checkId: string | null;
 }
 
-const posix = (p: string) => path.posix.normalize(p.replace(/\\/g, "/")).replace(/^\.\//, "");
-
-/** Files in `<reportsDir>/screenshots/<runId>/` plus any other report-folder image a check points at. */
+/** Images in the run's screenshots folder plus any other image a check points at, each with the URL the UI loads it from. */
 export function runScreenshots(run: Run): RunScreenshot[] {
-  const project = getProject(run.projectId);
-  if (!project) return [];
-  const reportsDir = posix(project.reportsDir);
-  const candidates = new Set<string>();
-  try {
-    for (const file of readdirSync(path.join(project.repoPath, project.reportsDir, "screenshots", run.id), { recursive: true })) {
-      candidates.add(posix(path.posix.join(reportsDir, "screenshots", run.id, String(file))));
-    }
-  } catch {
-    // no screenshots directory yet
-  }
-  const checkByPath = new Map<string, string>();
-  for (const c of run.checks) {
-    if (!c.screenshot) continue;
-    const rel = posix(c.screenshot);
-    candidates.add(rel);
-    if (!checkByPath.has(rel)) checkByPath.set(rel, c.id);
-  }
-
+  const project = getProject(run.projectId) ?? null;
+  const segments = (p: string) => p.split("/").map(encodeURIComponent).join("/");
+  const reportsDir = path.posix.normalize((project?.reportsDir ?? LEGACY_REPORTS_DIR).replace(/\\/g, "/"));
   const out: RunScreenshot[] = [];
-  for (const rel of candidates) {
-    const rest = path.posix.relative(reportsDir, rel);
-    if (!rest || rest.startsWith("..") || path.posix.isAbsolute(rest)) continue;
-    const abs = reportFilePath(project, rest);
-    if (!abs) continue;
-    out.push({
-      path: rel,
-      url: `/files/${encodeURIComponent(project.id)}/${rest.split("/").map(encodeURIComponent).join("/")}`,
-      name: path.posix.basename(rel),
-      mtime: statSync(abs).mtime.toISOString(),
-      checkId: checkByPath.get(rel) ?? null,
-    });
+  for (const image of runImages(run, project)) {
+    let url: string;
+    if (run.storage === "data") {
+      url = `/api/runs/${encodeURIComponent(run.id)}/files/${segments(image.rel)}`;
+    } else {
+      const rest = path.posix.relative(reportsDir, image.rel);
+      if (!project || !rest || rest.startsWith("..") || path.posix.isAbsolute(rest)) continue;
+      url = `/files/${encodeURIComponent(project.id)}/${segments(rest)}`;
+    }
+    out.push({ path: image.rel, url, name: image.name, mtime: image.mtime, checkId: image.checkId });
   }
-  return out.sort((a, b) => a.mtime.localeCompare(b.mtime) || a.name.localeCompare(b.name));
+  return out;
 }
 
 export function init(): void {

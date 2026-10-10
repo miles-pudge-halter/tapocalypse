@@ -9,7 +9,7 @@ Back to the [README](../README.md). Tapocalypse is configured with one JSON file
 | Config file | `$TAPOCALYPSE_CONFIG`; a legacy `tapocalypse.config.json` in the Tapocalypse checkout, if it exists; otherwise `$XDG_CONFIG_HOME/tapocalypse/config.json` (default `~/.config/tapocalypse/config.json`) |
 | Data directory | `$TAPOCALYPSE_DATA_DIR`; a legacy `data/` folder in the checkout, if it exists; otherwise `$XDG_DATA_HOME/tapocalypse` (default `~/.local/share/tapocalypse`) |
 
-Existing installs that already have the in-repo `tapocalypse.config.json` or `data/` keep using them, so nothing moves on upgrade. Fresh installs use the XDG locations. To migrate, move the file or folder and restart. The server prints the config path it created on first start.
+Existing installs that already have the in-repo `tapocalypse.config.json` or `data/` keep using them, so nothing moves on upgrade. Fresh installs use the XDG locations. To migrate, move the file or folder and restart. The server prints the config path it created on first start. Each run's report and screenshots are stored in the data directory too (`runs/<id>/report.md`, `runs/<id>/screenshots/`), never in your repositories.
 
 The config file is created with the defaults below when it does not exist. It is validated at startup (`fatal: config: …`, exit 1 when invalid) and read once: restart after editing it by hand. Projects added in the UI or over MCP take effect immediately and are written back to the file. [`tapocalypse.config.example.json`](../tapocalypse.config.example.json) is a copy of the defaults plus an `agent` block that spells out the default permission and sandbox settings (it leaves `agent.harness` unset, so the default is the first harness that is installed and signed in, else the first installed, else omp).
 
@@ -41,7 +41,7 @@ The config file is created with the defaults below when it does not exist. It is
 | `devicePool.ios.simulators` | `[]` | Simulator UDIDs Tapocalypse may boot on demand (macOS only) |
 | `devicePool.ios.idleShutdownMinutes` | `20` | Same idle shutdown for simulators |
 
-`retention` is evaluated at startup and every 6 hours. It only removes run folders under the data directory; reports and screenshots in your repositories are never touched, and queued or active runs are never deleted. See [Data and retention](guide.md#data-and-retention).
+`retention` is evaluated at startup and every 6 hours. It only removes run folders under the data directory, which now include each run's report and screenshots (export what you want to keep first with `tapocalypse report <id> --export <dir>`); files that old runs wrote into your repositories are never touched, and queued or active runs are never deleted. See [Data and retention](guide.md#data-and-retention).
 
 A fresh config file contains the defaults above for `port`, `maxConcurrentRuns`, `runMaxTime`, `projects` and `devicePool`; `agent`, `retry`, `retention` and `artemisPath` are optional and can be added by hand.
 
@@ -89,7 +89,7 @@ A *harness* is the headless coding-agent CLI that plays the QA agent: `omp`, `cl
 | `TAPOCALYPSE_CONFIG` | Config file path (see above) |
 | `TAPOCALYPSE_DATA_DIR` | Data directory (see above) |
 | `TAPOCALYPSE_PORT` | Overrides `port`. `tapocalypse serve --port` sets it. The CLI also uses it to find the server |
-| `TAPOCALYPSE_URL` | Server URL for `tapocalypse run` / `status` (default `http://127.0.0.1:<port>`); `--url` wins |
+| `TAPOCALYPSE_URL` | Server URL for `tapocalypse run` / `status` / `report` (default `http://127.0.0.1:<port>`); `--url` wins |
 | `XDG_CONFIG_HOME`, `XDG_DATA_HOME` | Base directories for the default config and data locations |
 | `OMP_BIN`, `CLAUDE_BIN`, `CODEX_BIN`, `ADB_BIN`, `XCRUN_BIN`, `GIT_BIN`, `GH_BIN` | Binaries to use instead of `omp`, `claude`, `codex`, `adb`, `xcrun`, `git`, `gh` from `PATH`. The harness variables override `agent.harnesses.<id>.bin` |
 | `EMULATOR_BIN` | Android emulator binary. Otherwise looked up (not on `PATH`) at `$ANDROID_HOME/emulator/emulator`, `$ANDROID_SDK_ROOT/emulator/emulator`, `~/Library/Android/sdk/emulator/emulator` (macOS), then `~/Android/Sdk/emulator/emulator` (Linux) |
@@ -104,7 +104,13 @@ A *harness* is the headless coding-agent CLI that plays the QA agent: `omp`, `cl
 bun start                                 # production server
 bun run dev                               # server with hot reload
 bun src/cli.ts serve [--port 4311] [--dev]
+bun src/cli.ts service install|uninstall|start|stop|restart|status|logs
+bun src/cli.ts report <runId> [--export <dir>] [--json]
 bun run doctor
 ```
 
-`serve --dev` runs the same server with Bun's development server (hot module reloading for the UI and browser console forwarding); without it `serve` runs in production mode. The `run` and `status` commands are described in [CLI and CI](guide.md#cli-and-ci); `run --harness omp|claude|codex` picks the agent runtime for one run.
+`serve --dev` runs the same server with Bun's development server (hot module reloading for the UI and browser console forwarding); without it `serve` runs in production mode. The `run`, `status` and `report` commands are described in [CLI and CI](guide.md#cli-and-ci); `run --harness omp|claude|codex` picks the agent runtime for one run.
+
+`service` keeps the server running in the background and starts it at login: `install` writes a launchd agent (macOS, `~/Library/LaunchAgents/dev.tapocalypse.server.plist`) or a systemd user unit (Linux, `~/.config/systemd/user/tapocalypse.service`) and starts it; `status` shows whether it is installed, running and answering; `logs` prints the end of `<data dir>/logs/service.log` (Linux: the journal); `start`, `stop` and `restart` control it; `uninstall` stops it and removes the unit. The unit stores the environment it was installed from (`PATH`, `HOME`, `TAPOCALYPSE_*`, `ANDROID_HOME`, `ANDROID_SDK_ROOT` and the `*_BIN` variables above), so run `install` again after changing it. It only touches its own unit and is not supported on Windows. Details: [Running as a service](guide.md#running-as-a-service).
+
+`report <runId>` prints a run's markdown report; `--export <dir>` copies the report (as `QA-REPORT-<runId>.md`) and its screenshots into `<dir>` instead, and `--json` prints `{ runId, reportPath, markdown }`. Details: [Reading reports and screenshots](guide.md#reading-reports-and-screenshots).

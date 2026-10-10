@@ -1,6 +1,8 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { z } from "zod";
 import { fetchHandler } from "../src/api";
 import { scheduler } from "../src/app";
 import { config, MAX_STEER_CHARS } from "../src/config";
@@ -10,6 +12,8 @@ import { appendStderr, runDir } from "../src/runs/store";
 import type { Run } from "../src/runs/types";
 
 const HOST = `127.0.0.1:${config.port}`;
+/** Smallest valid PNG header bytes; enough for the magic-byte checks. */
+const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
 const project = getProject("test-proj")!;
 
 function call(pathname: string, init: RequestInit & { json?: unknown } = {}): Promise<Response> {
@@ -148,13 +152,13 @@ describe("run resources", () => {
   });
 
   test("screenshots lists run files and check images, linking each to its check", async () => {
-    const run = await makeRun({ status: "done" });
+    const run = await makeRun({ status: "done", storage: "repo" });
     const dir = path.join(project.repoPath, "qa", "screenshots", run.id);
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, "01-home.png"), "png");
+    fs.writeFileSync(path.join(dir, "01-home.png"), PNG);
     fs.writeFileSync(path.join(dir, "notes.md"), "not an image");
     fs.mkdirSync(path.join(project.repoPath, "qa", "extra"), { recursive: true });
-    fs.writeFileSync(path.join(project.repoPath, "qa", "extra", "proof.png"), "png");
+    fs.writeFileSync(path.join(project.repoPath, "qa", "extra", "proof.png"), PNG);
     run.checks = [
       { id: "C1", title: "Home", status: "pass", screenshot: `qa/screenshots/${run.id}/01-home.png`, updatedAt: "t" },
       { id: "C2", title: "Proof", status: "pass", screenshot: "qa/extra/proof.png", updatedAt: "t" },
@@ -175,7 +179,9 @@ describe("run resources", () => {
         ["qa/extra/proof.png", "/files/test-proj/extra/proof.png", "C2"],
       ].sort(),
     );
-    expect((await call(shots[0]!.url)).status).toBe(200);
+    const legacy = await call(shots[0]!.url);
+    expect(legacy.status).toBe(200);
+    expect(legacy.headers.get("x-content-type-options")).toBe("nosniff");
   });
 
   test("the SSE snapshot reports whether older activity exists", async () => {
@@ -188,6 +194,96 @@ describe("run resources", () => {
     expect(text).toStartWith("event: snapshot\n");
     const data = JSON.parse(text.split("\n")[1]!.slice("data: ".length)) as { run: { id: string }; activity: unknown[]; hasMoreActivity: boolean };
     expect(data).toMatchObject({ run: { id: run.id }, activity: [], hasMoreActivity: false });
+  });
+});
+
+/** A finished run whose artefacts live in the data dir: report.md plus screenshots/01-home.png. */
+async function makeDataRun(extra: Partial<Run> = {}): Promise<Run> {
+  const run = await makeRun({ status: "done", storage: "data", reportPath: "report.md", ...extra });
+  fs.mkdirSync(path.join(runDir(run.id), "screenshots"), { recursive: true });
+  fs.writeFileSync(path.join(runDir(run.id), "report.md"), `# QA report ${run.id}\n\n![home](screenshots/01-home.png)\n`);
+  fs.writeFileSync(path.join(runDir(run.id), "screenshots", "01-home.png"), PNG);
+  fs.writeFileSync(path.join(runDir(run.id), "screenshots", "notes.md"), "not an image");
+  run.checks = [{ id: "C1", title: "Home", status: "pass", screenshot: "screenshots/01-home.png", updatedAt: "t" }];
+  scheduler.update(run);
+  return run;
+}
+
+describe("data-dir artefact routes", () => {
+  test("GET /api/runs/:id/files serves a stored screenshot and refuses everything else", async () => {
+    const run = await makeDataRun();
+    const ok = await call(`/api/runs/${run.id}/files/screenshots/01-home.png`);
+    expect(ok.status).toBe(200);
+    expect(ok.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(new Uint8Array(await ok.arrayBuffer())).toEqual(PNG);
+    expect((await call(`/api/runs/${run.id}/files/screenshots/notes.md`)).status).toBe(404);
+    expect((await call(`/api/runs/${run.id}/files/report.md`)).status).toBe(404);
+    expect((await call(`/api/runs/${run.id}/files/screenshots/missing.png`)).status).toBe(404);
+    expect((await call(`/api/runs/${run.id}/files/screenshots%2F..%2F..%2Frun.json`)).status).toBe(404);
+    expect((await call(`/api/runs/nope-${run.id}/files/screenshots/01-home.png`)).status).toBe(404);
+  });
+
+  test("a data run's screenshots list links each image to its file route", async () => {
+    const run = await makeDataRun();
+    const shots = (await (await call(`/api/runs/${run.id}/screenshots`)).json()) as { path: string; url: string; checkId: string | null }[];
+    expect(shots.map((s) => [s.path, s.url, s.checkId])).toEqual([["screenshots/01-home.png", `/api/runs/${run.id}/files/screenshots/01-home.png`, "C1"]]);
+    expect((await call(shots[0]!.url)).status).toBe(200);
+  });
+
+  test("GET /api/runs/:id/report returns the markdown, 404 without one", async () => {
+    const run = await makeDataRun();
+    expect(await (await call(`/api/runs/${run.id}/report`)).json()).toEqual({ markdown: `# QA report ${run.id}\n\n![home](screenshots/01-home.png)\n` });
+    const bare = await makeRun({ status: "done", storage: "data" });
+    expect((await call(`/api/runs/${bare.id}/report`)).status).toBe(404);
+    expect((await call(`/api/runs/nope-${run.id}/report`)).status).toBe(404);
+  });
+
+  test("GET /api/runs/:id/report still reads a legacy repo report", async () => {
+    const run = await makeRun({ status: "done", storage: "repo", reportPath: `qa/LEGACY-REPORT-${counter}.md` });
+    fs.writeFileSync(path.join(project.repoPath, run.reportPath!), "# legacy\n");
+    expect(await (await call(`/api/runs/${run.id}/report`)).json()).toEqual({ markdown: "# legacy\n" });
+  });
+
+  test("the run view carries the absolute report file", async () => {
+    const run = await makeDataRun();
+    const view = (await (await call(`/api/runs/${run.id}`)).json()) as { reportFile: string | null };
+    expect(view.reportFile).toBe(path.join(runDir(run.id), "report.md"));
+    const bare = await makeRun({ status: "done", storage: "data" });
+    expect(((await (await call(`/api/runs/${bare.id}`)).json()) as { reportFile: string | null }).reportFile).toBeNull();
+  });
+
+  test("POST /api/runs/:id/export copies the report and screenshots into an absolute directory", async () => {
+    const run = await makeDataRun();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tapocalypse-export-"));
+    try {
+      const res = await call(`/api/runs/${run.id}/export`, { method: "POST", json: { dir } });
+      expect(res.status).toBe(200);
+      const out = (await res.json()) as { report: string | null; screenshots: string[] };
+      expect(out.report).toBe(path.join(dir, `QA-REPORT-${run.id}.md`));
+      expect(fs.existsSync(out.report!)).toBe(true);
+      expect(out.screenshots).toContain(path.join(dir, "screenshots", "01-home.png"));
+      expect(fs.existsSync(path.join(dir, "screenshots", "01-home.png"))).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("export rejects a relative or missing dir, a non-JSON body, and an unknown run", async () => {
+    const run = await makeDataRun();
+    expect((await call(`/api/runs/${run.id}/export`, { method: "POST", json: { dir: "relative/out" } })).status).toBe(400);
+    expect((await call(`/api/runs/${run.id}/export`, { method: "POST", json: { dir: `${os.tmpdir()}/out\u0000x` } })).status).toBe(400);
+    expect((await call(`/api/runs/${run.id}/export`, { method: "POST", json: {} })).status).toBe(400);
+    const plain = await call(`/api/runs/${run.id}/export`, { method: "POST", headers: { "content-type": "text/plain" }, body: "{}" });
+    expect(plain.status).toBe(415);
+    expect((await call(`/api/runs/nope-${run.id}/export`, { method: "POST", json: { dir: os.tmpdir() } })).status).toBe(404);
+  });
+
+  test("the project reports routes list and render a data run by its id", async () => {
+    const run = await makeDataRun();
+    const list = (await (await call("/api/projects/test-proj/reports")).json()) as { name: string }[];
+    expect(list.map((r) => r.name)).toContain(run.id);
+    const rendered = (await (await call(`/api/projects/test-proj/reports/${run.id}`)).json()) as { html: string };
+    expect(rendered.html).toContain(`/api/runs/${run.id}/files/screenshots/01-home.png`);
   });
 });
 
@@ -282,6 +378,82 @@ describe("suites, templates, stats, mcp status", () => {
       lastTool: "qa_list_suites",
       lastRequester: "omp-test",
     });
+  });
+});
+
+describe("run-management MCP artefact tools", () => {
+  const Rpc = z.object({ result: z.object({ isError: z.boolean().optional(), content: z.array(z.object({ text: z.string() })).optional(), tools: z.array(z.object({ name: z.string() })).optional() }).optional() });
+  type RpcResult = NonNullable<z.infer<typeof Rpc>["result"]>;
+
+  async function rpc(method: string, params?: Record<string, unknown>): Promise<RpcResult> {
+    const res = await call("/mcp", {
+      method: "POST",
+      headers: { accept: "application/json, text/event-stream" },
+      json: { jsonrpc: "2.0", id: 1, method, params },
+    });
+    const text = await res.text();
+    const body = text.startsWith("event:") ? text.split("\n").find((l) => l.startsWith("data: "))!.slice("data: ".length) : text;
+    // A JSON-RPC protocol error (unknown tool, bad arguments) has no `result`.
+    return Rpc.parse(JSON.parse(body)).result ?? { isError: true };
+  }
+  const callTool = async (name: string, args: Record<string, unknown>) => {
+    const result = await rpc("tools/call", { name, arguments: args });
+    return { isError: result.isError === true, text: result.content?.[0]?.text ?? "" };
+  };
+
+  test("tools/list offers qa_get_screenshots and qa_export, and project tools no longer take reportsDir", async () => {
+    const list = await rpc("tools/list");
+    const names = list.tools!.map((t) => t.name);
+    expect(names).toEqual(expect.arrayContaining(["qa_get_report", "qa_get_screenshots", "qa_export", "qa_get_run"]));
+    const full = JSON.stringify(list.tools);
+    expect(full).not.toContain("reportsDir");
+  });
+
+  test("qa_get_run reports absolute report and screenshot paths in the data dir that share one resolved root", async () => {
+    const run = await makeDataRun();
+    const out = JSON.parse((await callTool("qa_get_run", { runId: run.id })).text) as { reportPath: string | null; screenshotsDir: string | null };
+    const real = fs.realpathSync(runDir(run.id));
+    expect(out.reportPath).toBe(path.join(real, "report.md"));
+    expect(out.screenshotsDir).toBe(path.join(real, "screenshots"));
+  });
+
+  test("qa_get_report reads a data run's report and errors for a run without one", async () => {
+    const run = await makeDataRun();
+    expect((await callTool("qa_get_report", { runId: run.id })).text).toContain(`# QA report ${run.id}`);
+    const bare = await makeRun({ status: "done", storage: "data" });
+    expect(await callTool("qa_get_report", { runId: bare.id })).toMatchObject({ isError: true });
+  });
+
+  test("qa_get_screenshots lists absolute paths with their check and url", async () => {
+    const run = await makeDataRun();
+    const out = JSON.parse((await callTool("qa_get_screenshots", { runId: run.id })).text) as { checkId: string | null; name: string; path: string; url: string }[];
+    expect(out).toEqual([
+      {
+        checkId: "C1",
+        name: "01-home.png",
+        path: fs.realpathSync(path.join(runDir(run.id), "screenshots", "01-home.png")),
+        url: `/api/runs/${run.id}/files/screenshots/01-home.png`,
+      },
+    ]);
+    expect((await callTool("qa_get_screenshots", { runId: `nope-${run.id}` })).isError).toBe(true);
+  });
+
+  test("qa_export copies the artefacts into an absolute directory and refuses a relative one", async () => {
+    const run = await makeDataRun();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tapocalypse-mcp-export-"));
+    try {
+      const ok = await callTool("qa_export", { runId: run.id, dir });
+      expect(ok.isError).toBe(false);
+      const out = JSON.parse(ok.text) as { report: string | null; screenshots: string[] };
+      expect(out.report).toBe(path.join(dir, `QA-REPORT-${run.id}.md`));
+      expect(fs.existsSync(path.join(dir, "screenshots", "01-home.png"))).toBe(true);
+      expect((await callTool("qa_export", { runId: run.id, dir: "relative/out" })).isError).toBe(true);
+      const nul = await callTool("qa_export", { runId: run.id, dir: `${dir}/x\u0000y` });
+      expect(nul.isError).toBe(true);
+      expect(nul.text).toContain("NUL");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

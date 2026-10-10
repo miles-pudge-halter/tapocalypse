@@ -155,7 +155,7 @@ export function ReportFileCard({
   imageCount,
 }: {
   name: string;
-  /** Absolute path on disk, when the project is known. */
+  /** Absolute path on disk as the server reports it; null until the report list has loaded. */
   path: string | null;
   imageCount: number;
 }) {

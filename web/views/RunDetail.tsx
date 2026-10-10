@@ -108,7 +108,11 @@ function Workbench({
 
   const shotsKey = `${run.status}|${run.checks.map((c) => `${c.status}:${c.screenshot ?? ""}`).join(",")}`;
   const screenshots = useScreenshots(run.id, shotsKey);
-  const gallery = useMemo(() => buildGallery(run.projectId, run.checks, screenshots.shots), [run.projectId, run.checks, screenshots.shots]);
+  const { id: runId, projectId: runProjectId, storage, checks } = run;
+  const gallery = useMemo(
+    () => buildGallery({ id: runId, projectId: runProjectId, storage }, checks, screenshots.shots),
+    [runId, runProjectId, storage, checks, screenshots.shots],
+  );
   const lightboxImages = useMemo(
     () => gallery.map((g) => ({ src: g.url, caption: g.checkId ? `${g.checkId} · ${g.name}` : g.name, href: g.url })),
     [gallery],

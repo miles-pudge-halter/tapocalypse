@@ -14,6 +14,8 @@ import type {
 import { HttpError } from "../src/config";
 import type { Device } from "../src/devices/devices";
 import { createRunner, type Runner, type RunnerScheduler } from "../src/runs/runner";
+import { getProject } from "../src/projects/registry";
+import { screenshotsDir } from "../src/runs/artefacts";
 import { createRun, deleteRun, getRun, readEvents, runDir, saveRun } from "../src/runs/store";
 import type { Activity, Run, RunUsage } from "../src/runs/types";
 
@@ -181,6 +183,7 @@ function setup(harnessId: HarnessId, o: FakeOptions = {}, runOver: Partial<Run> 
     verdict: null,
     summary: null,
     reportPath: null,
+    storage: "data",
     checks: [],
     error: null,
     startedAt: null,
@@ -243,7 +246,7 @@ describe("runner with a fake harness", () => {
         c.emit({ type: "usage", usage: { tokensIn: 2, tokensOut: 1 }, cumulative: false });
         await lookup.sink.record("qa_plan", { checks: [{ id: "C1", title: "Home loads" }] });
         await lookup.sink.record("qa_check", { id: "C1", status: "pass", note: "ok" });
-        await lookup.sink.record("qa_finish", { verdict: "PASS", summary: "all good", reportPath: "qa/QA-REPORT-x.md" });
+        await lookup.sink.record("qa_finish", { verdict: "PASS", summary: "all good", reportMarkdown: "# Report\n" });
         c.emit({ type: "turn_end", ok: true, error: null, limit: null });
         c.exit();
       },
@@ -257,7 +260,8 @@ describe("runner with a fake harness", () => {
     expect(c!.prompts[0]).toContain("fake:tpc:qa_plan");
     expect(c!.prompts[0]).not.toContain("You are a QA agent."); // persona is appended as system prompt, not duplicated
 
-    expect(env.run).toMatchObject({ status: "done", verdict: "PASS", verdictSource: "agent", errorKind: null, model: "fake-model" });
+    expect(env.run).toMatchObject({ status: "done", verdict: "PASS", verdictSource: "agent", errorKind: null, model: "fake-model", reportPath: "report.md" });
+    expect(fs.readFileSync(path.join(runDir(env.run.id), "report.md"), "utf8")).toBe("# Report\n");
     expect(env.run.checks).toMatchObject([{ id: "C1", status: "pass", note: "ok" }]);
     expect(env.run.usage).toEqual({ cost: 0.5, tokensIn: 9, tokensOut: 4, cacheRead: 0, cacheWrite: 0, toolCalls: 1, model: "fake-model" });
 
@@ -403,6 +407,32 @@ describe("runner with a fake harness", () => {
     start(env);
     await env.done;
     expect(env.spawned[0]!.prompts[0]).toContain("You are a QA agent.");
+  });
+
+  test("creates the run's screenshots folder before the agent starts and leaves the repository untouched", async () => {
+    const repoPath = getProject("test-proj")!.repoPath;
+    const reportsFolder = path.join(repoPath, "qa");
+    fs.rmSync(reportsFolder, { recursive: true, force: true });
+    try {
+      let existedAtSpawn = false;
+      const env = setup("claude", {
+        onSpawn: (c) => {
+          existedAtSpawn = fs.statSync(screenshotsDir(env.run.id)).isDirectory();
+          expect(c.opts.cwd).toBe(repoPath);
+        },
+        script: (c) => {
+          c.emit({ type: "turn_end", ok: true, error: null, limit: null });
+          c.exit();
+        },
+      });
+      start(env);
+      await env.done;
+      expect(existedAtSpawn).toBe(true);
+      expect(env.spawned[0]!.prompts[0]).toContain(`Screenshot directory: ${screenshotsDir(env.run.id)}`);
+      expect(fs.existsSync(reportsFolder)).toBe(false);
+    } finally {
+      fs.mkdirSync(reportsFolder, { recursive: true });
+    }
   });
 
   test("a persona model applies only to the harness the persona names (none = omp)", async () => {
@@ -556,5 +586,16 @@ describe("runner with a fake harness", () => {
     } finally {
       jest.useRealTimers();
     }
+  });
+});
+
+describe("runs queued under the previous version", () => {
+  test("a run persisted with legacy storage is executed as a data run, so its report and screenshots resolve", async () => {
+    const env = setup("claude", { script: (c) => c.exit() }, { storage: "repo" });
+    expect(getRun(env.run.id)?.storage).toBe("repo");
+    start(env);
+    await env.done;
+    expect(env.run.storage).toBe("data");
+    expect(getRun(env.run.id)?.storage).toBe("data");
   });
 });

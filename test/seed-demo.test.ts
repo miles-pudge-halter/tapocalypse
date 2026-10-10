@@ -82,37 +82,88 @@ describe("demo seed", () => {
     }
   });
 
-  test("each finished report carries its run's verdict and every check screenshot and embedded image exists in the repo", async () => {
-    const res = await inspect<{ repoPath: string; problems: string[]; reports: number }>(`
+  test("data runs keep their report and screenshots in the run dir with run-relative links, and the temp repo holds nothing of theirs", async () => {
+    const res = await inspect<{ problems: string[]; data: number; withReport: number; projectHasReportsDir: boolean; repoEntries: string[] }>(`
       import fs from "node:fs";
       import path from "node:path";
-      import { listRuns } from "./src/runs/store";
-      import { initProjects, listProjects } from "./src/projects/registry";
+      import { DATA_DIR } from "./src/config";
       import { extractVerdict } from "./src/reports/reports";
-      initProjects();
-      const project = listProjects().find((p) => p.id === "acme-shop");
+      const cfg = JSON.parse(fs.readFileSync(process.env.TAPOCALYPSE_CONFIG, "utf8"));
+      const repo = cfg.projects[0].repoPath;
+      const runsDir = path.join(DATA_DIR, "runs");
       const problems = [];
-      let reports = 0;
-      if (project?.status !== "ok") problems.push("project is not ok: " + project?.problems);
-      for (const run of listRuns()) {
+      let data = 0, withReport = 0;
+      const dataIds = [];
+      for (const id of fs.readdirSync(runsDir)) {
+        const run = JSON.parse(fs.readFileSync(path.join(runsDir, id, "run.json"), "utf8"));
+        if (run.storage !== "data") continue;
+        data++; dataIds.push(id);
         for (const c of run.checks) {
-          if (c.screenshot && !fs.existsSync(path.join(project.repoPath, c.screenshot))) problems.push(run.id + " missing " + c.screenshot);
+          if (!c.screenshot) continue;
+          if (!c.screenshot.startsWith("screenshots/")) problems.push(id + " screenshot " + c.screenshot);
+          else if (!fs.existsSync(path.join(runsDir, id, c.screenshot))) problems.push(id + " missing " + c.screenshot);
         }
-        if (!run.reportPath) continue;
-        reports++;
-        const file = path.join(project.repoPath, run.reportPath);
-        if (!fs.existsSync(file)) { problems.push("missing report " + run.reportPath); continue; }
+        if (run.reportPath === null) { if (fs.existsSync(path.join(runsDir, id, "report.md"))) problems.push(id + " stray report.md"); continue; }
+        withReport++;
+        if (run.reportPath !== "report.md") { problems.push(id + " reportPath " + run.reportPath); continue; }
+        const file = path.join(runsDir, id, "report.md");
+        if (!fs.existsSync(file)) { problems.push(id + " missing report.md"); continue; }
         const md = fs.readFileSync(file, "utf8");
-        if (extractVerdict(md) !== run.verdict) problems.push(run.id + " report verdict " + extractVerdict(md) + " != " + run.verdict);
-        for (const m of md.matchAll(/!\\[[^\\]]*\\]\\(([^)]+)\\)/g)) {
-          if (!fs.existsSync(path.join(project.repoPath, "qa", m[1]))) problems.push(run.id + " broken image " + m[1]);
+        if (extractVerdict(md) !== run.verdict) problems.push(id + " report verdict " + extractVerdict(md) + " != " + run.verdict);
+        const images = [...md.matchAll(/!\\[[^\\]]*\\]\\(([^)]+)\\)/g)].map((m) => m[1]);
+        for (const rel of images) {
+          if (!rel.startsWith("screenshots/") || !fs.existsSync(path.join(runsDir, id, rel))) problems.push(id + " broken image " + rel);
         }
       }
-      console.log(JSON.stringify({ repoPath: project.repoPath, problems, reports }));
+      const repoEntries = fs.readdirSync(repo, { recursive: true }).map(String).filter((f) => dataIds.some((id) => f.includes(id)));
+      console.log(JSON.stringify({ problems, data, withReport, projectHasReportsDir: "reportsDir" in cfg.projects[0], repoEntries }));
     `);
     expect(res.problems).toEqual([]);
-    expect(res.reports).toBe(19);
-    expect(fs.existsSync(path.join(res.repoPath, ".git"))).toBe(true);
+    expect(res.data).toBe(20);
+    expect(res.withReport).toBe(17);
+    expect(res.projectHasReportsDir).toBe(false);
+    expect(res.repoEntries).toEqual([]);
+  });
+
+  test("two legacy repo runs keep report and screenshots under the temp repo's qa/ and still carry their verdict", async () => {
+    const res = await inspect<{ problems: string[]; legacy: number; gitRepo: boolean }>(`
+      import fs from "node:fs";
+      import path from "node:path";
+      import { DATA_DIR } from "./src/config";
+      import { extractVerdict } from "./src/reports/reports";
+      const cfg = JSON.parse(fs.readFileSync(process.env.TAPOCALYPSE_CONFIG, "utf8"));
+      const repo = cfg.projects[0].repoPath;
+      const runsDir = path.join(DATA_DIR, "runs");
+      const problems = [];
+      let legacy = 0;
+      for (const id of fs.readdirSync(runsDir)) {
+        const run = JSON.parse(fs.readFileSync(path.join(runsDir, id, "run.json"), "utf8"));
+        if (run.storage === "data") continue;
+        if (run.storage !== "repo") { problems.push(id + " storage " + run.storage); continue; }
+        legacy++;
+        if (fs.existsSync(path.join(runsDir, id, "report.md"))) problems.push(id + " has a run-dir report");
+        if (fs.existsSync(path.join(runsDir, id, "screenshots"))) problems.push(id + " has run-dir screenshots");
+        let shots = 0;
+        for (const c of run.checks) {
+          if (!c.screenshot) continue;
+          shots++;
+          if (!fs.existsSync(path.join(repo, c.screenshot))) problems.push(id + " missing " + c.screenshot);
+        }
+        if (shots === 0) problems.push(id + " has no screenshots");
+        if (run.reportPath !== "qa/QA-REPORT-" + id + ".md") { problems.push(id + " reportPath " + run.reportPath); continue; }
+        const file = path.join(repo, run.reportPath);
+        if (!fs.existsSync(file)) { problems.push(id + " missing report"); continue; }
+        const md = fs.readFileSync(file, "utf8");
+        if (extractVerdict(md) !== run.verdict) problems.push(id + " report verdict " + extractVerdict(md) + " != " + run.verdict);
+        for (const m of md.matchAll(/!\\[[^\\]]*\\]\\(([^)]+)\\)/g)) {
+          if (!fs.existsSync(path.join(repo, "qa", m[1]))) problems.push(id + " broken image " + m[1]);
+        }
+      }
+      console.log(JSON.stringify({ problems, legacy, gitRepo: fs.existsSync(path.join(repo, ".git")) }));
+    `);
+    expect(res.problems).toEqual([]);
+    expect(res.legacy).toBe(2);
+    expect(res.gitRepo).toBe(true);
   });
 
   test("the batch has one Android and one iOS lane, and the infra failure, retry and derived verdict are linked as the app expects", async () => {

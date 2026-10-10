@@ -194,6 +194,16 @@ describe("enqueue validation", () => {
     expect(err).toMatchObject({ status: 400, message: "device emulator-9999 not connected" });
   });
 
+  test("a serial that belongs to a device of another platform names both platforms and the field to set", async () => {
+    const env = setup({ devices: [emulator("emulator-5556")] });
+    const err = await env.scheduler
+      .enqueueRun({ projectId: "test-proj", title: "t", brief: "b", device: { serial: "emulator-5556", platform: "ios" } })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(HttpError);
+    expect(err).toMatchObject({ status: 400, message: "device emulator-5556 is an android device; this run targets ios (set device.platform)" });
+    expect(env.scheduler.queue).toEqual([]);
+  });
+
   test("explicit serial excluded in config", async () => {
     const env = setup({ devices: [emulator("emulator-5999")] });
     const err = await env.scheduler
@@ -409,6 +419,17 @@ describe("retry", () => {
     expect(first.retriedBy).toBe(next.id);
     await settle(env.scheduler);
     expect(env.started.at(-1)).toEqual([next.id, { serial: "emulator-5556" }]);
+  });
+
+  test("new, re-run and retried runs store their artefacts in the data dir, even when the source run is a legacy repo run", async () => {
+    const env = setup();
+    const first = await env.scheduler.enqueueRun({ projectId: "test-proj", title: "storage", brief: "b", device: { platform: "android" } });
+    expect(first.storage).toBe("data");
+    first.storage = "repo";
+    first.status = "error";
+    first.errorKind = "infra";
+    expect((await env.scheduler.rerun(first.id, { only: "all" })).storage).toBe("data");
+    expect(env.scheduler.retry(first).storage).toBe("data");
   });
 });
 

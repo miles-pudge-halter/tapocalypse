@@ -72,7 +72,6 @@ describe("detectProject", () => {
       defaultPlatform: "android",
       defaultPackage: "com.example.shop.dev",
       personaFile: null,
-      reportsDir: "qa",
     });
   });
 
@@ -137,7 +136,7 @@ describe("detectProject", () => {
     expect(d.isGitRepo).toBe(false);
     expect(d.framework).toBe("unknown");
     expect(d.androidPackages).toEqual([]);
-    expect(d.suggestion.reportsDir).toBe("qa");
+    expect("reportsDir" in d.suggestion).toBe(false);
     expect(d.suggestion.defaultPackage).toBeNull();
   });
 
@@ -153,7 +152,7 @@ describe("detectProject", () => {
     expect((await detectProject(root)).isGitRepo).toBe(true);
   });
 
-  test("persona candidates need qa/test in the name; reports dirs must exist", async () => {
+  test("persona candidates need qa/test in the name; report folders are no longer detected", async () => {
     const root = fixture("personas", {
       ".omp/agents/mobile-qa.md": "---\nmodel: a/b\n---\nbody",
       ".omp/agents/reviewer.md": "body",
@@ -170,9 +169,9 @@ describe("detectProject", () => {
     expect(d.personaCandidates.indexOf(".omp/agents/smoke-test.md")).toBeGreaterThan(
       d.personaCandidates.indexOf(".claude/agents/qa-bot.md"),
     );
-    expect(d.reportsDirCandidates).toEqual(["qa", "docs/qa"]);
     expect(d.suggestion.personaFile).toBe(".omp/agents/mobile-qa.md");
-    expect(d.suggestion.reportsDir).toBe("qa");
+    expect("reportsDirCandidates" in d).toBe(false);
+    expect("reportsDir" in d.suggestion).toBe(false);
   });
 
   test("lists Codex persona files after the omp and Claude ones", async () => {

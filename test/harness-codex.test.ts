@@ -441,6 +441,15 @@ describe("codex spawn", () => {
     expect(cmd).toContain("sandbox_workspace_write.network_access=true");
   });
 
+  test("workspace-write makes the run's screenshots folder writable; the default sandbox adds no writable roots", () => {
+    const { spawn, calls } = fakeSpawn();
+    const restricted = makeOpts({ settings: { sandbox: "workspace-write" } }).opts;
+    createCodexHarness({ spawn }).spawn(restricted);
+    createCodexHarness({ spawn }).spawn(makeOpts().opts);
+    expect(calls[0].cmd).toContain(`sandbox_workspace_write.writable_roots=[${JSON.stringify(path.join(restricted.runDir, "screenshots"))}]`);
+    expect(calls[1].cmd.some((a) => a.startsWith("sandbox_workspace_write."))).toBe(false);
+  });
+
   test("an unknown sandbox setting fails the session instead of widening access", async () => {
     const { spawn, calls } = fakeSpawn();
     const session = createCodexHarness({ spawn }).spawn(makeOpts({ settings: { sandbox: "yolo" } }).opts);

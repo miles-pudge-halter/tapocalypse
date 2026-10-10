@@ -15,19 +15,16 @@ export interface Detection {
   androidPackages: string[];
   iosBundleIds: string[];
   personaCandidates: string[];
-  reportsDirCandidates: string[];
   suggestion: {
     id: string;
     name: string;
     defaultPlatform: Platform;
     defaultPackage: string | null;
     personaFile: string | null;
-    reportsDir: string;
   };
 }
 
 const MAX_READ_BYTES = 4 * 1024 * 1024;
-const REPORTS_DIR_CANDIDATES = ["qa", "docs/qa", "test/qa", "reports/qa"];
 const PERSONA_DIRS = [".omp/agents", ".claude/agents", ".codex/agents"];
 const ANDROID_APP_DIRS = ["android/app", "app", "androidApp", "composeApp"];
 const XCODE_PARENT_DIRS = ["", "ios", "iosApp"];
@@ -335,14 +332,12 @@ function emptyDetection(repoPath: string, exists: boolean): Detection {
     androidPackages: [],
     iosBundleIds: [],
     personaCandidates: [],
-    reportsDirCandidates: [],
     suggestion: {
       id: slugify(name),
       name,
       defaultPlatform: "android",
       defaultPackage: null,
       personaFile: null,
-      reportsDir: "qa",
     },
   };
 }
@@ -376,7 +371,6 @@ function detectSync(repoPath: string): Omit<Detection, "isGitRepo"> {
   const name = detectName(root, framework) ?? expo.name;
   const suggestedName = name ?? "Project";
   const personas = personaCandidates(root);
-  const reportsDirs = REPORTS_DIR_CANDIDATES.filter((d) => isDir(path.join(root, d)));
   const defaultPlatform: Platform = platforms.includes("android") || !platforms.includes("ios") ? "android" : "ios";
   const suggestedPackages = defaultPlatform === "android" ? androidPackages : iosBundleIds;
 
@@ -389,14 +383,12 @@ function detectSync(repoPath: string): Omit<Detection, "isGitRepo"> {
     androidPackages,
     iosBundleIds,
     personaCandidates: personas,
-    reportsDirCandidates: reportsDirs,
     suggestion: {
       id: slugify(suggestedName),
       name: suggestedName,
       defaultPlatform,
       defaultPackage: suggestedPackages.find((id) => DEV_SUFFIX.test(id)) ?? suggestedPackages[0] ?? null,
       personaFile: personas[0] ?? null,
-      reportsDir: reportsDirs[0] ?? "qa",
     },
   };
 }

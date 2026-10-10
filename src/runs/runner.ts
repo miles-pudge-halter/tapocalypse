@@ -20,6 +20,7 @@ import {
   type ReplayContext,
 } from "../harness/types";
 import { getProject, type Project, resolvePersonaPath } from "../projects/registry";
+import { screenshotsDir } from "./artefacts";
 import { type Outcome, classifyExit, deriveVerdict, hasResolvedCheck, parseDurationMs, UsageTotals } from "./outcome";
 import { ProgressRecorder } from "./progress";
 import { buildPrompt, loadPersona, type Persona, splitThinking } from "./prompt";
@@ -146,9 +147,6 @@ export function createRunner(scheduler: RunnerScheduler, deps: RunnerDeps = {}):
         run.verdictSource = "derived";
         run.summary = outcome.derived.summary;
       }
-      // The agent may have written its report before dying.
-      const report = `${ctx.project.reportsDir}/QA-REPORT-${run.id}.md`;
-      if (!run.reportPath && existsSync(path.join(ctx.project.repoPath, report))) run.reportPath = report;
     }
     run.usage ??= ctx.usage.snapshot(run.model);
     run.endedAt ??= new Date().toISOString();
@@ -477,7 +475,9 @@ export function createRunner(scheduler: RunnerScheduler, deps: RunnerDeps = {}):
     run.effort = effort;
     if (harness.id === "omp") run.thinking = effort;
     mkdirSync(path.join(dir, "session"), { recursive: true });
-    mkdirSync(path.join(project.repoPath, project.reportsDir), { recursive: true });
+    mkdirSync(screenshotsDir(run.id), { recursive: true });
+    // A run queued by an older version still says "repo", but it has no artefacts yet and the agent is told to write into the data dir.
+    run.storage = "data";
     writeFileSync(path.join(dir, "brief.md"), run.brief);
     const personaFile = path.join(dir, "persona.md");
     writeFileSync(personaFile, persona.body);
@@ -546,7 +546,7 @@ export function createRunner(scheduler: RunnerScheduler, deps: RunnerDeps = {}):
     // A cancel, shutdown or exit (session that never ran) during ready()/the PR wait must not start a paid turn.
     if (ctx.cancelRequested || shuttingDown || ctx.finalized) return;
     await session.send(
-      buildPrompt(run, project, (server, tool) => session.toolName(server, tool), {
+      buildPrompt(run, (server, tool) => session.toolName(server, tool), {
         runMaxTime: config.runMaxTime,
         prependPersona: harness.capabilities.appendSystemPrompt ? null : persona.body,
       }),
@@ -587,6 +587,7 @@ export function createRunner(scheduler: RunnerScheduler, deps: RunnerDeps = {}):
         },
         log: (kind, text, extra) => log(run, kind, text, extra),
         repoPath: project.repoPath,
+        runDir: runDir(run.id),
       }),
       token: null,
     };

@@ -12,6 +12,9 @@ import {
   resolveUnder,
   rewriteLinks,
 } from "../src/reports/reports";
+import { runArtefactDir } from "../src/runs/artefacts";
+import { createRun, deleteRun } from "../src/runs/store";
+import type { Run } from "../src/runs/types";
 
 let tmp: string;
 let root: string;
@@ -60,7 +63,7 @@ beforeAll(() => {
   fs.writeFileSync(path.join(root, "qa", `QA-REPORT-${RUN_ID}.md`), "# Run report\n\n## Findings\n");
   fs.writeFileSync(path.join(root, "qa", "QA-REPORT-20200101-000000-dead-gone.md"), "# Gone run\n");
   fs.mkdirSync(path.join(DATA_DIR, "runs", RUN_ID), { recursive: true });
-  fs.writeFileSync(path.join(DATA_DIR, "runs", RUN_ID, "run.json"), JSON.stringify({ id: RUN_ID, projectId: "pid" }));
+  fs.writeFileSync(path.join(DATA_DIR, "runs", RUN_ID, "run.json"), JSON.stringify({ id: RUN_ID, projectId: "pid", createdAt: "2026-01-01T12:00:00.000Z", checks: [] }));
   fs.utimesSync(path.join(root, "qa", "old.md"), new Date(2020, 0, 1), new Date(2020, 0, 1));
   project = {
     id: "pid",
@@ -219,6 +222,111 @@ describe("renderReport", () => {
     for (const name of ["../secret.md", "..\\secret.md", "missing.md", "notes.txt"]) {
       expect(() => renderReport(project, name)).toThrow(expect.objectContaining({ status: 404 }));
     }
+  });
+});
+
+describe("reports of runs stored in the data dir", () => {
+  const dataProject = (): Project => ({ ...project, id: "pid-data" });
+  const created: string[] = [];
+
+  function dataRun(md: string | null, over: Partial<Run> = {}): Run {
+    const run = createRun({
+      projectId: "pid-data",
+      title: "Data run",
+      brief: "b",
+      requestedBy: "test",
+      deviceRequest: { platform: "android" },
+      deviceSerial: null,
+      bootedByRun: false,
+      backend: "mobile-mcp",
+      packageId: "com.x",
+      status: "done",
+      verdict: "PASS",
+      summary: "s",
+      reportPath: md === null ? null : "report.md",
+      checks: [],
+      error: null,
+      startedAt: null,
+      endedAt: null,
+      stats: null,
+      transcriptHtml: false,
+      source: null,
+      build: null,
+      storage: "data",
+      ...over,
+    });
+    created.push(run.id);
+    if (md !== null) fs.writeFileSync(path.join(runArtefactDir(run.id), "report.md"), md);
+    return run;
+  }
+
+  afterAll(() => {
+    for (const id of created) deleteRun(id);
+  });
+
+  test("listReports merges data runs (named by run id) with the legacy folder, newest first", () => {
+    const withReport = dataRun("# Data report\n\n**Verdict: FAIL**\n", { title: "Data report", verdict: "FAIL" });
+    const later = new Date(Date.now() + 60_000);
+    fs.utimesSync(path.join(runArtefactDir(withReport.id), "report.md"), later, later);
+    fs.writeFileSync(path.join(root, "qa", "legacy-only.md"), "# Legacy only\n");
+    const list = listReports(dataProject());
+    expect(list[0]).toMatchObject({
+      name: withReport.id,
+      title: "Data report",
+      verdict: "FAIL",
+      runId: withReport.id,
+      path: path.join(runArtefactDir(withReport.id), "report.md"),
+    });
+    expect(list.map((r) => r.name)).toContain("legacy-only.md");
+    expect(list.find((r) => r.name === "legacy-only.md")).toMatchObject({ runId: null, path: path.join(root, "qa", "legacy-only.md") });
+  });
+
+  test("runs without a stored report, legacy-storage runs and other projects' runs are not listed", () => {
+    const none = dataRun(null);
+    const noFile = dataRun("# gone\n");
+    fs.rmSync(path.join(runArtefactDir(noFile.id), "report.md"));
+    const legacy = dataRun("# legacy storage\n", { storage: "repo" });
+    const other = dataRun("# other\n", { projectId: "someone-else" });
+    const names = listReports(dataProject()).map((r) => r.name);
+    for (const run of [none, noFile, legacy, other]) expect(names).not.toContain(run.id);
+  });
+
+  test("a data report's title and verdict come from the run record, not from the markdown", () => {
+    const run = dataRun("# Heading in the file\n\n**Verdict: FAIL**\n", { title: "Checkout flow", verdict: "BLOCKED" });
+    expect(listReports(dataProject()).find((r) => r.name === run.id)).toMatchObject({ title: "Checkout flow", verdict: "BLOCKED" });
+  });
+
+  test("a run without a title is listed under the first heading of its report", () => {
+    const run = dataRun("Intro line\n\n# **Real** title\n\nbody\n", { title: "", verdict: null });
+    expect(listReports(dataProject()).find((r) => r.name === run.id)).toMatchObject({ title: "Real title", verdict: null });
+    const bare = dataRun("No heading at all.\n", { title: "" });
+    expect(listReports(dataProject()).find((r) => r.name === bare.id)?.title).toBe(bare.id);
+  });
+
+  test("renderReport takes a run id and serves its images from the run's files route", () => {
+    const run = dataRun("# Shots\n\n**Verdict: PASS**\n\n![home](screenshots/01-home.png)\n\n[other](other.md)\n");
+    const r = renderReport(dataProject(), run.id);
+    expect(r).toMatchObject({ name: run.id, title: "Shots", verdict: "PASS", runId: run.id });
+    expect(r.path).toBe(fs.realpathSync(path.join(runArtefactDir(run.id), "report.md")));
+    expect(r.images).toEqual([{ src: `/api/runs/${run.id}/files/screenshots/01-home.png`, alt: "home" }]);
+    expect(r.html).not.toContain("/files/pid-data/");
+  });
+
+  test("renderReport rejects unknown run ids, runs of another project and runs without a report", () => {
+    const mine = dataRun(null);
+    const foreign = dataRun("# f\n", { projectId: "someone-else" });
+    for (const name of ["20200101-000000-dead-nothing", mine.id, foreign.id, "..", "a/b"]) {
+      expect(() => renderReport(dataProject(), name)).toThrow(expect.objectContaining({ status: 404 }));
+    }
+  });
+
+  test("rewriteLinks points a data run's images at its run files route and leaves legacy links alone", () => {
+    const html = '<img src="screenshots/a b.png"><a href="screenshots/../../etc/passwd">p</a><a href="https://e.com">e</a>';
+    const out = rewriteLinks(html, "pid", "run-1");
+    expect(out).toContain('src="/api/runs/run-1/files/screenshots/a%20b.png"');
+    expect(out).toContain('href="screenshots/../../etc/passwd"');
+    expect(out).toContain('href="https://e.com"');
+    expect(rewriteLinks('<img src="screenshots/a.png">', "pid")).toContain('src="/files/pid/screenshots/a.png"');
   });
 });
 

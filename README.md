@@ -10,7 +10,7 @@
   <img alt="Runs on omp • Claude Code • Codex" src="https://img.shields.io/badge/runs%20on-omp%20%E2%80%A2%20Claude%20Code%20%E2%80%A2%20Codex-f59e0b?style=flat-square&labelColor=1c1917">
 </p>
 
-Tapocalypse is a local console for agent-driven mobile QA. You give it a brief ("open Settings, toggle dark mode, verify it survives a restart"). A headless coding agent drives your app on a real emulator or simulator, reports every check live, and writes a markdown report with screenshots into your repo. The agent runs on the CLI you already use, [omp](https://github.com/can1357/oh-my-pi), [Claude Code](https://code.claude.com) or [Codex CLI](https://github.com/openai/codex), with whatever model or subscription it is signed in to. Start runs from the web UI, the command line, CI, or over [MCP](https://modelcontextprotocol.io) from the coding agent that just changed your code.
+Tapocalypse is a local console for agent-driven mobile QA. You give it a brief ("open Settings, toggle dark mode, verify it survives a restart"). A headless coding agent drives your app on a real emulator or simulator, reports every check live, and writes a markdown report with screenshots that Tapocalypse keeps in its own data folder, never in your repo. The agent runs on the CLI you already use, [omp](https://github.com/can1357/oh-my-pi), [Claude Code](https://code.claude.com) or [Codex CLI](https://github.com/openai/codex), with whatever model or subscription it is signed in to. Start runs from the web UI, the command line, CI, or over [MCP](https://modelcontextprotocol.io) from the coding agent that just changed your code.
 
 <picture>
   <source media="(prefers-color-scheme: light)" srcset="docs/images/runs-light.png">
@@ -37,14 +37,14 @@ flowchart LR
   agent --> mcp["mobile-mcp<br/>tap · type · screenshot"]
   mcp --> device
   agent --> progress["Checks<br/>pass · fail · evidence"]
-  progress --> result["Verdict + markdown report<br/>in your repo"]
+  progress --> result["Verdict + markdown report<br/>in Tapocalypse's data folder"]
 ```
 
 1. **Brief.** Pick a project (your app's repo), write what to test and what counts as a failure, and pick a platform or a specific device.
 2. **Device.** The scheduler assigns a free emulator or simulator, or boots one from your configured AVDs and simulators. If everything is busy, the run waits in a queue and says why.
-3. **Agent.** A headless QA agent starts inside your repo and drives the app through [mobile-mcp](https://github.com/mobile-next/mobile-mcp): taps, typing, screenshots, `adb` and `simctl`.
+3. **Agent.** A headless QA agent starts inside your repo (reading only: it is told never to write there) and drives the app through [mobile-mcp](https://github.com/mobile-next/mobile-mcp): taps, typing, screenshots, `adb` and `simctl`.
 4. **Checks.** The agent declares its checks up front and reports each one as it goes. You watch them turn pending → running → pass/fail next to a live device screen and the agent's activity feed. Cancel at any time; steer it on omp and Claude Code.
-5. **Verdict.** The agent writes `QA-REPORT-<run-id>.md` with screenshots into your repo (`qa/` by default) and ends with `PASS`, `PASS WITH ISSUES`, `FAIL`, `BLOCKED` or `PARTIAL`, plus a summary and what it cost.
+5. **Verdict.** The agent hands in a markdown report; with its screenshots it is stored in `<data dir>/runs/<run-id>/` (`report.md`, `screenshots/`), and the run ends with `PASS`, `PASS WITH ISSUES`, `FAIL`, `BLOCKED` or `PARTIAL`, plus a summary and what it cost. Read it in the UI, with `qa_get_report` / `qa_get_screenshots`, or `tapocalypse report <run-id>`; copy it anywhere with `qa_export` or `tapocalypse report <run-id> --export <dir>`.
 
 Details: [run outcomes](docs/guide.md#run-outcomes), [devices](docs/guide.md#devices) and [what happens under the hood](docs/guide.md#how-it-works).
 
@@ -81,7 +81,11 @@ cd tapocalypse
 bun install
 bun run doctor     # fix anything marked ✗
 bun start          # → tapocalypse listening on http://127.0.0.1:4310
+# or keep it running in the background and start it at login (macOS, Linux):
+bun src/cli.ts service install
 ```
+
+`service install` keeps Tapocalypse running in the background and starts it at login, so your coding agent's MCP calls always find it; `service status|logs|stop|uninstall` manage it ([details](docs/guide.md#running-as-a-service)). On Windows, or if you prefer a foreground server, use `bun start`.
 
 1. Open <http://127.0.0.1:4310>. The **Setup** page walks you through the rest and ticks itself off.
 2. Start an emulator or simulator with your app installed, or list an AVD in `devicePool.android.avds` and let Tapocalypse boot it ([Devices](docs/guide.md#devices)).
@@ -98,7 +102,7 @@ Let your coding agent do the setup. Paste this into omp, Claude Code, Codex, Cur
 Set up Tapocalypse for this repo: read https://raw.githubusercontent.com/miles-pudge-halter/tapocalypse/main/docs/agent-setup.md and follow it.
 ```
 
-The agent follows [docs/agent-setup.md](docs/agent-setup.md). It checks the prerequisites and tells you exactly what is missing, clones and installs Tapocalypse, runs the doctor, starts the server in the background on port 4310, registers the MCP server in its own harness, detects your app and registers it as a project, confirms a device is ready, and runs one short smoke test. It finishes with the run URL and the verdict. The smoke run costs real tokens on your agent runtime: one short session.
+The agent follows [docs/agent-setup.md](docs/agent-setup.md). It checks the prerequisites and tells you exactly what is missing, clones and installs Tapocalypse, runs the doctor, installs and starts the server as a background service on port 4310, registers the MCP server in its own harness, detects your app and registers it as a project, confirms a device is ready, and runs one short smoke test. It finishes with the run URL and the verdict. The smoke run costs real tokens on your agent runtime: one short session.
 
 **Connect an agent by hand.** The **Setup** page shows these snippets with a live "connected" indicator.
 
@@ -114,9 +118,9 @@ The agent follows [docs/agent-setup.md](docs/agent-setup.md). It checks the prer
 1. Calls `qa_list_projects` to find the project id (or `qa_detect_project` + `qa_create_project` the first time).
 2. Calls `qa_start_run { projectId, title, brief, requester, source: { path: "<its cwd>" } }`, so the run records its branch, commit and PR.
 3. Calls `qa_wait_run { runId }` until `timedOut` is `false`, narrating the checks as they resolve.
-4. Reads the verdict and the report (`qa_get_report`), fixes what failed, then confirms with `qa_rerun { runId, only: "failed" }`.
+4. Reads the verdict and the report (`qa_get_report`, with the screenshots from `qa_get_screenshots`), fixes what failed, then confirms with `qa_rerun { runId, only: "failed" }`.
 
-Eighteen tools in total, from batches to steering: [MCP reference](docs/guide.md#dispatching-runs-from-your-coding-agent-mcp) and [parameters](docs/api.md#mcp-tools).
+Twenty tools in total, from batches to steering: [MCP reference](docs/guide.md#dispatching-runs-from-your-coding-agent-mcp) and [parameters](docs/api.md#mcp-tools).
 
 ## Runtimes
 

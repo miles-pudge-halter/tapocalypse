@@ -10,7 +10,9 @@ import {
   exitCodeForError,
   exitCodeForRun,
   exitCodeForRuns,
+  executeReport,
   executeRun,
+  executeService,
   formatRun,
   oneLine,
   progressLine,
@@ -20,6 +22,7 @@ import {
   parseFailOn,
   renderJUnit,
   ServerUnreachableError,
+  summarizeRun,
   UsageError,
   type RunDeps,
   type RunLite,
@@ -39,7 +42,7 @@ function run(overrides: Partial<RunLite> = {}): RunLite {
     checks: [],
     startedAt: "2026-01-01T00:00:00.000Z",
     endedAt: "2026-01-01T00:02:00.000Z",
-    reportPath: null,
+    reportFile: null,
     ...overrides,
   };
 }
@@ -103,6 +106,29 @@ describe("parseCli", () => {
   test("serve is production unless --dev is given", () => {
     expect(parseCli(["serve"])).toEqual({ name: "serve", port: null, dev: false });
     expect(parseCli(["serve", "--dev", "--port", "4400"])).toEqual({ name: "serve", port: 4400, dev: true });
+  });
+
+  test("report takes one run id, an optional --export dir (resolved absolute) and --json", () => {
+    expect(parseCli(["report", "r1"])).toEqual({ name: "report", id: "r1", exportDir: null, json: false, url: "http://127.0.0.1:4310" });
+    expect(parseCli(["report", "r1", "--json", "--url", "http://localhost:4400/"])).toMatchObject({ json: true, url: "http://localhost:4400" });
+    expect(parseCli(["report", "r1", "--export", "out/qa"])).toMatchObject({ exportDir: path.resolve("out/qa") });
+    expect(parseCli(["report", "r1", "--export", "/abs/qa"])).toMatchObject({ exportDir: "/abs/qa" });
+    expect(() => parseCli(["report"])).toThrow(UsageError);
+    expect(() => parseCli(["report", "a", "b"])).toThrow(UsageError);
+    expect(() => parseCli(["report", "r1", "--export"])).toThrow(UsageError);
+  });
+
+  test("service takes exactly one known action", () => {
+    for (const action of ["install", "uninstall", "start", "stop", "restart", "status", "logs"] as const) {
+      expect(parseCli(["service", action])).toEqual({ name: "service", action });
+    }
+    expect(() => parseCli(["service"])).toThrow(UsageError);
+    expect(() => parseCli(["service", "reboot"])).toThrow(UsageError);
+    expect(() => parseCli(["service", "start", "stop"])).toThrow(UsageError);
+  });
+
+  test("the unreachable-server hint names the always-on service", () => {
+    expect(new ServerUnreachableError("http://x").message).toContain("tapocalypse service start");
   });
 
   test("help and version short-circuit, even after a command", () => {
@@ -204,7 +230,7 @@ describe("renderJUnit", () => {
     title: 'Login <flow> & "co"',
     verdict: "FAIL",
     summary: "Login broke.",
-    reportPath: "qa/QA-REPORT-r1.md",
+    reportFile: "/data/runs/r1/report.md",
     checks: [
       { id: "C1", title: "Launch", status: "pass", startedAt: "2026-01-01T00:00:00.000Z", endedAt: "2026-01-01T00:00:12.500Z" },
       { id: "C2", title: "Sign in", status: "fail", note: "button <Sign in> missing\nsecond line" },
@@ -229,7 +255,7 @@ describe("renderJUnit", () => {
   test("escapes attributes and carries run metadata", () => {
     expect(xml).toContain('name="Login &lt;flow&gt; &amp; &quot;co&quot;"');
     expect(xml).toContain('<property name="run.url" value="http://127.0.0.1:4310/#/runs/r1"/>');
-    expect(xml).toContain('<property name="report" value="qa/QA-REPORT-r1.md"/>');
+    expect(xml).toContain('<property name="report" value="/data/runs/r1/report.md"/>');
     expect(xml).toContain("<system-out>Login broke.</system-out>");
     // every tag opened is closed: a crude well-formedness check
     expect(xml.match(/<testsuite /g)?.length).toBe(xml.match(/<\/testsuite>/g)?.length);
@@ -269,6 +295,83 @@ describe("terminal output of agent-written text", () => {
     // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional
     expect(out).not.toMatch(/[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/);
     for (const line of out.split("\n")) expect(line.trimStart().startsWith("::")).toBe(false);
+  });
+});
+
+describe("report location", () => {
+  const finished = run({ id: "r9", reportFile: "/data/runs/r9/report.md" });
+
+  test("formatRun and --json print the absolute report path; nothing when the run has none", () => {
+    expect(formatRun(finished, "http://x")).toContain("  report: /data/runs/r9/report.md");
+    expect(formatRun(run(), "http://x")).not.toContain("report:");
+    expect(summarizeRun(finished, "http://x").reportPath).toBe("/data/runs/r9/report.md");
+    expect(summarizeRun(run(), "http://x").reportPath).toBeNull();
+  });
+});
+
+describe("executeReport", () => {
+  let server: Server<undefined>;
+  const exported: unknown[] = [];
+  const io = () => {
+    const out: string[] = [];
+    return { out, io: { out: (t: string) => out.push(t), err: (t: string) => out.push(`ERR ${t}`) } };
+  };
+  const client = () => ({ api: new ApiClient(`http://127.0.0.1:${server.port}`) });
+
+  beforeAll(() => {
+    server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname === "/api/runs/r1") return Response.json(run({ id: "r1", reportFile: "/data/runs/r1/report.md" }));
+        if (url.pathname === "/api/runs/r1/report") return Response.json({ markdown: "# Report\n\nAll good.\n" });
+        if (url.pathname === "/api/runs/r1/export" && req.method === "POST") {
+          exported.push(await req.json());
+          return Response.json({ report: "/out/QA-REPORT-r1.md", screenshots: ["/out/screenshots/01.png", "/out/screenshots/02.png"] });
+        }
+        if (url.pathname === "/api/runs/none") return Response.json(run({ id: "none" }));
+        if (url.pathname === "/api/runs/none/report") return Response.json({ error: "run none has no report" }, { status: 404 });
+        return Response.json({ error: "unknown run" }, { status: 404 });
+      },
+    });
+  });
+  afterAll(() => server.stop(true));
+
+  test("prints the markdown, or the JSON triple with --json", async () => {
+    const text = io();
+    expect(await executeReport({ id: "r1", exportDir: null, json: false }, { ...client(), io: text.io })).toBe(EXIT.OK);
+    expect(text.out).toEqual(["# Report\n\nAll good.\n"]);
+    const json = io();
+    expect(await executeReport({ id: "r1", exportDir: null, json: true }, { ...client(), io: json.io })).toBe(EXIT.OK);
+    expect(JSON.parse(json.out[0]!)).toEqual({ runId: "r1", reportPath: "/data/runs/r1/report.md", markdown: "# Report\n\nAll good.\n" });
+  });
+
+  test("--export posts the absolute directory and lists what was written", async () => {
+    const text = io();
+    expect(await executeReport({ id: "r1", exportDir: "/out", json: false }, { ...client(), io: text.io })).toBe(EXIT.OK);
+    expect(exported).toEqual([{ dir: "/out" }]);
+    expect(text.out.join("\n")).toContain("/out/QA-REPORT-r1.md");
+    expect(text.out.join("\n")).toContain("2 screenshots");
+    const json = io();
+    await executeReport({ id: "r1", exportDir: "/out", json: true }, { ...client(), io: json.io });
+    expect(JSON.parse(json.out[0]!)).toEqual({ report: "/out/QA-REPORT-r1.md", screenshots: ["/out/screenshots/01.png", "/out/screenshots/02.png"] });
+  });
+
+  test("a run without a report fails with the server's message", async () => {
+    await expect(executeReport({ id: "none", exportDir: null, json: false }, { ...client(), io: io().io })).rejects.toThrow("has no report");
+  });
+});
+
+describe("executeService", () => {
+  test("prints the service lines and exits 0 when ok, 2 when not", async () => {
+    const out: string[] = [];
+    const io = { out: (t: string) => out.push(t), err: (t: string) => out.push(`ERR ${t}`) };
+    expect(await executeService("status", async (a) => ({ ok: true, lines: [`${a}: running`, "pid 1"] }), io)).toBe(EXIT.OK);
+    expect(out).toEqual(["status: running", "pid 1"]);
+    out.length = 0;
+    expect(await executeService("start", async () => ({ ok: false, lines: ["not supported"] }), io)).toBe(EXIT.ERROR);
+    expect(out).toEqual(["ERR not supported"]);
   });
 });
 

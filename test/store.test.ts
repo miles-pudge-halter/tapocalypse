@@ -61,6 +61,7 @@ describe("store", () => {
       retriedBy: null,
       rerunOf: null,
       install: null,
+      storage: "repo",
     });
     expect(run.checks).toEqual(OLD_RUN.checks as typeof run.checks);
   });

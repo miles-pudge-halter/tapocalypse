@@ -112,7 +112,13 @@ export function buildCommand(opts: SpawnOptions): string[] {
   const config = [
     `approval_policy=${tomlString("never")}`,
     `developer_instructions=${tomlString(opts.persona)}`,
-    ...(sandbox === "workspace-write" ? ["sandbox_workspace_write.network_access=true"] : []),
+    ...(sandbox === "workspace-write"
+      ? [
+          "sandbox_workspace_write.network_access=true",
+          // Screenshots are saved in the run's data-dir folder, outside the repo the sandbox treats as the workspace.
+          `sandbox_workspace_write.writable_roots=[${tomlString(path.join(opts.runDir, "screenshots"))}]`,
+        ]
+      : []),
     ...opts.mcpServers.flatMap((s) => mcpServerConfig(s, opts.runDir)),
   ];
   const cmd = [bin, "exec", "--json", "--skip-git-repo-check", "-C", opts.cwd, "--sandbox", sandbox];

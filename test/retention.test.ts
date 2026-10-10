@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import fs from "node:fs";
+import path from "node:path";
 import { applyRetention, selectExpiredRuns } from "../src/retention";
 import { getRun, runDir, saveRun } from "../src/runs/store";
 import type { Run, RunStatus } from "../src/runs/types";
@@ -64,6 +65,17 @@ describe("applyRetention", () => {
     expect(getRun(ids[0]!)).toBeNull();
     expect(getRun(ids[1]!)).not.toBeNull();
     expect(getRun(ids[2]!)).not.toBeNull();
+  });
+
+  test("an expired data run takes its report and screenshots with it", () => {
+    const id = ids[0]!;
+    const dir = runDir(id);
+    fs.mkdirSync(path.join(dir, "screenshots"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "report.md"), "# r\n");
+    fs.writeFileSync(path.join(dir, "screenshots", "01.png"), "x");
+    saveRun({ ...run(id, "done", 400), id, projectId: "p", storage: "data", reportPath: "report.md" } as Run);
+    expect(applyRetention({ now: NOW, policy: { days: 30 } })).toContain(id);
+    expect(fs.existsSync(dir)).toBe(false);
   });
 
   test("a run whose runner still holds its device is skipped", () => {

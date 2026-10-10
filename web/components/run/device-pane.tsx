@@ -118,7 +118,7 @@ export function DevicePane({
 }) {
   const deviceLive = run.deviceSerial !== null && (run.status === "preflight" || run.status === "running" || run.status === "finishing");
   const check = selectedCheck ? run.checks.find((c) => c.id === selectedCheck) : undefined;
-  const pinned = check ? screenshotOfCheck(run.projectId, check, gallery) : null;
+  const pinned = check ? screenshotOfCheck(run, check, gallery) : null;
   const showLive = deviceLive && pinned === null;
   const live = useLiveScreen(run.deviceSerial, showLive);
   const still = pinned ?? (showLive ? null : (gallery[gallery.length - 1] ?? null));

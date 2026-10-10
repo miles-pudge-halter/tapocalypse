@@ -48,6 +48,10 @@ export type RunView = Run & {
   queuePosition: number | null;
   durationMs: number | null;
   queueReason: string | null;
+  /** Absolute path of the report on disk (both storages); null when the run has none. */
+  reportFile: string | null;
+  /** Absolute artefact folder of the run in Tapocalypse's data dir (report + screenshots). */
+  runDir: string;
 };
 
 export interface BatchView {
@@ -140,6 +144,8 @@ export interface ReportEntry {
   verdict: Verdict | null;
   mtime: string;
   runId: string | null;
+  /** Absolute path of the markdown file on disk. */
+  path: string;
 }
 export interface ReportHeading {
   level: 2 | 3;
@@ -342,19 +348,35 @@ export function screenUrl(serial: string, tick: number): string {
   return `/api/devices/${encodeURIComponent(serial)}/screen.png?t=${tick}`;
 }
 
-/** `repoRelPath` is relative to the project repo (`<reportsDir>/...`); the file route is rooted at reportsDir. */
-export function screenshotUrl(projectId: string, repoRelPath: string): string {
-  const rest = repoRelPath.split("/").filter(Boolean).slice(1).map(encodeURIComponent).join("/");
-  return `/files/${encodeURIComponent(projectId)}/${rest}`;
+/** The run fields that decide where its artefacts live (`storage`) and how they are addressed. */
+export type ArtefactRun = Pick<Run, "id" | "projectId" | "storage">;
+
+/**
+ * Image URL for a check screenshot. Data runs (`storage: "data"`) keep `rel` (`screenshots/<name>`) relative to their
+ * artefact folder in Tapocalypse's data dir; legacy runs hold a repo-relative path whose first segment is the project's
+ * reports dir, which the legacy file route is rooted at.
+ */
+export function screenshotUrl(run: ArtefactRun, rel: string): string {
+  const segments = rel.split("/").filter(Boolean);
+  if (run.storage === "data") {
+    return `/api/runs/${encodeURIComponent(run.id)}/files/${segments.map(encodeURIComponent).join("/")}`;
+  }
+  return `/files/${encodeURIComponent(run.projectId)}/${segments.slice(1).map(encodeURIComponent).join("/")}`;
 }
 
 export function transcriptUrl(runId: string): string {
   return `/api/runs/${encodeURIComponent(runId)}/transcript`;
 }
 
-export function reportHash(projectId: string, reportPath: string): string {
-  const base = reportPath.split("/").pop() ?? reportPath;
-  return `#/p/${encodeURIComponent(projectId)}/reports/${encodeURIComponent(base)}`;
+/** Hash route of a report by the name the server lists it under (a run id for data runs, a file name for legacy ones). */
+export function reportEntryHash(projectId: string, name: string): string {
+  return `#/p/${encodeURIComponent(projectId)}/reports/${encodeURIComponent(name)}`;
+}
+
+/** Hash route of a run's report: data runs are keyed by run id, legacy runs by the report file's basename. */
+export function reportHash(projectId: string, run: Pick<Run, "id" | "storage" | "reportPath">): string {
+  const name = run.storage === "data" ? run.id : (run.reportPath?.split("/").pop() ?? run.id);
+  return reportEntryHash(projectId, name);
 }
 
 export function runHash(id: string, checkId?: string): string {

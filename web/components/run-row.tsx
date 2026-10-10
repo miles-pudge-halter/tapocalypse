@@ -225,7 +225,7 @@ export function RunActions({ run, onChanged }: { run: RunView; onChanged(): void
             </>
           )}
           {run.reportPath && (
-            <DropdownMenuItem onSelect={() => navigate(reportHash(run.projectId, run.reportPath ?? ""))}>
+            <DropdownMenuItem onSelect={() => navigate(reportHash(run.projectId, run))}>
               <FileText />
               Open report
             </DropdownMenuItem>
@@ -250,7 +250,7 @@ export function RunActions({ run, onChanged }: { run: RunView; onChanged(): void
           <DialogHeader>
             <DialogTitle>Delete this run?</DialogTitle>
             <DialogDescription>
-              “{run.title}” and its transcript are removed from Tapocalypse. Reports in your repository are not touched.
+              “{run.title}” and its transcript are removed from Tapocalypse, along with its report and screenshots when Tapocalypse stores them. Reports in your repository are not touched.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>

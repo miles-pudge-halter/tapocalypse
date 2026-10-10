@@ -5,17 +5,21 @@ import path from "node:path";
 import { z } from "zod";
 import type { ProgressSink } from "../src/harness/types";
 import { handleRunMcp } from "../src/mcp/run-server";
-import { type ProgressRecorderOptions, type ProgressRun, ProgressRecorder } from "../src/runs/progress";
+import { PROGRESS_TOOLS, type ProgressRecorderOptions, type ProgressRun, ProgressRecorder, QaCheckArgs, QaFinishArgs, QaPlanArgs } from "../src/runs/progress";
 import type { CheckStatus } from "../src/runs/types";
 
 let repo: string;
 let outside: string;
+let runsRoot: string;
+let runCounter = 0;
+const PNG = Buffer.concat([Buffer.from("89504e470d0a1a0a", "hex"), Buffer.from("pixels")]);
 
 beforeAll(() => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "tpc-progress-")));
   repo = path.join(root, "repo");
   outside = path.join(root, "outside");
-  fs.mkdirSync(path.join(repo, "qa"), { recursive: true });
+  fs.mkdirSync(path.join(repo, "qa", "shots"), { recursive: true });
+  runsRoot = path.join(root, "runs");
   fs.mkdirSync(outside);
   fs.symlinkSync(outside, path.join(repo, "escape"));
 });
@@ -30,6 +34,7 @@ interface Logged {
 
 function fixture(status: ProgressRun["status"] = "running") {
   const run: ProgressRun = { status, checks: [], verdict: null, verdictSource: null, summary: null, reportPath: null };
+  const runDir = path.join(runsRoot, `run-${++runCounter}`);
   const logged: Logged[] = [];
   let updates = 0;
   const options: ProgressRecorderOptions = {
@@ -40,8 +45,9 @@ function fixture(status: ProgressRun["status"] = "running") {
     },
     log: (kind, text, extra) => logged.push({ kind, text, extra }),
     repoPath: repo,
+    runDir,
   };
-  return { run, logged, recorder: new ProgressRecorder(options), updates: () => updates };
+  return { run, runDir, logged, recorder: new ProgressRecorder(options), updates: () => updates };
 }
 
 describe("ProgressRecorder", () => {
@@ -56,17 +62,28 @@ describe("ProgressRecorder", () => {
     expect(logged).toEqual([{ kind: "check", text: "Test plan: 2 checks", extra: undefined }]);
   });
 
-  test("qa_check updates status, timestamps, note and a repo-relative screenshot, and logs it", async () => {
+  test("qa_check updates status, timestamps and note, and logs it", async () => {
     const { run, logged, recorder } = fixture();
     await recorder.record("qa_plan", { checks: [{ id: "C1", title: "Login" }] });
     await recorder.record("qa_check", { id: "C1", status: "running" });
     expect(run.checks[0]!.startedAt).toBeDefined();
     expect(run.checks[0]!.endedAt).toBeUndefined();
-    await recorder.record("qa_check", { id: "C1", status: "pass", note: "ok", screenshot: "qa/./shots/../shot.png" });
+    await recorder.record("qa_check", { id: "C1", status: "pass", note: "ok" });
     const c = run.checks[0]!;
-    expect(c).toMatchObject({ status: "pass", note: "ok", screenshot: "qa/shot.png", title: "Login" });
+    expect(c).toMatchObject({ status: "pass", note: "ok", title: "Login" });
+    expect(c.screenshot).toBeUndefined();
     expect(c.endedAt).toBeDefined();
     expect(logged.at(-1)).toEqual({ kind: "check", text: "C1: pass — ok", extra: { checkId: "C1", checkStatus: "pass" } });
+  });
+
+  test("qa_check copies a repo-relative screenshot into the run's screenshots folder and tells the agent its stored name", async () => {
+    const { run, runDir, recorder } = fixture();
+    fs.writeFileSync(path.join(repo, "qa", "shots", "01 home!.png"), PNG);
+    const out = await recorder.record("qa_check", { id: "C1", status: "pass", screenshot: "qa/./shots/../shots/01 home!.png" });
+    expect(run.checks[0]!.screenshot).toBe("screenshots/01_home_.png");
+    expect(out).toBe("recorded C1 pass; screenshot stored as screenshots/01_home_.png (reference it in the report as screenshots/01_home_.png)");
+    expect(fs.readFileSync(path.join(runDir, "screenshots", "01_home_.png"))).toEqual(PNG);
+    expect(fs.existsSync(path.join(repo, "qa", "shots", "01 home!.png"))).toBe(true);
   });
 
   test("qa_check for an undeclared id adds the check", async () => {
@@ -88,28 +105,122 @@ describe("ProgressRecorder", () => {
     expect(updates()).toBe(0);
   });
 
+  test("qa_check dedupes colliding names, reuses an identical re-attached image and accepts absolute paths", async () => {
+    const { run, runDir, recorder } = fixture();
+    fs.mkdirSync(path.join(repo, "qa", "other"), { recursive: true });
+    const other = Buffer.concat([PNG, Buffer.from("different")]);
+    fs.writeFileSync(path.join(repo, "qa", "shots", "a.png"), PNG);
+    fs.writeFileSync(path.join(repo, "qa", "other", "a.png"), other);
+    await recorder.record("qa_check", { id: "C1", status: "running", screenshot: "qa/shots/a.png" });
+    await recorder.record("qa_check", { id: "C1", status: "pass", screenshot: "qa/shots/a.png" });
+    expect(run.checks[0]!.screenshot).toBe("screenshots/a.png");
+    const out = await recorder.record("qa_check", { id: "C2", status: "pass", screenshot: path.join(repo, "qa", "other", "a.png") });
+    expect(run.checks[1]!.screenshot).toBe("screenshots/a-2.png");
+    expect(out).toContain("screenshots/a-2.png");
+    expect(fs.readdirSync(path.join(runDir, "screenshots")).sort()).toEqual(["a-2.png", "a.png"]);
+    expect(fs.readFileSync(path.join(runDir, "screenshots", "a-2.png"))).toEqual(other);
+  });
+
+  test("qa_check does not copy an image the agent already saved into the screenshots folder", async () => {
+    const { run, runDir, recorder } = fixture();
+    fs.mkdirSync(path.join(runDir, "screenshots"), { recursive: true });
+    fs.writeFileSync(path.join(runDir, "screenshots", "01-launch.png"), PNG);
+    const out = await recorder.record("qa_check", { id: "C1", status: "pass", screenshot: path.join(runDir, "screenshots", "01-launch.png") });
+    expect(run.checks[0]!.screenshot).toBe("screenshots/01-launch.png");
+    expect(out).toContain("screenshot stored as screenshots/01-launch.png");
+    expect(fs.readdirSync(path.join(runDir, "screenshots"))).toEqual(["01-launch.png"]);
+  });
+
+  test("qa_check rejects missing files, non-image content and non-image extensions, and records nothing", async () => {
+    const { run, logged, runDir, recorder, updates } = fixture();
+    fs.writeFileSync(path.join(repo, "qa", "shots", "fake.png"), "<html>not an image</html>");
+    fs.writeFileSync(path.join(repo, "qa", "shots", "notes.txt"), PNG);
+    fs.writeFileSync(path.join(repo, "qa", "shots", "tiny.png"), "");
+    await expect(recorder.record("qa_check", { id: "C1", status: "pass", screenshot: "qa/shots/none.png" })).rejects.toThrow("not found");
+    await expect(recorder.record("qa_check", { id: "C1", status: "pass", screenshot: "/definitely/not/here.png" })).rejects.toThrow("not found");
+    await expect(recorder.record("qa_check", { id: "C1", status: "pass", screenshot: "qa/shots/fake.png" })).rejects.toThrow("not a valid image");
+    await expect(recorder.record("qa_check", { id: "C1", status: "pass", screenshot: "qa/shots/tiny.png" })).rejects.toThrow("not a valid image");
+    await expect(recorder.record("qa_check", { id: "C1", status: "pass", screenshot: "qa/shots/notes.txt" })).rejects.toThrow("must be a");
+    expect(run.checks).toEqual([]);
+    expect(logged).toEqual([]);
+    expect(updates()).toBe(0);
+    expect(fs.existsSync(path.join(runDir, "screenshots", "fake.png"))).toBe(false);
+  });
+
+  test("qa_check recognises every supported image format by its magic bytes", async () => {
+    const { run, recorder } = fixture();
+    const formats: [string, Buffer][] = [
+      ["jpeg-shot.jpg", Buffer.from("ffd8ffe000104a464946", "hex")],
+      ["gif-shot.gif", Buffer.from("GIF89a....")],
+      ["webp-shot.webp", Buffer.concat([Buffer.from("RIFF"), Buffer.from([1, 2, 3, 4]), Buffer.from("WEBPVP8 ")])],
+    ];
+    for (const [i, [name, bytes]] of formats.entries()) {
+      fs.writeFileSync(path.join(repo, "qa", "shots", name), bytes);
+      await recorder.record("qa_check", { id: `F${i}`, status: "pass", screenshot: `qa/shots/${name}` });
+    }
+    expect(run.checks.map((c) => c.screenshot)).toEqual(["screenshots/jpeg-shot.jpg", "screenshots/gif-shot.gif", "screenshots/webp-shot.webp"]);
+    fs.writeFileSync(path.join(repo, "qa", "shots", "riff.webp"), Buffer.concat([Buffer.from("RIFF"), Buffer.from([1, 2, 3, 4]), Buffer.from("WAVEfmt ")]));
+    await expect(recorder.record("qa_check", { id: "W", status: "pass", screenshot: "qa/shots/riff.webp" })).rejects.toThrow("not a valid image");
+  });
+
   test("invalid arguments throw a message naming the tool", async () => {
     const { recorder } = fixture();
     await expect(recorder.record("qa_check", { id: "C1", status: "great" })).rejects.toThrow(/invalid qa_check arguments/);
     await expect(recorder.record("qa_plan", { checks: [] })).rejects.toThrow(/invalid qa_plan arguments/);
   });
 
-  test("qa_finish stores the verdict, moves running to finishing and is accepted only once", async () => {
-    const { run, logged, recorder } = fixture();
-    await recorder.record("qa_finish", { verdict: "PASS WITH ISSUES", summary: "fine", reportPath: "qa/QA-REPORT-1.md" });
-    expect(run).toMatchObject({ verdict: "PASS WITH ISSUES", verdictSource: "agent", summary: "fine", reportPath: "qa/QA-REPORT-1.md", status: "finishing" });
+  test("qa_finish stores reportMarkdown as the run's report.md, moves running to finishing and is accepted only once", async () => {
+    const { run, runDir, logged, recorder } = fixture();
+    const out = await recorder.record("qa_finish", { verdict: "PASS WITH ISSUES", summary: "fine", reportMarkdown: "# Report\n\n![a](screenshots/a.png)\n" });
+    expect(out).toBe("recorded");
+    expect(run).toMatchObject({ verdict: "PASS WITH ISSUES", verdictSource: "agent", summary: "fine", reportPath: "report.md", status: "finishing" });
+    expect(fs.readFileSync(path.join(runDir, "report.md"), "utf8")).toBe("# Report\n\n![a](screenshots/a.png)\n");
     expect(logged.at(-1)!.text).toBe("Finished: PASS WITH ISSUES");
-    await expect(recorder.record("qa_finish", { verdict: "FAIL", summary: "again", reportPath: "qa/x.md" })).rejects.toThrow("qa_finish already recorded");
+    await expect(recorder.record("qa_finish", { verdict: "FAIL", summary: "again", reportMarkdown: "# Other" })).rejects.toThrow("qa_finish already recorded");
     expect(run.verdict).toBe("PASS WITH ISSUES");
+    expect(fs.readFileSync(path.join(runDir, "report.md"), "utf8")).toStartWith("# Report");
   });
 
-  test("qa_finish keeps a non-running status and rejects a report path outside the repo", async () => {
+  test("qa_finish with reportPath reads the file the agent wrote and leaves it untouched", async () => {
+    const { run, runDir, recorder } = fixture();
+    fs.writeFileSync(path.join(repo, "qa", "mine.md"), "# From a file\n");
+    await recorder.record("qa_finish", { verdict: "PASS", summary: "s", reportPath: "qa/mine.md" });
+    expect(run.reportPath).toBe("report.md");
+    expect(fs.readFileSync(path.join(runDir, "report.md"), "utf8")).toBe("# From a file\n");
+    expect(fs.readFileSync(path.join(repo, "qa", "mine.md"), "utf8")).toBe("# From a file\n");
+
+    const second = fixture();
+    const abs = path.join(outside, "abs-report.md");
+    fs.writeFileSync(abs, "# Absolute\n");
+    await second.recorder.record("qa_finish", { verdict: "PASS", summary: "s", reportPath: abs });
+    expect(fs.readFileSync(path.join(second.runDir, "report.md"), "utf8")).toBe("# Absolute\n");
+  });
+
+  test("qa_finish needs exactly one of reportMarkdown and reportPath and records nothing otherwise", async () => {
+    const { run, runDir, logged, recorder, updates } = fixture();
+    fs.writeFileSync(path.join(repo, "qa", "both.md"), "# both\n");
+    await expect(recorder.record("qa_finish", { verdict: "PASS", summary: "s" })).rejects.toThrow("exactly one of reportMarkdown or reportPath");
+    await expect(
+      recorder.record("qa_finish", { verdict: "PASS", summary: "s", reportMarkdown: "# x", reportPath: "qa/both.md" }),
+    ).rejects.toThrow("exactly one of reportMarkdown or reportPath");
+    await expect(recorder.record("qa_finish", { verdict: "PASS", summary: "s", reportPath: "qa/missing.md" })).rejects.toThrow("not found");
+    expect(run.verdict).toBeNull();
+    expect(run.reportPath).toBeNull();
+    expect(fs.existsSync(path.join(runDir, "report.md"))).toBe(false);
+    expect(logged).toEqual([]);
+    expect(updates()).toBe(0);
+  });
+
+  test("qa_finish rejects a relative report path outside the repo and an oversized report, keeping the status", async () => {
     const { run, recorder } = fixture("finishing");
     await expect(recorder.record("qa_finish", { verdict: "PASS", summary: "s", reportPath: "../outside/r.md" })).rejects.toThrow(
       "reportPath must be inside the repo",
     );
+    await expect(
+      recorder.record("qa_finish", { verdict: "PASS", summary: "s", reportMarkdown: "x".repeat(2 * 1024 * 1024 + 1) }),
+    ).rejects.toThrow("report is larger than 2 MB");
     expect(run.verdict).toBeNull();
-    await recorder.record("qa_finish", { verdict: "PASS", summary: "s", reportPath: "qa/r.md" });
+    await recorder.record("qa_finish", { verdict: "PASS", summary: "s", reportMarkdown: "# ok" });
     expect(run.status).toBe("finishing");
   });
 });
@@ -173,7 +284,7 @@ describe("handleRunMcp", () => {
     const list = await handleRunMcp(rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" }), "run-1", lookup);
     const { tools } = await rpcResult(list, ToolsList);
     expect(tools.map((t) => t.name).sort()).toEqual(["qa_check", "qa_finish", "qa_plan"]);
-    expect(tools.find((t) => t.name === "qa_finish")!.inputSchema.required).toEqual(["verdict", "summary", "reportPath"]);
+    expect(tools.find((t) => t.name === "qa_finish")!.inputSchema.required).toEqual(["verdict", "summary"]);
 
     const call = await handleRunMcp(
       rpc({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "qa_plan", arguments: { checks: [{ id: "C1", title: "Login" }] } } }),
@@ -203,11 +314,117 @@ describe("handleRunMcp", () => {
     expect(escape.isError).toBe(true);
     expect(escape.content[0]!.text).toContain("must be inside the repo");
 
-    const finish = { verdict: "PASS", summary: "ok", reportPath: "qa/r.md" };
+    const finish = { verdict: "PASS", summary: "ok", reportMarkdown: "# ok" };
     expect((await callTool("qa_finish", finish)).isError).toBeUndefined();
     const dup = await callTool("qa_finish", finish);
     expect(dup.isError).toBe(true);
     expect(dup.content[0]!.text).toBe("qa_finish already recorded");
     expect(run.checks).toEqual([]);
+  });
+});
+
+describe("omp host tool schemas", () => {
+  test("mirror the zod argument schemas the MCP endpoint serves (same fields, same required set)", () => {
+    const zodByTool = { qa_plan: QaPlanArgs, qa_check: QaCheckArgs, qa_finish: QaFinishArgs };
+    for (const tool of PROGRESS_TOOLS) {
+      const fromZod = z.toJSONSchema(zodByTool[tool.name], { io: "input" }) as { properties: Record<string, unknown>; required?: string[] };
+      const required: readonly string[] = tool.parameters.required;
+      expect(Object.keys(tool.parameters.properties).sort()).toEqual(Object.keys(fromZod.properties).sort());
+      expect([...required].sort()).toEqual([...(fromZod.required ?? [])].sort());
+    }
+  });
+});
+
+describe("ProgressRecorder file confinement", () => {
+  const repoRoot = path.resolve(import.meta.dir, "..");
+  const elsewhereImage = path.join(repoRoot, "docs", "images", "runs-dark.png");
+  const elsewhereReport = path.join(repoRoot, "README.md");
+
+  test("absolute paths outside the repo, the run folder and the temp folder are rejected for screenshots and reports", async () => {
+    const { run, runDir, logged, recorder, updates } = fixture();
+    await expect(recorder.record("qa_check", { id: "C1", status: "pass", screenshot: elsewhereImage })).rejects.toThrow("must be inside");
+    await expect(recorder.record("qa_finish", { verdict: "PASS", summary: "s", reportPath: elsewhereReport })).rejects.toThrow("must be inside");
+    expect(fs.existsSync(path.join(runDir, "screenshots"))).toBe(false);
+    expect(fs.existsSync(path.join(runDir, "report.md"))).toBe(false);
+    expect([run.checks, run.verdict, logged, updates()]).toEqual([[], null, [], 0]);
+  });
+
+  test("absolute paths in the temp folder and in the run folder are accepted", async () => {
+    const { run, runDir, recorder } = fixture();
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "tpc-progress-tmp-"));
+    try {
+      fs.writeFileSync(path.join(tmp, "shot.png"), PNG);
+      fs.writeFileSync(path.join(tmp, "report.md"), "# From tmp\n");
+      await recorder.record("qa_check", { id: "C1", status: "pass", screenshot: path.join(tmp, "shot.png") });
+      await recorder.record("qa_finish", { verdict: "PASS", summary: "s", reportPath: path.join(tmp, "report.md") });
+      expect(run.checks[0]!.screenshot).toBe("screenshots/shot.png");
+      expect(fs.readFileSync(path.join(runDir, "report.md"), "utf8")).toBe("# From tmp\n");
+
+      const second = fixture();
+      fs.mkdirSync(second.runDir, { recursive: true });
+      fs.writeFileSync(path.join(second.runDir, "mine.md"), "# In the run folder\n");
+      await second.recorder.record("qa_finish", { verdict: "PASS", summary: "s", reportPath: path.join(second.runDir, "mine.md") });
+      expect(fs.readFileSync(path.join(second.runDir, "report.md"), "utf8")).toBe("# In the run folder\n");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test("a reportPath must be a markdown or text file", async () => {
+    const { run, recorder } = fixture();
+    fs.writeFileSync(path.join(repo, "qa", "secrets.env"), "KEY=value\n");
+    fs.writeFileSync(path.join(repo, "qa", "plain.txt"), "plain report\n");
+    await expect(recorder.record("qa_finish", { verdict: "PASS", summary: "s", reportPath: "qa/secrets.env" })).rejects.toThrow(".md");
+    expect(run.verdict).toBeNull();
+    await recorder.record("qa_finish", { verdict: "PASS", summary: "s", reportPath: "qa/plain.txt" });
+    expect(run.reportPath).toBe("report.md");
+  });
+
+  test("an oversized reportPath is rejected from its size, before any read", async () => {
+    const { run, recorder } = fixture();
+    const huge = path.join(repo, "qa", "huge.md");
+    fs.writeFileSync(huge, "");
+    fs.truncateSync(huge, 1024 * 1024 * 1024); // sparse: a full read would allocate 1 GB
+    const started = performance.now();
+    await expect(recorder.record("qa_finish", { verdict: "PASS", summary: "s", reportPath: "qa/huge.md" })).rejects.toThrow("report is larger than 2 MB");
+    expect(performance.now() - started).toBeLessThan(500);
+    expect(run.verdict).toBeNull();
+  });
+
+  test("an oversized screenshot is rejected from its size and the tool description names the cap", async () => {
+    const { run, runDir, recorder } = fixture();
+    const big = path.join(repo, "qa", "shots", "big.png");
+    fs.writeFileSync(big, PNG);
+    fs.truncateSync(big, 25 * 1024 * 1024 + 1);
+    await expect(recorder.record("qa_check", { id: "C1", status: "pass", screenshot: "qa/shots/big.png" })).rejects.toThrow("25 MB");
+    expect(run.checks).toEqual([]);
+    expect(fs.existsSync(path.join(runDir, "screenshots", "big.png"))).toBe(false);
+    const check = PROGRESS_TOOLS.find((t) => t.name === "qa_check")!;
+    expect(check.parameters.properties.screenshot.description).toContain("25 MB");
+  });
+
+  test("same-sized but different images under one name get separate stored copies; the identical one is reused", async () => {
+    const { run, recorder } = fixture();
+    fs.mkdirSync(path.join(repo, "qa", "same"), { recursive: true });
+    const a = Buffer.concat([PNG, Buffer.from("aaaa")]);
+    const b = Buffer.concat([PNG, Buffer.from("bbbb")]);
+    fs.writeFileSync(path.join(repo, "qa", "shots", "same.png"), a);
+    fs.writeFileSync(path.join(repo, "qa", "same", "same.png"), b);
+    await recorder.record("qa_check", { id: "C1", status: "pass", screenshot: "qa/shots/same.png" });
+    await recorder.record("qa_check", { id: "C2", status: "pass", screenshot: "qa/same/same.png" });
+    await recorder.record("qa_check", { id: "C3", status: "pass", screenshot: "qa/same/same.png" });
+    expect(run.checks.map((c) => c.screenshot)).toEqual(["screenshots/same.png", "screenshots/same-2.png", "screenshots/same-2.png"]);
+  });
+
+  test("a report written with the old screenshots/<run id>/ layout gets working image links", async () => {
+    const { run, runDir, recorder } = fixture();
+    const runId = path.basename(runDir);
+    fs.writeFileSync(
+      path.join(repo, "qa", "old-layout.md"),
+      `# Old\n\n![home](screenshots/${runId}/02-home.png)\n![other](screenshots/other-run/x.png)\n`,
+    );
+    await recorder.record("qa_finish", { verdict: "PASS", summary: "s", reportPath: "qa/old-layout.md" });
+    expect(run.reportPath).toBe("report.md");
+    expect(fs.readFileSync(path.join(runDir, "report.md"), "utf8")).toBe("# Old\n\n![home](screenshots/02-home.png)\n![other](screenshots/other-run/x.png)\n");
   });
 });

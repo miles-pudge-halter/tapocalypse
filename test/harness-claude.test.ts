@@ -507,6 +507,13 @@ describe("claude spawn configuration", () => {
     expect(argv.slice(at + 1, at + 8)).toEqual(["mcp__tpc__*", "mcp__mobile_mcp__*", "Bash(adb *)", "Bash(xcrun simctl *)", "Read", "Write", "Edit"]);
   });
 
+  test("permissions: allowlist lets the agent write into the run folder (screenshots live there); bypass adds no directories", () => {
+    const allow = rig({ settings: { permissions: "allowlist" } });
+    const argv = allow.spawned[0].cmd;
+    expect(argv.slice(argv.indexOf("--add-dir"), argv.indexOf("--add-dir") + 2)).toEqual(["--add-dir", allow.runDir]);
+    expect(rig().spawned[0].cmd).not.toContain("--add-dir");
+  });
+
   test("settings.bin selects the executable; unknown permission modes never start claude", () => {
     expect(rig({ settings: { bin: "/opt/bin/claude-x" } }).spawned[0].cmd[0]).toBe("/opt/bin/claude-x");
     expect(rig({ settings: { permissions: "yolo" } }).spawned).toEqual([]);

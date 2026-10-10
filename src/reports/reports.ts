@@ -4,7 +4,8 @@ import { marked } from "marked";
 import sanitizeHtml from "sanitize-html";
 import { HttpError } from "../config";
 import type { Project } from "../projects/registry";
-import { getRun } from "../runs/store";
+import { LEGACY_REPORTS_DIR, reportFile, reportLocation } from "../runs/artefacts";
+import { getRun, listRuns } from "../runs/store";
 import type { Verdict } from "../runs/types";
 
 const VERDICT_RE = /Verdict:?\**\s*\**\s*(PASS WITH ISSUES|PASS|FAIL|BLOCKED|PARTIAL)/i;
@@ -19,12 +20,15 @@ const HEADING_RE = /<h([1-6])(\s[^>]*)?>([\s\S]*?)<\/h\1>/g;
 const IMG_TAG_RE = /<img\b[^>]*>/g;
 
 export interface ReportEntry {
+  /** A run id for reports stored in the data dir, or the file name of a report in the project's legacy reports folder. */
   name: string;
   title: string;
   verdict: Verdict | null;
   mtime: string;
-  /** Run that wrote this report (from `QA-REPORT-<runId>.md`), when that run still exists. */
+  /** Run that wrote this report (the run itself, or `QA-REPORT-<runId>.md` for legacy files), when that run still exists. */
   runId: string | null;
+  /** Absolute path of the report file on disk. */
+  path: string;
 }
 
 export interface ReportHeading {
@@ -47,6 +51,8 @@ export interface RenderedReport {
   runId: string | null;
   headings: ReportHeading[];
   images: ReportImage[];
+  /** Absolute path of the report file on disk. */
+  path: string;
 }
 
 /**
@@ -87,7 +93,7 @@ const SANITIZE_OPTIONS: sanitizeHtml.IOptions = {
 };
 
 /** Realpath of the deepest existing ancestor of `p`, with the non-existent remainder re-appended. */
-function realpathLoose(p: string): string {
+export function realpathLoose(p: string): string {
   const rest: string[] = [];
   let cur = p;
   for (;;) {
@@ -148,9 +154,56 @@ function reportRunId(project: Project, name: string): string | null {
   return getRun(id)?.projectId === project.id ? id : null;
 }
 
-const reportsRoot = (project: Project) => path.join(project.repoPath, project.reportsDir);
+/** Legacy reports folder: runs from before artefacts moved to the data dir wrote it into the repo. */
+const reportsRoot = (project: Project) => path.join(project.repoPath, project.reportsDir ?? LEGACY_REPORTS_DIR);
 
-export function listReports(project: Project): ReportEntry[] {
+const HEADING_PROBE_BYTES = 4096;
+
+/** The first `# ` heading of a report, reading only its first few KiB; null when there is none. */
+function firstHeading(file: string): string | null {
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(file, "r");
+    const buf = Buffer.alloc(HEADING_PROBE_BYTES);
+    const head = buf.toString("utf8", 0, fs.readSync(fd, buf, 0, HEADING_PROBE_BYTES, 0));
+    return /^# .+$/m.test(head) ? extractTitle(head, "") || null : null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+  }
+}
+
+/**
+ * Reports of runs stored in the data dir: the project's data runs that still have their report file. Title and verdict come from the
+ * run record (the markdown is only probed for a heading when the run has no title), so a list never reads whole reports.
+ */
+function dataReports(project: Project): (ReportEntry & { ms: number })[] {
+  const entries: (ReportEntry & { ms: number })[] = [];
+  for (const run of listRuns({ projectId: project.id })) {
+    if (run.storage !== "data" || !run.reportPath) continue;
+    const file = reportLocation(run, project);
+    if (!file) continue;
+    try {
+      const st = fs.statSync(file);
+      if (!st.isFile()) continue;
+      entries.push({
+        name: run.id,
+        title: run.title || firstHeading(file) || run.id,
+        verdict: run.verdict,
+        mtime: st.mtime.toISOString(),
+        runId: run.id,
+        path: file,
+        ms: st.mtimeMs,
+      });
+    } catch {
+      // report vanished between lookup and stat; skip it
+    }
+  }
+  return entries;
+}
+
+function legacyReports(project: Project): (ReportEntry & { ms: number })[] {
   const dir = reportsRoot(project);
   let names: string[];
   try {
@@ -172,18 +225,28 @@ export function listReports(project: Project): ReportEntry[] {
         verdict: extractVerdict(md),
         mtime: st.mtime.toISOString(),
         runId: reportRunId(project, name),
+        path: file,
         ms: st.mtimeMs,
       });
     } catch {
       // file vanished between readdir and stat; skip it
     }
   }
+  return entries;
+}
+
+/** Data-dir reports (by run id) merged with the legacy repo folder (by file name), newest first. */
+export function listReports(project: Project): ReportEntry[] {
+  const entries = [...dataReports(project), ...legacyReports(project)];
   entries.sort((a, b) => b.ms - a.ms);
   return entries.map(({ ms: _ms, ...entry }) => entry);
 }
 
-/** Rewrites relative `src`/`href` values (relative to the reports dir) to app routes. */
-export function rewriteLinks(html: string, projectId: string): string {
+/**
+ * Rewrites relative `src`/`href` values to app routes: for a data-dir report (`runId` given) to that run's files route,
+ * for a legacy report (relative to the repo's reports dir) to the project's files route.
+ */
+export function rewriteLinks(html: string, projectId: string, runId?: string): string {
   return html.replace(LINK_ATTR_RE, (whole, attr: string, value: string) => {
     if (!value || value.startsWith("/") || value.startsWith("#") || URL_SCHEME_RE.test(value)) return whole;
     const hashAt = value.indexOf("#");
@@ -193,6 +256,10 @@ export function rewriteLinks(html: string, projectId: string): string {
     const pathPart = queryAt === -1 ? beforeHash : beforeHash.slice(0, queryAt);
     const normalized = path.posix.normalize(pathPart);
     if (!pathPart || normalized === ".." || normalized.startsWith("../")) return whole;
+    if (runId !== undefined) {
+      if (normalized.toLowerCase().endsWith(".md")) return whole;
+      return `${attr}="/api/runs/${runId}/files/${normalized.split("/").map(encodeURIComponent).join("/")}${frag}"`;
+    }
     if (normalized.toLowerCase().endsWith(".md")) {
       return `${attr}="#/p/${projectId}/reports/${path.posix.basename(normalized)}${frag}"`;
     }
@@ -241,10 +308,18 @@ function extractImages(html: string): ReportImage[] {
   return images;
 }
 
+/** `name` is a run id (report stored in the data dir) or a file name in the project's legacy reports folder. */
 export function renderReport(project: Project, name: string): RenderedReport {
   const notFound = () => new HttpError(404, "report not found");
-  if (!REPORT_NAME_RE.test(name)) throw notFound();
-  const file = resolveUnder(reportsRoot(project), name);
+  const run = REPORT_NAME_RE.test(name) ? null : getRun(name);
+  let file: string | null;
+  if (run) {
+    if (run.projectId !== project.id || run.storage !== "data") throw notFound();
+    file = reportFile(run, project);
+  } else {
+    if (!REPORT_NAME_RE.test(name)) throw notFound();
+    file = resolveUnder(reportsRoot(project), name);
+  }
   if (!file) throw notFound();
   let md: string;
   try {
@@ -252,11 +327,13 @@ export function renderReport(project: Project, name: string): RenderedReport {
   } catch {
     throw notFound();
   }
-  const title = extractTitle(md, name);
+  const title = extractTitle(md, run?.title ?? name);
   // Sanitize first: it normalizes attribute quoting, so link rewriting sees every src/href and only ever prefixes safe values.
-  const clean = rewriteLinks(sanitizeHtml(marked.parse(md, { async: false }), SANITIZE_OPTIONS), project.id);
+  const clean = rewriteLinks(sanitizeHtml(marked.parse(md, { async: false }), SANITIZE_OPTIONS), project.id, run?.id);
   const { html, headings } = annotateHeadings(clean, title);
-  return { name, title, verdict: extractVerdict(md), html, runId: reportRunId(project, name), headings, images: extractImages(html) };
+  const verdict = extractVerdict(md) ?? run?.verdict ?? null;
+  const runId = run ? run.id : reportRunId(project, name);
+  return { name, title, verdict, html, runId, headings, images: extractImages(html), path: file };
 }
 
 /** Absolute path of a servable file under the project's reports dir, or null. */

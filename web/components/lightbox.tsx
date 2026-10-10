@@ -26,8 +26,12 @@ export function Lightbox({
   const activeThumb = useRef<HTMLButtonElement | null>(null);
 
   // Each image starts fitted to the viewport.
-  useEffect(() => setActualSize(false), [index]);
-  useEffect(() => activeThumb.current?.scrollIntoView({ block: "nearest", inline: "center" }), [index]);
+  useEffect(() => {
+    setActualSize(false);
+  }, [index]);
+  useEffect(() => {
+    activeThumb.current?.scrollIntoView({ block: "nearest", inline: "center" });
+  }, [index]);
 
   const go = (delta: number) => {
     if (index === null || images.length < 2) return;

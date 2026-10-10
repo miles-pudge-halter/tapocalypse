@@ -2,7 +2,7 @@
 
 You are a coding agent (omp, Claude Code, Codex CLI, Cursor or similar) running on the user's machine. The user asked you to set up Tapocalypse for the mobile app repository you are working in. Follow the steps below in order. Each step says how to check it worked and what to do when it did not. Humans: the [README](../README.md#quick-start) has the manual version, the [guide](guide.md) has everything else.
 
-Tapocalypse is a local server (Bun, port 4310) with a web UI and an MCP endpoint. A *run* = project (the app's repo) + brief (plain-language test instructions) + device. For each run it starts a headless QA agent (omp, Claude Code or Codex CLI, called the *harness*) that drives an Android emulator or iOS simulator through mobile-mcp and reports checks, a verdict and a markdown report.
+Tapocalypse is a local server (Bun, port 4310) with a web UI and an MCP endpoint. A *run* = project (the app's repo) + brief (plain-language test instructions) + device. For each run it starts a headless QA agent (omp, Claude Code or Codex CLI, called the *harness*) that drives an Android emulator or iOS simulator through mobile-mcp and reports checks, a verdict and a markdown report. Tapocalypse keeps the report and screenshots in its own data folder and gives them to you over MCP (`qa_get_report`, `qa_get_screenshots`, `qa_export`) or the CLI (`tapocalypse report <run-id>`); the QA agent never writes into the user's repo.
 
 ## Goal
 
@@ -18,9 +18,9 @@ When you are done:
 
 Read these before running anything. They override convenience.
 
-- **Never `pkill`, `killall` or kill by pattern.** Stop only processes you started, by the PID you recorded.
+- **Never `pkill`, `killall` or kill by pattern.** Stop only processes you started, by the PID you recorded. The background service started by `service install` is stopped only with `bun src/cli.ts service stop` or `service uninstall`, which touch nothing but Tapocalypse's own launchd or systemd unit; never use `launchctl`, `systemctl` or `kill` on it yourself.
 - **Never stop, restart or kill a server on port 4310 that you did not start.** If Tapocalypse already runs there, reuse it. If something else holds the port, pick another port (step 3).
-- **Never commit Tapocalypse state.** `tapocalypse.config.json` and `data/` in the Tapocalypse checkout, and its config and data under `~/.config/tapocalypse` and `~/.local/share/tapocalypse`, hold machine-specific paths and run history. Do not commit the `qa/` reports a run writes into the user's repo either, unless the user asks.
+- **Never commit Tapocalypse state.** `tapocalypse.config.json` and `data/` in the Tapocalypse checkout, and its config and data under `~/.config/tapocalypse` and `~/.local/share/tapocalypse`, hold machine-specific paths and run history. Runs do not write reports into the user's repo; if you export one with `qa_export` or `tapocalypse report <run-id> --export <dir>`, do not commit the exported files unless the user asks.
 - **Runs cost real money.** Every run is a full agent session on the user's model provider or subscription. Start exactly one smoke run. Ask before starting more.
 - **Ask before installing system software** (Bun, Node.js, Android Studio, Xcode, Homebrew packages, an agent CLI) or signing in to anything. Print the install command and let the user decide.
 - **Never use a physical phone** unless the user names it. Tapocalypse never picks one automatically, and neither should you.
@@ -98,7 +98,17 @@ curl -fsS http://127.0.0.1:4310/api/mcp/status
 | `Connection refused` / `Failed to connect` | The port is free | Start the server (below) |
 | Any other answer | Something else owns the port | Start on another port: prefix the start command with `TAPOCALYPSE_PORT=4311` and use `http://127.0.0.1:4311` as `TPC_URL` everywhere below |
 
-Start it in the background so it outlives your session, and record the PID. If your harness has its own background-process feature, use that instead of `nohup`.
+On macOS and Linux, install it as a background service. It keeps Tapocalypse running, restarts it if it crashes and starts it at login, so it outlives your session and the user's MCP calls always find it:
+
+```sh
+cd "$TPC_DIR"
+bun src/cli.ts service install     # on another port: TAPOCALYPSE_PORT=4311 bun src/cli.ts service install
+bun src/cli.ts service status
+```
+
+`service install` records the current `PATH`, `ANDROID_HOME` and any `TAPOCALYPSE_*` variables, so run it from the shell where `bun run doctor` passed. Wait for it: poll `curl -fsS "$TPC_URL/api/mcp/status"` once per second for up to 30 s, and run `service status` to see whether the unit is installed and running. If it never answers, read `bun src/cli.ts service logs`.
+
+**Fallback (Windows, or when `service` reports it is not supported).** Start it in the background so it outlives your session, and record the PID. If your harness has its own background-process feature, use that instead of `nohup`.
 
 ```sh
 cd "$TPC_DIR"
@@ -106,7 +116,7 @@ nohup bun start > "${TMPDIR:-/tmp}/tapocalypse.log" 2>&1 &
 echo $!
 ```
 
-Wait for it: poll `curl -fsS "$TPC_URL/api/mcp/status"` once per second for up to 30 s. The log shows `tapocalypse listening on http://127.0.0.1:4310` when it is ready. If it never answers, read the log. `fatal: config: …` means the config file is invalid: report the message to the user and stop.
+Poll `curl -fsS "$TPC_URL/api/mcp/status"` the same way. The log shows `tapocalypse listening on http://127.0.0.1:4310` when it is ready. If it never answers, read the log. `fatal: config: …` means the config file is invalid: report the message to the user and stop.
 
 The first start creates the config file (`~/.config/tapocalypse/config.json`, unless `TAPOCALYPSE_CONFIG` is set or a `tapocalypse.config.json` already exists in `TPC_DIR`). Remember which path it is; step 6 may need it.
 
@@ -169,7 +179,7 @@ Take `suggestion` from the answer and create the project with it (`personaFile` 
 curl -fsS -X POST "$TPC_URL/api/projects" -H 'content-type: application/json' -d '{
   "id": "<suggestion.id>", "name": "<suggestion.name>", "repoPath": "<APP_REPO>",
   "defaultPackage": "<suggestion.defaultPackage>", "defaultPlatform": "<android|ios>",
-  "personaFile": null, "reportsDir": "<suggestion.reportsDir>"
+  "personaFile": null
 }'
 ```
 
@@ -242,10 +252,10 @@ Send the user one short message:
 
 ```text
 Tapocalypse is set up.
-- Server: http://127.0.0.1:4310. <Started by me in the background, PID <pid>, log at <path>; stop it with `kill <pid>` | Already running; reused it>.
+- Server: http://127.0.0.1:4310. <Installed by me as a background service (`bun src/cli.ts service status|logs|stop|uninstall`) | Started by me in the background, PID <pid>, log at <path>; stop it with `kill <pid>` | Already running; reused it>.
 - MCP: registered as `tapocalypse` in <config file or command>. <Start a new session to load the qa_* tools | Tools are live>.
 - Project: <id> (<defaultPackage>, <platform>).
-- Smoke run: <verdict>. <summary>. Watch or replay: <url>. Report: <reportPath>. Cost: <cost, or tokens>.
+- Smoke run: <verdict>. <summary>. Watch or replay: <url>. Report: <reportPath from `qa_get_run`, in Tapocalypse's data folder; read it with `qa_get_report` or `tapocalypse report <run-id>`>. Cost: <cost, or tokens>.
 - Still missing: <optional items, or "nothing">.
 Next time, ask me to "QA what you just built with Tapocalypse" and I will start a run, wait for it and fix what fails.
 ```

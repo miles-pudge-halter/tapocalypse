@@ -23,7 +23,7 @@ import {
   CommandList,
   CommandSeparator,
 } from "@/components/ui/command";
-import { type Device, type ReportEntry, type RunView, api, reportHash, runHash } from "@/lib/api";
+import { type Device, type ReportEntry, type RunView, api, reportEntryHash, runHash } from "@/lib/api";
 import { deviceDisplayName, deviceSubtitle } from "@/lib/format";
 import {
   navigate,
@@ -295,7 +295,7 @@ function PaletteContent({ close }: { close: () => void }) {
                 <CommandItem
                   key={`${r.projectId}/${r.name}`}
                   value={`report ${r.title} ${r.name} ${r.projectName}`}
-                  onSelect={go(reportHash(r.projectId, r.name))}
+                  onSelect={go(reportEntryHash(r.projectId, r.name))}
                 >
                   <FileText /> <span className="truncate">{r.title}</span>
                   <span className="ml-auto shrink-0 text-xs text-muted-foreground">{r.projectName}</span>

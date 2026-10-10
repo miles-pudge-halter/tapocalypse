@@ -89,7 +89,8 @@ describe("project CRUD", () => {
     const created = createProject(input());
     projectEvents.off("change", onChange);
 
-    expect(created).toMatchObject({ id: "my-app", status: "ok", problems: [], personaFile: null, reportsDir: "qa" });
+    expect(created).toMatchObject({ id: "my-app", status: "ok", problems: [], personaFile: null });
+    expect("reportsDir" in created).toBe(false);
     expect(changes).toBe(1);
     const file = readFileConfig();
     expect(file.marker).toEqual({ keep: "me" });
@@ -100,7 +101,6 @@ describe("project CRUD", () => {
         name: "My App",
         repoPath: repo,
         personaFile: null,
-        reportsDir: "qa",
         defaultPackage: "com.example.app",
         defaultPlatform: "android",
       },
@@ -133,8 +133,8 @@ describe("project CRUD", () => {
 
   test("update patches fields, keeps the rest, and persists", () => {
     createProject(input());
-    const updated = updateProject("my-app", { name: "Renamed", personaFile: "agents/qa.md", reportsDir: "docs/qa" });
-    expect(updated).toMatchObject({ name: "Renamed", personaFile: "agents/qa.md", reportsDir: "docs/qa", defaultPackage: "com.example.app" });
+    const updated = updateProject("my-app", { name: "Renamed", personaFile: "agents/qa.md" });
+    expect(updated).toMatchObject({ name: "Renamed", personaFile: "agents/qa.md", defaultPackage: "com.example.app" });
     expect((readFileConfig().projects as { name: string }[])[0]!.name).toBe("Renamed");
     expect(updateProject("my-app", { personaFile: null }).personaFile).toBeNull();
   });
@@ -182,6 +182,29 @@ describe("project CRUD", () => {
   });
 });
 
+describe("legacy reportsDir in config", () => {
+  const stored = (over: Record<string, unknown> = {}) => ({ ...input(), personaFile: null, ...over });
+
+  test("a config without reportsDir loads ok and keeps the field absent", () => {
+    resetConfig([stored()]);
+    const [p] = listProjects();
+    expect(p).toMatchObject({ id: "my-app", status: "ok", problems: [] });
+    expect(getProject("my-app")?.reportsDir).toBeUndefined();
+  });
+
+  test("a config with reportsDir still loads ok and the value survives an unrelated update", () => {
+    resetConfig([stored({ reportsDir: "docs/qa" })]);
+    expect(listProjects()[0]).toMatchObject({ status: "ok", reportsDir: "docs/qa" });
+    updateProject("my-app", { name: "Renamed" });
+    expect((readFileConfig().projects as { reportsDir?: string }[])[0]!.reportsDir).toBe("docs/qa");
+  });
+
+  test("a legacy reportsDir escaping the repository is reported as a problem", () => {
+    resetConfig([stored({ reportsDir: "../elsewhere" })]);
+    expect(listProjects()[0]).toMatchObject({ status: "invalid" });
+  });
+});
+
 describe("validation", () => {
   const errorsFor = (over: Record<string, unknown>) => validateProject(input(over), "create").errors;
 
@@ -222,10 +245,12 @@ describe("validation", () => {
     expect(errorsFor({ personaFile: null }).personaFile).toBeUndefined();
   });
 
-  test("reportsDir must be relative with no .. segments", () => {
+  test("a legacy reportsDir is only checked to stay inside the repository, and never warned about", () => {
     expect(errorsFor({ reportsDir: "/abs" }).reportsDir).toContain("relative");
     expect(errorsFor({ reportsDir: "a/../b" }).reportsDir).toContain("..");
     expect(errorsFor({ reportsDir: "docs/qa" }).reportsDir).toBeUndefined();
+    expect(validateProject(input({ reportsDir: "docs/qa" }), "create").warnings.join("\n")).not.toContain("created");
+    expect(validateProject(input(), "create").warnings.join("\n")).not.toContain("created");
   });
 
   test("defaultPackage and defaultPlatform", () => {
@@ -248,12 +273,11 @@ describe("validation", () => {
     });
   });
 
-  test("warnings: non-git repo and missing reports dir", () => {
+  test("warnings: non-git repo", () => {
     const plain = path.join(tmp, "plain");
     fs.mkdirSync(plain);
     const w = validateProject(input({ repoPath: plain }), "create").warnings.join("\n");
     expect(w).toContain("Not a git repository");
-    expect(w).toContain("qa/ does not exist yet");
     expect(validateProject(input(), "create").warnings.join("\n")).not.toContain("Not a git repository");
   });
 

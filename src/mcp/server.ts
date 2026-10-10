@@ -3,13 +3,14 @@ import path from "node:path";
 import { McpServer, WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import pkg from "../../package.json";
-import { batchView, devicesView, findRun, runDurationMs, runner, scheduler } from "../app";
+import { batchView, devicesView, findRun, runDurationMs, runner, runScreenshots, scheduler } from "../app";
 import { config, HttpError, MAX_STEER_CHARS } from "../config";
 import { runDoctor } from "../doctor";
 import { HARNESS_IDS, type HarnessId } from "../harness/types";
 import { detectProject } from "../projects/detect";
 import { createProject, deleteProject, getProject, listProjects, PACKAGE_RE, updateProject } from "../projects/registry";
-import { resolveUnder } from "../reports/reports";
+import { exportRun, LEGACY_REPORTS_DIR, reportFile, screenshotFile, screenshotsDir } from "../runs/artefacts";
+import { realpathLoose } from "../reports/reports";
 import { runMatches } from "../runs/source";
 import { listRuns } from "../runs/store";
 import { ACTIVE, type Run } from "../runs/types";
@@ -35,7 +36,6 @@ const ProjectFields = {
     .nullable()
     .optional()
     .describe("QA persona markdown, relative to the repo; null for the built-in persona"),
-  reportsDir: z.string().max(200).optional().describe("Reports folder relative to the repo; default qa"),
 };
 
 const SourceInput = z.object({
@@ -62,8 +62,8 @@ export function runSummary(run: Run) {
     backend: run.backend,
     queuePosition: scheduler.queuePosition(run.id),
     checks: run.checks.map(({ id, title, status, note }) => ({ id, title, status, note })),
-    reportPath: project && run.reportPath ? path.join(project.repoPath, run.reportPath) : null,
-    screenshotsDir: project ? path.join(project.repoPath, project.reportsDir, "screenshots", run.id) : null,
+    reportPath: reportFile(run, project ?? null),
+    screenshotsDir: run.storage === "data" ? realpathLoose(screenshotsDir(run.id)) : project ? path.join(project.repoPath, project.reportsDir ?? LEGACY_REPORTS_DIR, "screenshots", run.id) : null,
     source: run.source,
     build: run.build,
     usage: run.usage,
@@ -203,7 +203,6 @@ function buildServer(): McpServer {
           defaultPlatform: args.defaultPlatform ?? suggestion.defaultPlatform,
           defaultPackage: args.defaultPackage ?? suggestion.defaultPackage,
           personaFile: args.personaFile === undefined ? suggestion.personaFile : args.personaFile,
-          reportsDir: args.reportsDir ?? suggestion.reportsDir,
         };
         const missing = (["id", "name", "defaultPackage", "defaultPlatform"] as const).filter((k) => !input[k]);
         if (missing.length > 0) {
@@ -232,7 +231,7 @@ function buildServer(): McpServer {
     {
       title: "Delete a QA project",
       description:
-        "Remove a project from Tapocalypse. Fails while the project has queued or active runs. The repository and its reports are not touched.",
+        "Remove a project from Tapocalypse. Fails while the project has queued or active runs. The repository is not touched; the runs' reports and screenshots in Tapocalypse's data dir stay until retention removes them.",
       inputSchema: z.object({ id: z.string().max(64).describe("Project id from qa_list_projects") }),
     },
     ({ id }) =>
@@ -406,16 +405,52 @@ function buildServer(): McpServer {
     "qa_get_report",
     {
       title: "Read a run's report",
-      description: "The markdown QA report the agent wrote for a finished run. Errors when the run has no report.",
+      description:
+        "The markdown QA report the agent wrote for a finished run (stored in Tapocalypse's data dir; image links are relative to the run's artefact folder, see qa_get_screenshots). Errors when the run has no report.",
       inputSchema: z.object({ runId: z.string() }),
     },
     ({ runId }) =>
       respond(() => {
         const run = requireRun(runId);
-        const project = getProject(run.projectId);
-        const file = project && run.reportPath ? resolveUnder(project.repoPath, run.reportPath) : null;
+        const file = reportFile(run, getProject(run.projectId) ?? null);
         if (!file || !existsSync(file)) throw new HttpError(404, `run ${runId} has no report`);
         return readFileSync(file, "utf8");
+      }),
+  );
+
+  server.registerTool(
+    "qa_get_screenshots",
+    {
+      title: "List a run's screenshots",
+      description:
+        "Screenshots of a run, stored in Tapocalypse's data dir: checkId (when a check points at it), name, absolute path (read it or view it directly) and the UI url path.",
+      inputSchema: z.object({ runId: z.string() }),
+    },
+    ({ runId }) =>
+      respond(() => {
+        const run = requireRun(runId);
+        const project = getProject(run.projectId) ?? null;
+        return runScreenshots(run).flatMap((s) => {
+          const abs = screenshotFile(run, project, s.path);
+          return abs ? [{ checkId: s.checkId, name: s.name, path: abs, url: s.url }] : [];
+        });
+      }),
+  );
+
+  server.registerTool(
+    "qa_export",
+    {
+      title: "Export a run's report and screenshots",
+      description:
+        "Copy a run's report (as QA-REPORT-<runId>.md) and screenshots (under screenshots/) from Tapocalypse's data dir into an absolute directory you choose, e.g. a folder in your repository you want to commit or attach to a PR. Nothing is written to the repository otherwise.",
+      inputSchema: z.object({ runId: z.string(), dir: z.string().max(4096).describe("Absolute destination directory; created when missing") }),
+    },
+    ({ runId, dir }) =>
+      respond(() => {
+        const run = requireRun(runId);
+        if (dir.includes("\0")) throw new HttpError(400, "dir must not contain a NUL byte");
+        if (!path.isAbsolute(dir)) throw new HttpError(400, "dir must be an absolute path");
+        return exportRun(run, getProject(run.projectId) ?? null, dir);
       }),
   );
 
@@ -439,7 +474,8 @@ function buildServer(): McpServer {
     "qa_get_run",
     {
       title: "Get run status",
-      description: "Current status, checks, verdict and absolute report/screenshot paths of a run.",
+      description:
+        "Current status, checks, verdict and absolute report/screenshot paths of a run (artefacts live in Tapocalypse's data dir; use qa_get_report, qa_get_screenshots or qa_export to access them).",
       inputSchema: z.object({ runId: z.string() }),
     },
     ({ runId }) => respond(() => runSummary(requireRun(runId))),

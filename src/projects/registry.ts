@@ -15,8 +15,11 @@ export interface Project {
   repoPath: string;
   /** Relative to repoPath; null = the built-in default persona. */
   personaFile: string | null;
-  /** Relative to repoPath; created on first run when missing. */
-  reportsDir: string;
+  /**
+   * Legacy: the repo-relative folder older runs wrote reports and screenshots into. Read from config so those runs keep
+   * rendering; never suggested, created or offered for editing. New runs store artefacts in Tapocalypse's data dir.
+   */
+  reportsDir?: string;
   defaultPackage: string;
   defaultPlatform: Platform;
   /** Per-project agent runtime overrides (harness, harness-native model and effort); absent = defaults. */
@@ -42,7 +45,6 @@ export interface ProjectStatus extends Project {
 
 export type ProjectInput = Omit<Project, "personaFile" | "reportsDir"> & {
   personaFile?: string | null;
-  reportsDir?: string;
 };
 
 export interface ValidationResult {
@@ -63,7 +65,6 @@ const FIELD_ORDER: (keyof Project)[] = [
   "defaultPlatform",
   "agent",
 ];
-const DEFAULT_REPORTS_DIR = "qa";
 const BUNDLED_PERSONA = path.join(REPO_ROOT, "personas", "default-mobile-qa.md");
 
 type Raw = Record<string, unknown>;
@@ -113,7 +114,7 @@ function coerce(raw: Raw): Project {
     name: str(raw.name),
     repoPath: str(raw.repoPath),
     personaFile: typeof raw.personaFile === "string" && raw.personaFile ? raw.personaFile : null,
-    reportsDir: str(raw.reportsDir) || DEFAULT_REPORTS_DIR,
+    ...(str(raw.reportsDir) ? { reportsDir: str(raw.reportsDir) } : {}),
     defaultPackage: str(raw.defaultPackage),
     defaultPlatform: raw.defaultPlatform === "ios" ? "ios" : "android",
     ...(agent.success && Object.keys(agent.data).length > 0 ? { agent: agent.data } : {}),
@@ -168,16 +169,16 @@ function check(input: Raw, unique: boolean): Check {
     }
   }
 
-  const reportsRaw = input.reportsDir === undefined || input.reportsDir === "" ? DEFAULT_REPORTS_DIR : input.reportsDir;
-  let reportsDir = DEFAULT_REPORTS_DIR;
-  let reportsOk = false;
-  if (typeof reportsRaw !== "string") errors.reportsDir = "must be a path relative to the repository";
-  else {
-    reportsDir = reportsRaw.trim().replace(/[\\/]+$/, "") || DEFAULT_REPORTS_DIR;
-    if (path.isAbsolute(reportsDir)) errors.reportsDir = "must be relative to the repository";
-    else if (reportsDir.split(/[\\/]/).includes("..")) errors.reportsDir = 'must not contain ".." segments';
-    else if (repoOk && !resolveUnder(repoPath, reportsDir)) errors.reportsDir = "must stay inside the repository";
-    else reportsOk = true;
+  let reportsDir: string | undefined;
+  if (input.reportsDir !== undefined && input.reportsDir !== null && input.reportsDir !== "") {
+    if (typeof input.reportsDir !== "string") errors.reportsDir = "must be a path relative to the repository";
+    else {
+      const rel = input.reportsDir.trim().replace(/[\\/]+$/, "");
+      if (path.isAbsolute(rel)) errors.reportsDir = "must be relative to the repository";
+      else if (rel.split(/[\\/]/).includes("..")) errors.reportsDir = 'must not contain ".." segments';
+      else if (repoOk && !resolveUnder(repoPath, rel)) errors.reportsDir = "must stay inside the repository";
+      else if (rel) reportsDir = rel;
+    }
   }
 
   const defaultPackage = str(input.defaultPackage).trim();
@@ -195,15 +196,15 @@ function check(input: Raw, unique: boolean): Check {
 
   if (repoOk) {
     if (!fs.existsSync(path.join(repoPath, ".git"))) warnings.push("Not a git repository: runs will not record branch/commit/PR.");
-    if (reportsOk && !fs.existsSync(path.join(repoPath, reportsDir))) {
-      warnings.push(`${reportsDir}/ does not exist yet: it will be created on first run.`);
-    }
   }
   if (defaultPlatform === "ios" && !Bun.which("xcrun")) warnings.push("iOS simulators unavailable on this machine.");
 
   const result: ValidationResult = { ok: Object.keys(errors).length === 0, errors, warnings };
   if (!result.ok || (defaultPlatform !== "android" && defaultPlatform !== "ios")) return { project: null, result };
-  return { project: { id, name, repoPath, personaFile, reportsDir, defaultPackage, defaultPlatform, ...(agent ? { agent } : {}) }, result };
+  return {
+    project: { id, name, repoPath, personaFile, ...(reportsDir ? { reportsDir } : {}), defaultPackage, defaultPlatform, ...(agent ? { agent } : {}) },
+    result,
+  };
 }
 
 function problemsOf(errors: Errors): string[] {

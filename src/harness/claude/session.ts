@@ -107,7 +107,8 @@ export function prepareClaude(opts: SpawnOptions): string[] {
     "AskUserQuestion",
   ];
   if (settings.permissions === "allowlist") {
-    argv.push("--permission-mode", "dontAsk", "--allowedTools", ...opts.mcpServers.map((s) => `mcp__${s.name}__*`), ...ALLOWLIST_TOOLS);
+    // The run folder (screenshots, report) is outside the repo the agent works in.
+    argv.push("--add-dir", opts.runDir, "--permission-mode", "dontAsk", "--allowedTools", ...opts.mcpServers.map((s) => `mcp__${s.name}__*`), ...ALLOWLIST_TOOLS);
   } else {
     argv.push("--permission-mode", "bypassPermissions");
   }

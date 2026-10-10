@@ -1,4 +1,4 @@
-import { screenshotUrl, type Check, type RunScreenshot } from "@/lib/api";
+import { screenshotUrl, type ArtefactRun, type Check, type RunScreenshot } from "@/lib/api";
 
 /** One image of a run: either listed by `/api/runs/:id/screenshots` or referenced only by a check. */
 export interface GalleryItem {
@@ -12,14 +12,14 @@ export interface GalleryItem {
  * Chronological list of every screenshot of a run: the files on disk first (oldest → newest), then check
  * screenshots the listing did not return (e.g. saved outside the run's screenshot folder).
  */
-export function buildGallery(projectId: string, checks: readonly Check[], shots: readonly RunScreenshot[]): GalleryItem[] {
+export function buildGallery(run: ArtefactRun, checks: readonly Check[], shots: readonly RunScreenshot[]): GalleryItem[] {
   const items: GalleryItem[] = [...shots]
     .sort((a, b) => Date.parse(a.mtime) - Date.parse(b.mtime))
     .map((s) => ({ key: s.path, url: s.url, name: s.name, checkId: s.checkId }));
   const known = new Set(shots.flatMap((s) => [s.path, s.url]));
   for (const c of checks) {
     if (!c.screenshot) continue;
-    const url = screenshotUrl(projectId, c.screenshot);
+    const url = screenshotUrl(run, c.screenshot);
     if (known.has(c.screenshot) || known.has(url)) continue;
     known.add(url);
     items.push({ key: c.screenshot, url, name: c.screenshot.split("/").pop() ?? c.screenshot, checkId: c.id });
@@ -46,9 +46,9 @@ export function groupGallery(items: readonly GalleryItem[], checks: readonly Che
 }
 
 /** The image that proves a check: its own `screenshot`, else the newest file attributed to it. */
-export function screenshotOfCheck(projectId: string, check: Check, items: readonly GalleryItem[]): GalleryItem | null {
+export function screenshotOfCheck(run: ArtefactRun, check: Check, items: readonly GalleryItem[]): GalleryItem | null {
   if (check.screenshot) {
-    const url = screenshotUrl(projectId, check.screenshot);
+    const url = screenshotUrl(run, check.screenshot);
     const hit = items.find((i) => i.url === url || i.key === check.screenshot);
     return hit ?? { key: check.screenshot, url, name: check.screenshot.split("/").pop() ?? check.screenshot, checkId: check.id };
   }

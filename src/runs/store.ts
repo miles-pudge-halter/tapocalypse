@@ -47,6 +47,7 @@ const RUN_DEFAULTS = {
   retriedBy: null,
   rerunOf: null,
   install: null,
+  storage: "repo",
 } satisfies Partial<Run>;
 
 type RunDefaultKey = keyof typeof RUN_DEFAULTS;
@@ -122,7 +123,7 @@ export function getRun(id: string): Run | null {
   }
 }
 
-/** Removes the run directory (run.json, events, session, transcript) and forgets the run. Repo reports are untouched. */
+/** Removes the run directory (run.json, events, session, transcript, and for `storage: "data"` runs the report and screenshots) and forgets the run. Legacy repo reports are untouched. */
 export function deleteRun(id: string): void {
   if (!/^[A-Za-z0-9-]+$/.test(id)) return;
   rmSync(runDir(id), { recursive: true, force: true });
