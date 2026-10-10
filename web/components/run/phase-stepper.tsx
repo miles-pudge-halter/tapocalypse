@@ -1,8 +1,10 @@
 import { Check, Loader2 } from "lucide-react";
 
+import { LeaseRing } from "@/components/lease-ring";
 import { formatDuration } from "@/lib/format";
 import type { RunView } from "@/lib/api";
 import { useNow } from "@/lib/hooks";
+import { queueHoldCopy } from "@/lib/leases";
 import { cn } from "@/lib/utils";
 
 const PHASE_INDEX: Record<string, number> = { queued: 0, preflight: 1, running: 2, finishing: 3 };
@@ -63,7 +65,17 @@ export function PhaseStepper({ run }: { run: RunView }) {
           );
         })}
       </ol>
-      {waitNote ? <p className="mt-1.5 text-xs text-muted-foreground">{waitNote}</p> : null}
+      {run.status === "queued" && run.queueHold ? (
+        <p className="mt-1.5 flex flex-wrap items-center gap-x-1.5 text-xs text-muted-foreground">
+          <LeaseRing size={12} lease={{ renewedAt: run.createdAt, expiresAt: run.queueHold.expiresAt }} />
+          <span className="line-clamp-2 min-w-0 break-words">{queueHoldCopy(run.queueHold, run.deviceRequest).note}</span>
+          <a href="#/devices" className="text-foreground underline-offset-4 hover:underline">
+            Open Devices
+          </a>
+        </p>
+      ) : waitNote ? (
+        <p className="mt-1.5 text-xs text-muted-foreground">{waitNote}</p>
+      ) : null}
     </div>
   );
 }

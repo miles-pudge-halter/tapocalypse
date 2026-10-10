@@ -121,7 +121,7 @@ describe("batch fan-out", () => {
 
 describe("rerun", () => {
   async function finished(env: ReturnType<typeof setup>, extra: Partial<Run> = {}): Promise<Run> {
-    const run = await env.scheduler.enqueueRun({ ...base, title: "Checkout", brief: "Buy things.", backend: "mobile-mcp" });
+    const run = await env.scheduler.enqueueRun({ ...base, title: "Checkout", brief: "Buy things." });
     Object.assign(run, {
       status: "done",
       verdict: "FAIL",
@@ -158,7 +158,6 @@ describe("rerun", () => {
         { id: "C2", title: "Pay" },
         { id: "C4", title: "Email" },
       ],
-      backend: "mobile-mcp",
       packageId: run.packageId,
       requestedBy: "mcp",
       status: "queued",

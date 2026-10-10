@@ -6,6 +6,7 @@ import { RunStatusIcon } from "@/components/run-status-icon";
 import { SegmentedProgress } from "@/components/segmented-progress";
 import { SetupBanner } from "@/components/setup-checklist";
 import { DeviceFrame } from "@/components/device-frame";
+import { LeaseRing } from "@/components/lease-ring";
 import { EmptyState } from "@/components/empty-state";
 import { PageHeader } from "@/components/page-header";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -19,6 +20,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { isActive, runHash, type Device, type RunStatus, type RunView, type Verdict } from "@/lib/api";
 import { deviceDisplayName, formatCost, formatDuration } from "@/lib/format";
+import { deviceCounts, heldSummary } from "@/lib/leases";
 import {
   setRunFilters,
   useActiveRuns,
@@ -322,8 +324,8 @@ function LiveStrip({
   loading: boolean;
 }) {
   const { stats, loading: statsLoading } = useStats(project, 7);
-  const usable = devices.filter((d) => d.state === "ready" && d.deviceType !== "watch" && d.deviceType !== "tv");
-  const busy = usable.filter((d) => d.busyRunId).length;
+  const { usable, busy } = deviceCounts(devices);
+  const held = heldSummary(devices);
   const judged = stats ? stats.pass + stats.fail + stats.issues : 0;
 
   const segment = "flex items-center gap-1.5 rounded-md px-2 py-1 text-sm hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring";
@@ -351,10 +353,21 @@ function LiveStrip({
           {divider}
           <a href="#/devices" className={segment} title="Open Devices">
             <strong className="font-semibold">
-              {busy}/{usable.length}
+              {busy}/{usable}
             </strong>{" "}
             devices busy
           </a>
+          {held && (
+            <>
+              {divider}
+              <a href="#/devices" className={segment} title={held.title}>
+                <span className="inline-flex items-center gap-1 whitespace-nowrap rounded-full border border-violet-500/40 bg-violet-50 px-2 py-0.5 text-xs font-medium text-violet-800 dark:bg-violet-950/40 dark:text-violet-300">
+                  <LeaseRing size={12} lease={held.earliest} />
+                  {held.label}
+                </span>
+              </a>
+            </>
+          )}
         </>
       )}
       {divider}

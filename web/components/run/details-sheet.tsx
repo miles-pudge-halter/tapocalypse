@@ -88,7 +88,6 @@ export function DetailsSheet({
                 "—"
               )}
             </Field>
-            <Field label="Backend">{run.backend}</Field>
             <Field label="Agent runtime">{harnessLabel ?? run.harness}</Field>
             <Field label="Model">
               {model ?? "—"}

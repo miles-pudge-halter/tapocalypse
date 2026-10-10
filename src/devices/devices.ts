@@ -1,14 +1,12 @@
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ADB_BIN, ARTEMIS_LOCK_DIR, config, XCRUN_BIN } from "../config";
+import { ADB_BIN, config, XCRUN_BIN } from "../config";
 import type { Platform } from "../runs/types";
+import type { LeaseView } from "./leases";
 
-export interface ArtemisOwner {
-  pid: number;
-  sessionId?: string;
-  description?: string;
-}
+/** Someone queued for a specific device: an agent's ticket or a QA run. */
+export type DeviceWaiter = { kind: "agent"; holder: string; since: string } | { kind: "run"; runId: string; title: string };
 
 export type DeviceType = "phone" | "tablet" | "watch" | "tv" | "unknown";
 
@@ -26,8 +24,10 @@ export interface Device {
   deviceType: DeviceType;
   state: "ready" | "booting";
   avdName?: string;
-  artemisHelper?: boolean;
-  artemisOwner?: ArtemisOwner | null;
+  /** The agent lease holding this device (QA runs keep using `busyRunId`); set by the scheduler's overlay. */
+  lease?: LeaseView | null;
+  /** Who waits for this serial, FIFO (agent tickets and queued runs share one queue); set by the scheduler's overlay. */
+  waiters?: DeviceWaiter[];
   busyRunId?: string;
   bootedByTapocalypse?: boolean;
   /** True when the serial is in devicePool.android.excludeSerials: never auto-assigned. */
@@ -98,24 +98,6 @@ export function parseAdbDevices(out: string): { serial: string; model: string; k
 export async function connectedAndroidSerials(): Promise<string[]> {
   const r = await exec([ADB_BIN, "devices", "-l"]);
   return parseAdbDevices(r.text).map((d) => d.serial);
-}
-
-export function artemisLockOwner(serial: string): ArtemisOwner | null {
-  const file = path.join(ARTEMIS_LOCK_DIR, `artemis-device-${serial.replace(/[^A-Za-z0-9_-]/g, "_")}.lock`);
-  if (!existsSync(file)) return null;
-  try {
-    const data = JSON.parse(readFileSync(file, "utf8")) as { pid?: unknown; session_id?: unknown; description?: unknown };
-    const pid = Number(data.pid);
-    if (!Number.isInteger(pid) || pid <= 0) return null;
-    process.kill(pid, 0);
-    return {
-      pid,
-      sessionId: typeof data.session_id === "string" ? data.session_id : undefined,
-      description: typeof data.description === "string" ? data.description : undefined,
-    };
-  } catch {
-    return null;
-  }
 }
 
 /** "Physical size: 1440x3120" (+ optional "Override size: …") → "1440×3120"; the override is what apps actually see. */
@@ -206,16 +188,13 @@ interface AndroidStatic {
   deviceType: DeviceType;
 }
 
-// Identity/hardware facts barely change; the Artemis helper flag changes after an install, so it expires sooner.
+// Identity/hardware facts barely change.
 const STATIC_TTL_MS = 30_000;
-const HELPER_TTL_MS = 5_000;
 const staticProbes = new Map<string, Memo<AndroidStatic>>();
-const helperProbes = new Map<string, Memo<boolean>>();
 
-/** Forget cached probes of a device (its screen override or helper state just changed). */
+/** Forget cached probes of a device (its screen override just changed). */
 export function invalidateDeviceProbes(serial: string): void {
   staticProbes.delete(serial);
-  helperProbes.delete(serial);
 }
 
 async function loadAndroidStatic(d: { serial: string; kind: "emulator" | "physical" }): Promise<AndroidStatic> {
@@ -239,15 +218,7 @@ async function loadAndroidStatic(d: { serial: string; kind: "emulator" | "physic
 }
 
 async function probeAndroid(d: { serial: string; model: string; kind: "emulator" | "physical" }): Promise<Device> {
-  const [info, helper] = await Promise.all([
-    memo(staticProbes, d.serial, STATIC_TTL_MS, () => loadAndroidStatic(d)),
-    // Only the optional Artemis backend cares whether its helper is installed.
-    config.artemisPath
-      ? memo(helperProbes, d.serial, HELPER_TTL_MS, async () =>
-          (await adb(d.serial, ["shell", "settings", "get", "secure", "enabled_accessibility_services"], 5_000)).text.includes("com.artemis.helper"),
-        )
-      : undefined,
-  ]);
+  const info = await memo(staticProbes, d.serial, STATIC_TTL_MS, () => loadAndroidStatic(d));
   return {
     ...d,
     platform: "android",
@@ -257,8 +228,6 @@ async function probeAndroid(d: { serial: string; model: string; kind: "emulator"
     deviceType: info.deviceType,
     state: "ready",
     avdName: info.avdName,
-    artemisHelper: helper,
-    artemisOwner: artemisLockOwner(d.serial),
     idleShutdownAt: null,
   };
 }
@@ -301,9 +270,7 @@ export async function listDevices(): Promise<Device[]> {
   const [adbOut, ios] = await Promise.all([exec([ADB_BIN, "devices", "-l"]), listIos()]);
   const connected = parseAdbDevices(adbOut.text);
   const serials = new Set(connected.map((d) => d.serial));
-  for (const cache of [staticProbes, helperProbes]) {
-    for (const key of cache.keys()) if (!serials.has(key)) cache.delete(key);
-  }
+  for (const key of staticProbes.keys()) if (!serials.has(key)) staticProbes.delete(key);
   const android = await Promise.all(connected.map(probeAndroid));
   const excluded = new Set(config.devicePool.android.excludeSerials);
   lastDevices = [...android, ...ios].map((d) => ({ ...d, idleShutdownAt: idleShutdownLookup(d.serial), excluded: excluded.has(d.serial) }));
@@ -356,38 +323,19 @@ export async function appVersion(
   return versionName === null && versionCode === null ? null : { versionName, versionCode };
 }
 
+const isAndroidEmulator = (d: Pick<Device, "serial" | "platform">) => d.platform === "android" && d.serial.startsWith("emulator-");
+
 /**
  * The id mobile-mcp addresses a device by: emulators by AVD name (its device list shows them under that id, not the adb serial), iOS simulators by UDID,
- * physical Android devices by serial. Falls back to the serial when the AVD name cannot be read.
+ * physical Android devices by serial. Falls back to the serial when the AVD name is unknown.
  */
+export function mobileDeviceIdOf(device: Pick<Device, "serial" | "platform"> & { avdName?: string | null }): string {
+  return isAndroidEmulator(device) && device.avdName ? device.avdName : device.serial;
+}
+
+/** `mobileDeviceIdOf` for a device whose AVD name is not known yet: asks the emulator. */
 export async function mobileMcpDeviceId(device: Pick<Device, "serial" | "platform">): Promise<string> {
-  if (device.platform !== "android" || !device.serial.startsWith("emulator-")) return device.serial;
+  if (!isAndroidEmulator(device)) return device.serial;
   const r = await adb(device.serial, ["emu", "avd", "name"], 5_000);
-  const avd = r.code === 0 ? r.text.split(/\r?\n/)[0]!.trim() : "";
-  return avd || device.serial;
-}
-
-/** Kills mobile-mcp's on-device DeviceServer so Artemis can take the UiAutomation connection. */
-export async function stopMobileMcpDeviceServer(serial: string): Promise<number[]> {
-  const ps = await adb(serial, ["shell", "ps", "-A", "-o", "PID,ARGS"], 10_000);
-  const pids = ps.text
-    .split("\n")
-    .filter((l) => l.includes("com.mobilenext.mobilecli.DeviceServer"))
-    .map((l) => Number(l.trim().split(/\s+/)[0]))
-    .filter((n) => Number.isInteger(n) && n > 0);
-  for (const pid of pids) await adb(serial, ["shell", "kill", String(pid)], 5_000);
-  return pids;
-}
-
-/** Installs/upgrades the Artemis helper from the local clone so it matches the checked-out fixes. */
-export async function ensureArtemisHelper(serial: string): Promise<void> {
-  const r = await exec(["uv", "run", "artemis", "helper", "install", "--serial", serial], {
-    cwd: config.artemisPath,
-    stdin: "y\n",
-    timeoutMs: 120_000,
-  });
-  if (r.code !== 0) {
-    const tail = (r.stderr.trim() || r.text.trim()).split("\n").slice(-5).join("\n");
-    throw new Error(`artemis helper install failed: ${tail}`);
-  }
+  return mobileDeviceIdOf({ ...device, avdName: r.code === 0 ? r.text.split(/\r?\n/)[0]!.trim() : undefined });
 }

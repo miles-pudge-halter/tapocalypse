@@ -162,8 +162,6 @@ function Lane({ run, device, now }: { run: RunView; device: Device | undefined; 
           ) : (
             <span>{run.deviceName ?? run.deviceSerial ?? `any ${run.deviceRequest.platform}`}</span>
           )}
-          <span aria-hidden="true">·</span>
-          <span>{run.backend}</span>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {run.verdict ? <VerdictBadge verdict={run.verdict} /> : <StatusBadge status={run.status} />}

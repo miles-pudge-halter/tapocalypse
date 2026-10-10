@@ -4,7 +4,8 @@
  * (`agent_message`, `reasoning`, `command_execution`, `file_change`, `mcp_tool_call`, `web_search`, `todo_list`, `error`), `error`.
  */
 import { z } from "zod";
-import type { Activity, Backend, RunUsage } from "../../runs/types";
+import { backendViolation } from "../../runs/prompt";
+import type { Activity, RunUsage } from "../../runs/types";
 import { CANONICAL_TOOL_PREFIX, type HarnessEvent, type ReplayContext } from "../types";
 
 /** The one place that knows how Codex names an MCP tool for the model (`mcp__<server>__<tool>`). [INFERENCE: not observed on a live run] */
@@ -271,7 +272,6 @@ function mentionsServer(text: string, server: string): boolean {
 // ---- replay -------------------------------------------------------------------------------------------------------
 
 const ARGS_LIMIT = 2048;
-const CHECK_TOOL_PREFIXES = ["mcp__tapocalypse_"];
 
 function truncateArgs(v: unknown): unknown {
   let json: string | undefined;
@@ -286,12 +286,6 @@ function truncateArgs(v: unknown): unknown {
 
 function formatDuration(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
-}
-
-function backendViolation(tool: string, backend: Backend): boolean {
-  if (CHECK_TOOL_PREFIXES.some((p) => tool.startsWith(p))) return true;
-  if (backend === "mobile-mcp") return tool.startsWith("mcp__artemis_");
-  return tool.startsWith("mcp__mobile_mcp_mobile_") || tool === "mcp__artemis_mobile_run_task";
 }
 
 function isProgressTool(tool: string): boolean {
@@ -319,7 +313,7 @@ export function frameToActivity(frame: unknown, ctx: ReplayContext): Activity | 
       // The store maps a frame twice (scan, then page): only a different frame repeating the id is a duplicate.
       if (!d || !id || (prev && prev.seq !== seq)) return null;
       ctx.starts.set(id, { ts: Date.parse(ts), tool: d.tool, seq });
-      return toolLine(d, id, ts, seq, ctx.backend);
+      return toolLine(d, id, ts, seq);
     }
     case "item.completed": {
       const item = parsed.item;
@@ -332,7 +326,7 @@ export function frameToActivity(frame: unknown, ctx: ReplayContext): Activity | 
       const id = "id" in item ? item.id : undefined;
       if (!d || !id) return null;
       const start = ctx.starts.get(id);
-      if (!start) return toolLine(d, id, ts, seq, ctx.backend);
+      if (!start) return toolLine(d, id, ts, seq);
       const outcome = describeOutcome(item);
       if (isProgressTool(d.tool) && outcome.ok) return null;
       const durationMs = Math.max(0, Date.parse(ts) - start.ts);
@@ -356,10 +350,10 @@ export function frameToActivity(frame: unknown, ctx: ReplayContext): Activity | 
   }
 }
 
-function toolLine(d: ToolDescription, callId: string, ts: string, seq: number, backend: Backend): Activity | null {
+function toolLine(d: ToolDescription, callId: string, ts: string, seq: number): Activity | null {
   if (isProgressTool(d.tool)) return null;
   const base = { ts, seq, callId, tool: d.tool, args: truncateArgs(d.args) };
-  if (backendViolation(d.tool, backend)) return { ...base, kind: "warn", text: `backend violation: ${d.tool}` };
+  if (backendViolation(d.tool)) return { ...base, kind: "warn", text: `backend violation: ${d.tool}` };
   const shown = JSON.stringify(d.args) ?? "";
   return { ...base, kind: "tool", text: `${d.tool} ${shown.slice(0, 200)}` };
 }

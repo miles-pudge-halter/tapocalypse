@@ -20,7 +20,6 @@ function makeRun(over: Partial<Run> = {}): Run {
     deviceRequest: { platform: "android" },
     deviceSerial: null,
     bootedByRun: false,
-    backend: "mobile-mcp",
     packageId: "com.example.app",
     status: "done",
     verdict: "PASS",

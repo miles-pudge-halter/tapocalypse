@@ -906,7 +906,6 @@ function buildRun(spec: RunSpec, ctx: BuildContext): Finished {
     deviceName: infra ? null : device.name,
     deviceLabel: infra ? null : device.label,
     bootedByRun,
-    backend: "mobile-mcp",
     packageId: PACKAGE_ID,
     status,
     verdict,

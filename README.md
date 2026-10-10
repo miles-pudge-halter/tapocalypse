@@ -120,7 +120,9 @@ The agent follows [docs/agent-setup.md](docs/agent-setup.md). It checks the prer
 3. Calls `qa_wait_run { runId }` until `timedOut` is `false`, narrating the checks as they resolve.
 4. Reads the verdict and the report (`qa_get_report`, with the screenshots from `qa_get_screenshots`), fixes what failed, then confirms with `qa_rerun { runId, only: "failed" }`.
 
-Twenty tools in total, from batches to steering: [MCP reference](docs/guide.md#dispatching-runs-from-your-coding-agent-mcp) and [parameters](docs/api.md#mcp-tools).
+The tools range from batches to steering to device leases: [MCP reference](docs/guide.md#dispatching-runs-from-your-coding-agent-mcp) and [parameters](docs/api.md#mcp-tools).
+
+**Share devices between agents.** Tapocalypse is also the device broker for every coding agent on the machine. An agent borrows an emulator or simulator with `device_acquire` (a *lease*), uses only that one, and gives it back with `device_release`. While it is leased, no other agent and no QA run is given that device; they wait in one first-in, first-out queue, and a lease that is not renewed ends on its own (default 30 minutes). The Devices page shows who holds each device and why, and lets you release a stuck lease. Leases are cooperative: they keep well-behaved agents apart but do not stop a process that runs `adb` on its own. [Sharing devices between agents](docs/guide.md#sharing-devices-between-agents), and the snippet to give your agents is in [docs/agent-setup.md](docs/agent-setup.md#8-let-your-agents-borrow-devices-optional).
 
 ## Runtimes
 
@@ -134,7 +136,7 @@ Tapocalypse ships no model and no agent loop. It drives a coding-agent CLI headl
 | Cost | When the provider reports one | Yes (Claude Code's estimate) | Tokens only |
 | Full transcript | Yes | No (activity feed) | No (activity feed) |
 
-Selection order, limits, models and the optional Artemis driver (omp only): [Agent runtimes](docs/guide.md#agent-runtimes).
+Selection order, limits and models: [Agent runtimes](docs/guide.md#agent-runtimes).
 
 ## Docs
 

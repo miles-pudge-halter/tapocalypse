@@ -1,8 +1,7 @@
-import type { Activity, Backend, Platform, Run, RunStatus, Verdict } from "../../src/runs/types";
+import type { Activity, Platform, Run, RunStatus, Verdict } from "../../src/runs/types";
 
 export type {
   Activity,
-  Backend,
   BuildInfo,
   Check,
   CheckStatus,
@@ -18,11 +17,13 @@ export type {
   Verdict,
   VerdictSource,
 } from "../../src/runs/types";
-export type { Device } from "../../src/devices/devices";
+export type { Device, DeviceWaiter } from "../../src/devices/devices";
+export type { LeaseEvent, LeaseView } from "../../src/devices/leases";
 export type { DoctorCheck, DoctorReport } from "../../src/doctor";
 export type { Detection, Framework } from "../../src/projects/detect";
 export type { Project, ProjectInput, ProjectStatus, ValidationResult } from "../../src/projects/registry";
 import type { Device } from "../../src/devices/devices";
+import type { LeaseView } from "../../src/devices/leases";
 import type { Detection, Framework } from "../../src/projects/detect";
 import type { ProjectInput, ProjectStatus, ValidationResult } from "../../src/projects/registry";
 import type { DoctorReport } from "../../src/doctor";
@@ -44,10 +45,21 @@ export interface HarnessList {
   harnesses: HarnessInfo[];
 }
 
+/** A queued run's wait on an agent lease (`RunView.queueHold`). */
+export interface QueueHold {
+  serial: string;
+  deviceName: string;
+  holder: string;
+  reason: string | null;
+  expiresAt: string;
+}
+
 export type RunView = Run & {
   queuePosition: number | null;
   durationMs: number | null;
   queueReason: string | null;
+  /** Set while a queued run waits for a device an agent holds (for "any": the lease that ends first). */
+  queueHold?: QueueHold | null;
   /** Absolute path of the report on disk (both storages); null when the run has none. */
   reportFile: string | null;
   /** Absolute artefact folder of the run in Tapocalypse's data dir (report + screenshots). */
@@ -136,6 +148,8 @@ export interface PoolView {
   bootedCount: number;
   bootable: BootableDevice[];
   idle: { serial: string; shutdownAt: string }[];
+  /** Agents and queued runs waiting for "any <platform>" (nothing free); absent on an older server. */
+  waiting?: { platform: Platform; holders: string[]; runIds: string[] }[];
 }
 
 export interface ReportEntry {
@@ -182,7 +196,6 @@ export interface StartRunInput {
   /** Optional when `suiteId` is set (the suite body becomes the brief). */
   brief?: string;
   device: DeviceTarget;
-  backend: Backend;
   packageId: string;
   source?: StartRunSource;
   model?: string;
@@ -197,7 +210,6 @@ export interface StartBatchInput {
   brief?: string;
   suiteId?: string;
   devices: DeviceTarget[];
-  backend?: Backend;
   packageId?: string;
   model?: string;
   harness?: HarnessId;
@@ -223,19 +235,38 @@ export interface RunListParams {
 
 export class ApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  /** The server's machine-readable `code` (e.g. `held_by_run`), when the error body carries one. */
+  code: string | null;
+  /** The lease the server reports as current when a release was refused. */
+  lease: LeaseView | null;
+  constructor(status: number, message: string, extra: { code?: string | null; lease?: LeaseView | null } = {}) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.code = extra.code ?? null;
+    this.lease = extra.lease ?? null;
   }
+}
+
+function isLeaseView(value: unknown): value is LeaseView {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "ref" in value &&
+    typeof value.ref === "string" &&
+    "holder" in value &&
+    typeof value.holder === "string"
+  );
 }
 
 async function ensureOk(res: Response): Promise<void> {
   if (res.ok) return;
   const body: unknown = await res.json().catch(() => null);
-  const message =
-    body && typeof body === "object" && "error" in body && typeof body.error === "string" ? body.error : `${res.status} ${res.statusText}`;
-  throw new ApiError(res.status, message);
+  const record = body && typeof body === "object" ? body : null;
+  const message = record && "error" in record && typeof record.error === "string" ? record.error : `${res.status} ${res.statusText}`;
+  const code = record && "code" in record && typeof record.code === "string" ? record.code : null;
+  const lease = record && "lease" in record && isLeaseView(record.lease) ? record.lease : null;
+  throw new ApiError(res.status, message, { code, lease });
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -332,6 +363,17 @@ export const api = {
   },
   async shutdownDevice(serial: string) {
     await ensureOk(await fetch(`/api/devices/${encodeURIComponent(serial)}/shutdown`, { method: "POST" }));
+  },
+  leases: () => request<LeaseView[]>("/api/leases"),
+  /** UI force release; `ref` is the lease's public handle, so a lease that changed hands is never released by mistake. */
+  async releaseDevice(serial: string, ref: string) {
+    await ensureOk(
+      await fetch(`/api/devices/${encodeURIComponent(serial)}/release`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ref }),
+      }),
+    );
   },
   reports: (projectId: string) => request<ReportEntry[]>(`/api/projects/${encodeURIComponent(projectId)}/reports`),
   report: (projectId: string, name: string) =>

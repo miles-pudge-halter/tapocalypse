@@ -2,11 +2,10 @@ import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { config, HttpError, MAX_STEER_CHARS, XCRUN_BIN } from "../config";
-import { adb, appVersion, artemisLockOwner, type Device, ensureArtemisHelper, exec, listDevices, mobileMcpDeviceId, stopMobileMcpDeviceServer } from "../devices/devices";
+import { adb, appVersion, type Device, exec, listDevices, mobileMcpDeviceId } from "../devices/devices";
 import { bootAndroid, bootIos } from "../devices/pool";
 import { getHarness as registryHarness, harnessBin } from "../harness";
 import {
-  ARTEMIS_SERVER,
   type Harness,
   type HarnessEvent,
   type HarnessExit,
@@ -248,7 +247,7 @@ export function createRunner(scheduler: RunnerScheduler, deps: RunnerDeps = {}):
   function onRaw(ctx: RunContext, frame: object): void {
     const { run } = ctx;
     const seq = appendEvent(run.id, frame);
-    const activity = ctx.harness.toActivity(frame, { backend: run.backend, seq, starts: ctx.starts });
+    const activity = ctx.harness.toActivity(frame, { seq, starts: ctx.starts });
     if (activity) scheduler.activity(run.id, activity);
   }
 
@@ -368,22 +367,9 @@ export function createRunner(scheduler: RunnerScheduler, deps: RunnerDeps = {}):
     }
     await captureBuild(ctx, serial);
 
-    const owner = artemisLockOwner(serial);
-    if (owner) {
-      finalize(ctx, failure(`Artemis task ${owner.sessionId ?? owner.pid} holds ${serial}; stop it in the Artemis console first`));
-      return false;
-    }
-
-    if (run.backend === "artemis") {
-      log(run, "info", `installing/upgrading Artemis helper on ${serial}`);
-      await ensureArtemisHelper(serial);
-      const pids = await stopMobileMcpDeviceServer(serial);
-      log(run, "info", `stopped mobile-mcp DeviceServer pids: ${pids.length ? pids.join(", ") : "none"}`);
-    } else {
-      run.deviceLabel = await mobileMcpDeviceId({ serial, platform: run.deviceRequest.platform });
-      scheduler.update(run);
-      log(run, "info", `mobile-mcp device id: ${run.deviceLabel}`);
-    }
+    run.deviceLabel = await mobileMcpDeviceId({ serial, platform: run.deviceRequest.platform });
+    scheduler.update(run);
+    log(run, "info", `mobile-mcp device id: ${run.deviceLabel}`);
     if (ctx.cancelRequested) {
       finalize(ctx, failure("cancelled", "cancelled"));
       return false;
@@ -446,13 +432,10 @@ export function createRunner(scheduler: RunnerScheduler, deps: RunnerDeps = {}):
     return { model, effort };
   }
 
-  /** Device driver and progress servers mounted for this session only. Artemis comes from the user's own omp config. */
+  /** Device driver and progress servers mounted for this session only. */
   function buildMcpServers(ctx: RunContext, token: string): McpServerSpec[] {
     const { run, harness } = ctx;
-    const servers: McpServerSpec[] = [];
-    if (run.backend === "mobile-mcp") {
-      servers.push({ name: MOBILE_MCP_SERVER, transport: "stdio", command: "npx", args: ["-y", `${MOBILE_MCP_PACKAGE}@latest`] });
-    }
+    const servers: McpServerSpec[] = [{ name: MOBILE_MCP_SERVER, transport: "stdio", command: "npx", args: ["-y", `${MOBILE_MCP_PACKAGE}@latest`] }];
     if (!harness.capabilities.nativeProgressTools) {
       servers.push({
         name: PROGRESS_SERVER,
@@ -507,7 +490,6 @@ export function createRunner(scheduler: RunnerScheduler, deps: RunnerDeps = {}):
       model,
       effort,
       mcpServers: buildMcpServers(ctx, token),
-      backend: run.backend,
       limits: { maxTime: config.runMaxTime, maxTurns: config.agent?.maxTurns ?? null, maxBudgetUsd: config.agent?.maxBudgetUsd ?? null },
       settings: { ...config.agent?.harnesses?.[harness.id], bin: harnessBin(harness.id) },
       onEvent: (e) => onEvent(ctx, e),
@@ -527,8 +509,7 @@ export function createRunner(scheduler: RunnerScheduler, deps: RunnerDeps = {}):
     const info = await session.ready();
     if (info.model) run.model = info.model;
     scheduler.update(run);
-    const deviceServer = run.backend === "mobile-mcp" ? MOBILE_MCP_SERVER : ARTEMIS_SERVER;
-    const required = [deviceServer, ...(harness.capabilities.nativeProgressTools ? [] : [PROGRESS_SERVER])];
+    const required = [MOBILE_MCP_SERVER, ...(harness.capabilities.nativeProgressTools ? [] : [PROGRESS_SERVER])];
     for (const name of required) {
       const server = info.mcp.find((m) => m.name === name);
       if (!server?.ok) {

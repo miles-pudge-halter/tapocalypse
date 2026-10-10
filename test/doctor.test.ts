@@ -1,8 +1,7 @@
-import { afterAll, describe, expect, test } from "bun:test";
-import fs from "node:fs";
+import { describe, expect, test } from "bun:test";
 import os from "node:os";
 import path from "node:path";
-import { artemisAvailable, buildReport, type DoctorCheck, type DoctorEnv } from "../src/doctor";
+import { buildReport, type DoctorCheck, type DoctorEnv } from "../src/doctor";
 import { getHarness } from "../src/harness";
 import { HARNESS_IDS, type HarnessId } from "../src/harness/types";
 
@@ -31,7 +30,6 @@ function envWith(over: Partial<DoctorEnv>): DoctorEnv {
     gitBin: "git",
     ghBin: "gh",
     emulatorBin: "emulator",
-    artemisPath: undefined,
     platform: "linux",
     configPath: path.join(os.tmpdir(), "tapocalypse-doctor-missing-config.json"),
     configuredAvds: [],
@@ -128,33 +126,6 @@ describe("buildReport", () => {
     expect(projects.status).toBe("warn");
     expect(projects.detail).toContain("broken");
     expect(projects.detail).toContain("repoPath: does not exist");
-  });
-});
-
-describe("artemis status", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tapocalypse-doctor-"));
-  afterAll(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const cases: [string, string | undefined, DoctorCheck["status"], boolean][] = [
-    ["unset", undefined, "skip", false],
-    ["set but missing", path.join(dir, "absent"), "error", false],
-    ["set and exists", dir, "ok", true],
-  ];
-
-  for (const [name, artemisPath, status, available] of cases) {
-    test(`${name} → ${status}, backends ${available ? "include" : "exclude"} artemis`, async () => {
-      const report = await buildReport(envWith({ artemisPath }));
-      const artemis = byId(report.checks, "artemis");
-      expect(artemis.status).toBe(status);
-      expect(artemis.required).toBe(false);
-      expect(report.backends).toEqual(available ? ["mobile-mcp", "artemis"] : ["mobile-mcp"]);
-      expect(artemisAvailable(artemisPath)).toBe(available);
-    });
-  }
-
-  test("a file at artemisPath does not count as available", () => {
-    const file = path.join(dir, "file.txt");
-    fs.writeFileSync(file, "x");
-    expect(artemisAvailable(file)).toBe(false);
   });
 });
 

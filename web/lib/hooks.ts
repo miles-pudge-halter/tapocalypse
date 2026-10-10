@@ -19,10 +19,12 @@ import {
   type Suite,
   type Template,
   type Verdict,
-  type Backend,
+  type LeaseEvent,
+  type LeaseView,
   type HarnessInfo,
   type HarnessId,
 } from "./api";
+import { createLeaseCache, parseWatched } from "./leases";
 import { readStorage, writeStorage } from "./storage";
 
 // --- routing ---
@@ -189,6 +191,58 @@ function parseRunEvent(e: Event): RunView | null {
   return null;
 }
 
+const LEASE_CHANGES: readonly string[] = ["acquired", "renewed", "released", "expired", "revoked", "gone"];
+
+/** Narrows a global `lease` event's payload; null for anything that is not one. */
+export function parseLeaseEvent(e: Event): LeaseEvent | null {
+  try {
+    const data: unknown = JSON.parse((e as MessageEvent<string>).data);
+    if (data && typeof data === "object" && "serial" in data && "change" in data && typeof data.serial === "string" && LEASE_CHANGES.includes(String(data.change))) {
+      return data as LeaseEvent;
+    }
+  } catch {
+    // malformed payload
+  }
+  return null;
+}
+
+const leaseCache = createLeaseCache();
+const resolvedLeases = new WeakMap<Event, LeaseView | null>();
+
+/**
+ * Subscribes to global `lease` events with the lease the event is about. The server sends `lease: null` on every ending
+ * event, so that is the last lease this tab knew for the serial (null if it never saw one). All listeners of one event
+ * get the same answer.
+ */
+export function listenLeaseEvent(handler: (event: LeaseEvent, lease: LeaseView | null) => void): () => void {
+  return listenEvent("lease", (e) => {
+    const event = parseLeaseEvent(e);
+    if (!event) return;
+    if (!resolvedLeases.has(e)) resolvedLeases.set(e, leaseCache.resolve(event));
+    handler(event, resolvedLeases.get(e) ?? null);
+  });
+}
+
+/** Calls `cb` (debounced) after every global `lease` event and once after each reconnect (events may have been missed). */
+function useLeasesChanged(cb: () => void, delayMs = 300): void {
+  const ref = useRef(cb);
+  ref.current = cb;
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const fire = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => ref.current(), delayMs);
+    };
+    const offLease = listenEvent("lease", fire);
+    const offOpen = listenEvent("open", fire);
+    return () => {
+      clearTimeout(timer);
+      offLease();
+      offOpen();
+    };
+  }, [delayMs]);
+}
+
 /** True while the global event stream is open ("Live"); false while (re)connecting. */
 export function useLiveConnection(): boolean {
   return useSyncExternalStore(
@@ -351,6 +405,7 @@ export function useProjectScope(): { projectId: string | null; setProjectId(id: 
 
 // --- devices, doctor, reports ---
 
+/** Every device, polled and refreshed within a second of any lease change. */
 export function useDevices(intervalMs = 10_000): {
   devices: Device[];
   loading: boolean;
@@ -358,13 +413,28 @@ export function useDevices(intervalMs = 10_000): {
   refresh(): void;
 } {
   const { data, loading, error, refresh } = useAsync(api.devices, "devices", intervalMs);
+  useLeasesChanged(refresh);
+  useEffect(() => {
+    if (data) leaseCache.seed(data.flatMap((d) => (d.lease ? [d.lease] : [])));
+  }, [data]);
   return { devices: data ?? [], loading, error, refresh };
 }
 
 export function usePool(intervalMs = 5_000): { pool: PoolView | null; loading: boolean; error: string | null; refresh(): void } {
   const { data, loading, error, refresh } = useAsync(api.pool, "pool", intervalMs);
   useRunsChanged(refresh, 600);
+  useLeasesChanged(refresh);
   return { pool: data, loading, error, refresh };
+}
+
+/** Agent and run leases (public view, no secrets), refreshed by `lease` events. */
+export function useLeases(intervalMs = 15_000): { leases: LeaseView[]; loading: boolean; error: string | null; refresh(): void } {
+  const { data, loading, error, refresh } = useAsync(api.leases, "leases", intervalMs);
+  useLeasesChanged(refresh);
+  useEffect(() => {
+    if (data) leaseCache.seed(data);
+  }, [data]);
+  return { leases: data ?? [], loading: loading && data === null, error, refresh };
 }
 
 // --- useDoctor: one shared report so a Re-check anywhere updates the sidebar dot too ---
@@ -653,7 +723,6 @@ export interface NewRunPrefill {
   brief?: string;
   device?: { platform: Platform; serial?: string };
   devices?: { platform: Platform; serial?: string }[];
-  backend?: Backend;
   packageId?: string;
   model?: string;
   harness?: HarnessId;
@@ -694,6 +763,61 @@ export function useNewRun(): { open: boolean; prefill: NewRunPrefill | null; ope
     () => newRunState,
   );
   return { ...state, openNewRun, close: closeNewRun };
+}
+
+// --- a release this tab confirmed, so its own `revoked` event does not toast a second time ---
+
+let ownRelease: { serial: string; ref: string } | null = null;
+
+/** Remembers (before the request goes out; the event can beat the response) the lease this tab is releasing. */
+export function noteOwnRelease(serial: string, ref: string): void {
+  ownRelease = { serial, ref };
+}
+
+export function lastOwnRelease(): { serial: string; ref: string } | null {
+  return ownRelease;
+}
+
+// --- devices watched for "notify me when free" ---
+
+const WATCH_KEY = "tapocalypse-watched-devices";
+const watchListeners = new Set<() => void>();
+let watchedState: ReadonlySet<string> = new Set(parseWatched(readStorage(WATCH_KEY)));
+
+function setWatched(next: ReadonlySet<string>): void {
+  watchedState = next;
+  writeStorage(WATCH_KEY, next.size > 0 ? JSON.stringify([...next]) : null);
+  for (const l of watchListeners) l();
+}
+
+function toggleWatched(serial: string): void {
+  const next = new Set(watchedState);
+  if (!next.delete(serial)) next.add(serial);
+  setWatched(next);
+}
+
+function unwatchDevice(serial: string): void {
+  if (!watchedState.has(serial)) return;
+  const next = new Set(watchedState);
+  next.delete(serial);
+  setWatched(next);
+}
+
+/** The Devices-page bell: serials the user wants a toast for when they become free; persisted, unknown serials kept. */
+export function useWatchedDevices(): { watched: ReadonlySet<string>; toggle(serial: string): void; unwatch(serial: string): void } {
+  const watched = useSyncExternalStore(
+    (listener) => {
+      watchListeners.add(listener);
+      return () => void watchListeners.delete(listener);
+    },
+    () => watchedState,
+  );
+  return { watched, toggle: toggleWatched, unwatch: unwatchDevice };
+}
+
+/** Current watch list for non-React callers (the notifications component's event handler). */
+export function isWatched(serial: string): boolean {
+  return watchedState.has(serial);
 }
 
 // --- notifications preference ---

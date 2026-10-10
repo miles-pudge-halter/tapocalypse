@@ -1,11 +1,13 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { ExecResult } from "../src/devices/devices";
 import { detectInstalled, detectReadiness, getHarness, harnessBin, resetProbeCache, resolveHarness, resolveHarnessId } from "../src/harness";
 import { HARNESS_IDS, type Harness, type HarnessId } from "../src/harness/types";
 
 const result = (code: number): ExecResult => ({ code, stdout: new Uint8Array(), text: "", stderr: "" });
 
+// Reset on both sides: a fake readiness map primed here must not leak into files that resolve the default harness.
 beforeEach(resetProbeCache);
+afterEach(resetProbeCache);
 
 describe("resolveHarnessId", () => {
   test("run request > project > persona > config", () => {
@@ -111,8 +113,6 @@ describe("registry", () => {
   test("every id resolves to an adapter with its own id and the contract capabilities", () => {
     for (const id of HARNESS_IDS) expect(getHarness(id).id).toBe(id);
     expect(getHarness("omp").capabilities).toMatchObject({ nativeProgressTools: true, transcriptExport: true, steer: true });
-    expect(getHarness("omp").capabilities.backends).toEqual(["mobile-mcp", "artemis"]);
     expect(getHarness("codex").capabilities.steer).toBe(false);
-    expect(getHarness("claude").capabilities.backends).not.toContain("artemis");
   });
 });

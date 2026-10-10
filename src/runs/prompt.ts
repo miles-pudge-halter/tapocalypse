@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
-import { ARTEMIS_SERVER, HARNESS_IDS, type HarnessId, MOBILE_MCP_SERVER, PROGRESS_SERVER } from "../harness/types";
+import { HARNESS_IDS, type HarnessId, MOBILE_MCP_SERVER, PROGRESS_SERVER } from "../harness/types";
 import { screenshotsDir } from "./artefacts";
-import type { Backend, Run } from "./types";
+import type { Run } from "./types";
 
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
@@ -43,15 +43,10 @@ export function loadPersona(file: string): Persona {
 /** The callable name the harness gives `tool` of the MCP server `server` (see `HarnessSession.toolName`). */
 export type ToolNamer = (server: string, tool: string) => string;
 
-/** Backend rules and driving guidance, naming the tools exactly as this harness mounted them for this run. */
-function backendRules(backend: Backend, toolName: ToolNamer): string {
+/** Driving guidance, naming the mobile-mcp tools exactly as this harness mounted them for this run. */
+function driverRules(toolName: ToolNamer): string {
   const mobile = (tool: string) => toolName(MOBILE_MCP_SERVER, tool);
-  const artemis = (tool: string) => toolName(ARTEMIS_SERVER, tool);
-  if (backend === "artemis") {
-    const direct = ["mobile_click", "mobile_swipe", "mobile_input_text", "mobile_press_key", "mobile_long_press", "mobile_get_device_state", "mobile_manage_app"];
-    return `Driver backend: Artemis direct tools. Use ${direct.map(artemis).join(", ")} (package names only) plus adb. NEVER call any ${mobile("")}* tool and NEVER call ${artemis("mobile_run_task")}.`;
-  }
-  return `Driver backend: mobile-mcp. Use the ${mobile("")}* tools plus adb/simctl. NEVER call any ${artemis("")}* tool.
+  return `Driver: mobile-mcp. Use the ${mobile("")}* tools plus adb/simctl.
 mobile-mcp: call ${mobile("mobile_list_elements_on_screen")} once per screen and tap by its @ref; re-list only after navigation or a visible change.
 Group known sequences (tap, type, tap) in ${mobile("mobile_batch_commands")}. Use ${mobile("mobile_take_screenshot")} only for what the element list cannot show.`;
 }
@@ -59,7 +54,6 @@ Group known sequences (tap, type, tap) in ${mobile("mobile_batch_commands")}. Us
 function deviceLine(run: Run): string {
   const target = `Target device: ${run.deviceSerial} (${run.deviceRequest.platform})`;
   const rules = "NEVER touch, boot, shut down or reconfigure any other device, NEVER run `adb kill-server`, and do not boot your own emulator — this device was assigned to you.";
-  if (run.backend === "artemis") return `${target}. Pass it explicitly to every adb / device tool call. ${rules}`;
   const id = run.deviceLabel ?? run.deviceSerial;
   return `${target}; mobile-mcp device id: "${id}". Use the serial for every adb / simctl call and the device id as the device argument of every mobile-mcp tool (never the adb serial for an emulator). ${rules}`;
 }
@@ -110,7 +104,7 @@ ${deviceLine(run)}
 App package: ${run.packageId}. Use the build that is already installed unless the brief says otherwise.
 Run id: ${runId}.
 Time budget: ${opts.runMaxTime}. If you are running out of time, stop testing, write the report with what you have and call ${finish}.
-${sourceBlock(run)}${backendRules(run.backend, toolName)}
+${sourceBlock(run)}${driverRules(toolName)}
 
 Progress reporting (mandatory — the Tapocalypse UI is built from these calls):
 1. After writing your test plan and before your first device action, call ${plan} with every check (short ids like C1, C2...).
@@ -123,12 +117,7 @@ Brief:
 ${run.brief}`;
 }
 
-/** Canonical `mcp__mobile_mcp_*` names (adapters strip plugin namespaces, so user-config and Tapocalypse-provisioned servers look alike). */
-const MOBILE_MCP_TOOL = /^mcp__mobile_mcp_/;
-
-/** True when `tool` (canonical name) breaks the run's backend rule or reaches Tapocalypse's own MCP server. */
-export function backendViolation(tool: string, backend: Backend): boolean {
-  if (tool.startsWith("mcp__tapocalypse_")) return true;
-  if (backend === "mobile-mcp") return tool.startsWith("mcp__artemis_");
-  return MOBILE_MCP_TOOL.test(tool) || tool === "mcp__artemis_mobile_run_task";
+/** True when `tool` (canonical name) reaches Tapocalypse's own MCP server (run management), which a run's agent must never use. */
+export function backendViolation(tool: string): boolean {
+  return tool.startsWith("mcp__tapocalypse_");
 }

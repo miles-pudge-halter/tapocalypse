@@ -1,10 +1,9 @@
-import { existsSync, statSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { ADB_BIN, CONFIG_PATH, config, EMULATOR_BIN, GH_BIN, GIT_BIN } from "./config";
 import { type ExecResult, exec, parseAdbDevices } from "./devices/devices";
 import { getHarness, type HarnessReadiness, harnessBin, pickDefaultHarness, readinessOf } from "./harness";
 import { HARNESS_IDS, type Harness, type HarnessId } from "./harness/types";
 import { listProjects, projectEvents, type ProjectStatus } from "./projects/registry";
-import type { Backend } from "./runs/types";
 
 export interface DoctorCheck {
   id: string;
@@ -17,7 +16,6 @@ export interface DoctorCheck {
 
 export interface DoctorReport {
   checks: DoctorCheck[];
-  backends: Backend[];
 }
 
 /** Everything the checks read from the outside world; tests inject their own. */
@@ -32,7 +30,6 @@ export interface DoctorEnv {
   gitBin: string;
   ghBin: string;
   emulatorBin: string | null;
-  artemisPath: string | undefined;
   platform: NodeJS.Platform;
   configPath: string;
   configuredAvds: readonly string[];
@@ -60,7 +57,6 @@ export function defaultEnv(): DoctorEnv {
     gitBin: GIT_BIN,
     ghBin: GH_BIN,
     emulatorBin: EMULATOR_BIN,
-    artemisPath: config.artemisPath,
     platform: process.platform,
     configPath: CONFIG_PATH,
     configuredAvds: config.devicePool.android.avds,
@@ -81,14 +77,6 @@ function versionAtLeast(version: string, min: readonly number[]): boolean {
     if ((parts[i] ?? 0) !== min[i]) return (parts[i] ?? 0) > min[i];
   }
   return true;
-}
-
-function isDir(p: string): boolean {
-  try {
-    return statSync(p).isDirectory();
-  } catch {
-    return false;
-  }
 }
 
 /** Runs one check; a throw or a hang becomes an error row instead of failing the whole report. */
@@ -322,25 +310,6 @@ function checkProjects(env: DoctorEnv): Promise<DoctorCheck> {
   });
 }
 
-function checkArtemis(env: DoctorEnv): Promise<DoctorCheck> {
-  return guarded({ id: "artemis", label: "Artemis backend", required: false }, () => {
-    if (!env.artemisPath) return { status: "skip", detail: "Not configured; agents drive devices with mobile-mcp" };
-    if (!isDir(env.artemisPath)) {
-      return {
-        status: "error",
-        detail: `artemisPath ${env.artemisPath} does not exist`,
-        fix: `Clone Artemis there, or remove artemisPath from ${env.configPath}`,
-      };
-    }
-    return { status: "ok", detail: env.artemisPath };
-  });
-}
-
-/** Artemis is offered only when `artemisPath` is set and the directory exists. */
-export function artemisAvailable(artemisPath: string | undefined = config.artemisPath): boolean {
-  return !!artemisPath && isDir(artemisPath);
-}
-
 /** Uncached report for an explicit environment. */
 export async function buildReport(env: DoctorEnv): Promise<DoctorReport> {
   const xcrun = checkXcrun(env);
@@ -357,7 +326,6 @@ export async function buildReport(env: DoctorEnv): Promise<DoctorReport> {
     checkDevices(env),
     checkConfig(env),
     checkProjects(env),
-    checkArtemis(env),
   ]);
   const byHarness = new Map<HarnessId, DoctorCheck[]>(harnessRows);
   const readiness = Object.fromEntries(HARNESS_IDS.map((id) => [id, readinessOf(id, byHarness.get(id) ?? [])])) as Record<HarnessId, HarnessReadiness>;
@@ -366,7 +334,7 @@ export async function buildReport(env: DoctorEnv): Promise<DoctorReport> {
     (byHarness.get(id) ?? []).map((c) => (c.id === id || c.id === authId(id) ? { ...c, required: id === selected } : c)),
   );
   const checks = [os, bun, agentRuntimeCheck(env, readiness), ...harnessList, ...rest];
-  return { checks, backends: artemisAvailable(env.artemisPath) ? ["mobile-mcp", "artemis"] : ["mobile-mcp"] };
+  return { checks };
 }
 
 let cache: { at: number; report: Promise<DoctorReport> } | null = null;

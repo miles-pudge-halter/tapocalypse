@@ -109,7 +109,6 @@ export function ReportRunCard({ runId }: { runId: string }) {
             <span className="font-mono text-xs">{run.deviceSerial ?? run.deviceRequest.platform}</span>
           )}
         </MetaRow>
-        <MetaRow label="Backend">{run.backend}</MetaRow>
         <MetaRow label="Requested by">{run.requestedBy}</MetaRow>
         <MetaRow label="Started">{formatTime(run.startedAt)}</MetaRow>
         <MetaRow label="Duration">{formatDuration(run.startedAt, run.endedAt, now)}</MetaRow>

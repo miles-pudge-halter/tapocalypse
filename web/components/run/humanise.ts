@@ -101,7 +101,7 @@ function prettify(snake: string): string {
   return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
-/** `mobile_click_on_screen_at_coordinates` and `click` style actions of mobile-mcp / Artemis. */
+/** `mobile_click_on_screen_at_coordinates` actions of mobile-mcp, and the short `click` style names legacy runs recorded. */
 function deviceAction(action: string, a: ArgRecord): string {
   switch (action) {
     case "click_on_screen_at_coordinates":
@@ -197,6 +197,7 @@ function batchLabel(a: ArgRecord): string {
 }
 
 const MOBILE_MCP = /^mcp__(?:\w*?_)?mobile_mcp_mobile_(\w+)$/;
+/** Legacy: old runs recorded a removed driver's tools under this prefix; their activity feeds still replay. */
 const ARTEMIS = /^mcp__artemis_mobile_(\w+)$/;
 
 /** `ADB=$(command -v adb || …);` / `A=~/…/platform-tools/adb;` — a variable that only names the adb binary. */

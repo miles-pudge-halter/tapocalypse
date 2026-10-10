@@ -30,20 +30,21 @@ The config file is created with the defaults below when it does not exist. It is
 | `retry.infra` | `1` | Automatic retries of a run that failed on infrastructure (boot failure, agent crash, MCP tools missing) before any check resolved. `0` disables retries |
 | `retention.days` | unset | Delete finished runs that ended more than this many days ago. Unset keeps them |
 | `retention.maxRuns` | unset | Keep only the newest this-many runs, deleting older finished ones. Unset keeps them |
-| `artemisPath` | unset | Path to a local Artemis clone; enables the optional [Artemis backend](guide.md#optional-artemis-backend) |
 | `devicePool.android.avds` | `[]` | AVD names (`emulator -list-avds`) Tapocalypse may boot on demand. Wear OS, TV and Automotive AVDs are never booted automatically |
 | `devicePool.android.basePort` | `5560` | First emulator console port; booted emulators get even ports from here |
 | `devicePool.android.maxBooted` | `1` | Max emulators Tapocalypse keeps booted at once; `0` disables auto-boot |
 | `devicePool.android.minSize` | `"720x1280"` | Booted emulators with a smaller screen are overridden to this size (`WxH`) |
 | `devicePool.android.minDensity` | `320` | Density (dpi) used with that override |
 | `devicePool.android.idleShutdownMinutes` | `20` | Shut down a Tapocalypse-booted emulator after this much idle time |
-| `devicePool.android.excludeSerials` | `[]` | Android serials that are never used |
+| `devicePool.android.excludeSerials` | `[]` | Android serials that are never used: not picked for runs, and not leasable by agents (`device_excluded`) |
 | `devicePool.ios.simulators` | `[]` | Simulator UDIDs Tapocalypse may boot on demand (macOS only) |
 | `devicePool.ios.idleShutdownMinutes` | `20` | Same idle shutdown for simulators |
 
 `retention` is evaluated at startup and every 6 hours. It only removes run folders under the data directory, which now include each run's report and screenshots (export what you want to keep first with `tapocalypse report <id> --export <dir>`); files that old runs wrote into your repositories are never touched, and queued or active runs are never deleted. See [Data and retention](guide.md#data-and-retention).
 
-A fresh config file contains the defaults above for `port`, `maxConcurrentRuns`, `runMaxTime`, `projects` and `devicePool`; `agent`, `retry`, `retention` and `artemisPath` are optional and can be added by hand.
+A fresh config file contains the defaults above for `port`, `maxConcurrentRuns`, `runMaxTime`, `projects` and `devicePool`; `agent`, `retry` and `retention` are optional and can be added by hand.
+
+**Ignored keys.** Keys the schema does not know, including those of removed features, are ignored. Runs no longer take a `backend`; old runs that recorded one still load. [Device leases](guide.md#sharing-devices-between-agents) have no settings: the TTL (default 30 min, 5-120) is chosen per lease by the agent, and agent leases are stored in `<data dir>/leases.json`.
 
 ## Agent harnesses
 
@@ -80,7 +81,7 @@ A *harness* is the headless coding-agent CLI that plays the QA agent: `omp`, `cl
 
 **Limits.** `runMaxTime` applies to every harness: omp enforces it with `--max-time` and Tapocalypse kills it 5 minutes after the budget; Claude Code and Codex CLI are killed at the budget. `agent.maxTurns` and `agent.maxBudgetUsd` apply to Claude Code only. A limit that ends a session is reported as a run with `errorKind: "timeout"` and the limit named in `error`; the verdict is derived from the resolved checks as for a time-out ([Run outcomes](guide.md#run-outcomes)).
 
-**What a harness can do.** Steering a running agent works with omp and Claude Code but not Codex CLI (`POST /api/runs/:id/steer` answers 409). Cost is reported by omp (when the provider says) and Claude Code; Codex CLI reports tokens only. An HTML transcript and the [Artemis backend](guide.md#optional-artemis-backend) are omp-only: a run that asks for `backend: "artemis"` on another harness is rejected with a 400. Each adapter writes its per-run configuration into the run's data folder, never into your repository or your home directory. The run's progress token reaches the agent through an owner-only file (mode 0600) in the run's data folder: `mcp.json` for Claude Code, `tpc-mcp.json` for the stdio bridge Codex CLI talks to; the file stays until retention removes the run; omp uses host tools and needs no token. It is never on the command line or in `run.json`, `events.jsonl` or `stderr.log`. One side effect is outside Tapocalypse's control: the first `codex exec` in a repository makes Codex CLI add that path as trusted to `~/.codex/config.toml`; see [SECURITY.md](../SECURITY.md).
+**What a harness can do.** Steering a running agent works with omp and Claude Code but not Codex CLI (`POST /api/runs/:id/steer` answers 409). Cost is reported by omp (when the provider says) and Claude Code; Codex CLI reports tokens only. An HTML transcript is omp-only. Each adapter writes its per-run configuration into the run's data folder, never into your repository or your home directory. The run's progress token reaches the agent through an owner-only file (mode 0600) in the run's data folder: `mcp.json` for Claude Code, `tpc-mcp.json` for the stdio bridge Codex CLI talks to; the file stays until retention removes the run; omp uses host tools and needs no token. It is never on the command line or in `run.json`, `events.jsonl` or `stderr.log`. One side effect is outside Tapocalypse's control: the first `codex exec` in a repository makes Codex CLI add that path as trusted to `~/.codex/config.toml`; see [SECURITY.md](../SECURITY.md).
 
 ## Environment variables
 

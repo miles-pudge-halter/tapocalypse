@@ -1,40 +1,79 @@
-import { AlertCircle, Apple, Bot, ExternalLink, Loader2, Play, Power, RefreshCw, Smartphone } from "lucide-react";
-import { type ReactNode, useEffect, useState } from "react";
+import { AlertCircle, Apple, Bell, BellRing, Bot, ExternalLink, Loader2, Play, Power, RefreshCw, Smartphone, Unlock } from "lucide-react";
+import { Fragment, type ReactNode, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { CodeBlock } from "@/components/code-block";
 import { DeviceFrame } from "@/components/device-frame";
 import { DeviceName } from "@/components/device-name";
 import { EmptyState } from "@/components/empty-state";
+import { LeaseRing } from "@/components/lease-ring";
 import { PageHeader } from "@/components/page-header";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
-import { api, type BootableDevice, type Device, type PoolView, type RunView, runHash } from "@/lib/api";
-import { deviceSubtitle } from "@/lib/format";
-import { useActiveRuns, useDevices, useNewRun, useNow, usePool, useProjectScope } from "@/lib/hooks";
+import { Toggle } from "@/components/ui/toggle";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  api,
+  type BootableDevice,
+  type Device,
+  type DeviceWaiter,
+  type LeaseView,
+  type PoolView,
+  type RunView,
+  runHash,
+} from "@/lib/api";
+import { deviceSubtitle, formatClock, formatTime } from "@/lib/format";
+import {
+  listenLeaseEvent,
+  noteOwnRelease,
+  useActiveRuns,
+  useDevices,
+  useNewRun,
+  useNow,
+  usePool,
+  useProjectScope,
+  useWatchedDevices,
+} from "@/lib/hooks";
+import {
+  deviceCounts,
+  deviceState,
+  expiredNote,
+  leaseTimes,
+  poolWaitingLine,
+  releaseCopy,
+  releaseOutcome,
+  sortRank,
+  usedForQa,
+} from "@/lib/leases";
+import { strikeOnce } from "@/lib/strike";
 import { cn } from "@/lib/utils";
 
-type Tone = "free" | "busy" | "warn" | "neutral";
+type Tone = "free" | "busy" | "held" | "warn" | "neutral";
 
 const TONE: Record<Tone, { badge: string; dot: string }> = {
   free: { badge: "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300", dot: "bg-emerald-500" },
   busy: { badge: "border-blue-500/30 bg-blue-500/10 text-blue-700 dark:text-blue-300", dot: "bg-blue-500" },
+  held: { badge: "border-violet-500/40 bg-violet-50 text-violet-800 dark:bg-violet-950/40 dark:text-violet-300", dot: "bg-violet-500" },
   warn: { badge: "border-orange-500/30 bg-orange-500/10 text-orange-800 dark:text-orange-300", dot: "bg-orange-400" },
   neutral: { badge: "border-stone-500/30 bg-stone-500/10 text-stone-700 dark:text-stone-300", dot: "bg-stone-500" },
 };
 
-/** A chip's `pulse` marks transient states (running, booting) the way StatusBadge does for runs. */
-function StateChip({ tone, pulse = false, children }: { tone: Tone; pulse?: boolean; children: ReactNode }) {
+/** A chip's `pulse` marks transient states (running, booting) the way StatusBadge does for runs; `glyph` replaces the dot. */
+function StateChip({ tone, pulse = false, glyph, children }: { tone: Tone; pulse?: boolean; glyph?: ReactNode; children: ReactNode }) {
   const t = TONE[tone];
   return (
     <Badge variant="outline" className={cn("max-w-full", t.badge)}>
-      <span className="relative flex size-2 shrink-0">
-        {pulse && <span className={cn("absolute inline-flex size-full animate-ping rounded-full opacity-60", t.dot)} />}
-        <span className={cn("relative inline-flex size-2 rounded-full", t.dot)} />
-      </span>
+      {glyph ?? (
+        <span className="relative flex size-2 shrink-0">
+          {pulse && <span className={cn("absolute inline-flex size-full animate-ping rounded-full opacity-60", t.dot)} />}
+          <span className={cn("relative inline-flex size-2 rounded-full", t.dot)} />
+        </span>
+      )}
       <span className="truncate">{children}</span>
     </Badge>
   );
@@ -44,55 +83,295 @@ function minutesUntil(iso: string, now: number): number {
   return Math.max(0, Math.ceil((Date.parse(iso) - now) / 60_000));
 }
 
-/** Whether Tapocalypse would ever schedule QA on this device. */
-function usedForQa(device: Device): boolean {
-  return device.deviceType !== "watch" && device.deviceType !== "tv";
+/** A lease that ran out while this page was open: the "Lease expired" chip for 10 s and one strike across the card. */
+interface ExpiredLease {
+  holder: string;
+  /** ISO time the lease ran out. */
+  at: string;
+  /** False when the device went straight to the next waiter, so there is nothing to call "expired". */
+  chip: boolean;
+  /** Bumped per event so the card replays the strike. */
+  seq: number;
 }
 
-function sortRank(device: Device): number {
-  if (!usedForQa(device)) return 4;
-  if (device.excluded === true || device.artemisOwner) return 3;
-  if (device.state === "booting") return 2;
-  return device.busyRunId ? 0 : 1;
+const EXPIRED_CHIP_MS = 10_000;
+
+function WaiterEntry({ waiter }: { waiter: DeviceWaiter }) {
+  if (waiter.kind === "agent") return <>{waiter.holder}</>;
+  return (
+    <>
+      run “
+      <a href={runHash(waiter.runId)} className="underline-offset-4 hover:text-foreground hover:underline">
+        {waiter.title}
+      </a>
+      ”
+    </>
+  );
+}
+
+/** Who waits for this device, in queue order: the first two inline, the rest in a hover card. */
+function WaitersLine({ waiters }: { waiters: DeviceWaiter[] }) {
+  const shown = waiters.slice(0, 2);
+  const more = waiters.length - shown.length;
+  return (
+    <p className="truncate text-xs text-muted-foreground">
+      {waiters.length} waiting:{" "}
+      {shown.map((w, i) => (
+        <Fragment key={i}>
+          {i > 0 && ", "}
+          <WaiterEntry waiter={w} />
+        </Fragment>
+      ))}
+      {more > 0 && (
+        <>
+          {", "}
+          <HoverCard openDelay={200}>
+            <HoverCardTrigger asChild>
+              <span tabIndex={0} className="cursor-default underline decoration-dotted underline-offset-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                +{more} more
+              </span>
+            </HoverCardTrigger>
+            <HoverCardContent className="w-72">
+              <ol className="list-decimal space-y-1 pl-4 text-xs">
+                {waiters.map((w, i) => (
+                  <li key={i} className="break-words">
+                    <WaiterEntry waiter={w} />
+                  </li>
+                ))}
+              </ol>
+            </HoverCardContent>
+          </HoverCard>
+        </>
+      )}
+    </p>
+  );
+}
+
+/** Holder, reason and times of an agent lease, with the draining ring; the hover card carries the full text and the lease ref. */
+function LeasePanel({ lease }: { lease: LeaseView }) {
+  const now = useNow(lease.claimPending ? 1_000 : 10_000);
+  return (
+    <HoverCard openDelay={300}>
+      <HoverCardTrigger asChild>
+        <div
+          tabIndex={0}
+          className="flex gap-2 rounded-md border bg-muted/40 p-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400"
+        >
+          <LeaseRing size={32} lease={lease} />
+          <div className="min-w-0 flex-1 space-y-0.5">
+            <p className="truncate text-sm font-medium" title={lease.holder}>
+              {lease.holder}
+            </p>
+            {lease.reason && <p className="line-clamp-2 break-words text-xs text-muted-foreground">{lease.reason}</p>}
+            <p className="text-xs tabular-nums text-muted-foreground">{leaseTimes(lease, now)}</p>
+          </div>
+        </div>
+      </HoverCardTrigger>
+      <HoverCardContent className="w-80 space-y-2 text-xs">
+        <p className="break-words text-sm font-medium">{lease.holder}</p>
+        {lease.reason && <p className="whitespace-pre-wrap break-words">{lease.reason}</p>}
+        <p className="font-mono text-muted-foreground">Lease {lease.ref}</p>
+        <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-muted-foreground">
+          <dt>Acquired</dt>
+          <dd className="tabular-nums">{formatTime(lease.acquiredAt)}</dd>
+          <dt>Renewed</dt>
+          <dd className="tabular-nums">{formatTime(lease.renewedAt)}</dd>
+          <dt>{lease.claimPending ? "Pick up by" : "Expires"}</dt>
+          <dd className="tabular-nums">{formatTime(lease.expiresAt)}</dd>
+        </dl>
+      </HoverCardContent>
+    </HoverCard>
+  );
+}
+
+function ReleaseDialog({
+  device,
+  lease,
+  open,
+  onOpenChange,
+  onDone,
+}: {
+  device: Device;
+  /** The lease as it was when the dialog opened; only this `ref` is ever sent. */
+  lease: LeaseView;
+  open: boolean;
+  onOpenChange(open: boolean): void;
+  onDone(): void;
+}) {
+  const now = useNow(15_000);
+  const { unwatch } = useWatchedDevices();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const waiters = device.waiters ?? [];
+  const copy = releaseCopy(lease, waiters, now);
+  const ended = device.lease?.ref !== lease.ref;
+  const next = waiters[0];
+
+  async function confirm() {
+    setBusy(true);
+    setError(null);
+    noteOwnRelease(device.serial, lease.ref);
+    let failure: unknown = null;
+    try {
+      await api.releaseDevice(device.serial, lease.ref);
+    } catch (e) {
+      failure = e;
+    }
+    const outcome = releaseOutcome(failure);
+    setBusy(false);
+    if (outcome.kind === "failed") {
+      setError(outcome.message);
+      return;
+    }
+    onOpenChange(false);
+    if (outcome.kind === "released") {
+      const who = next ? (next.kind === "agent" ? next.holder : `“${next.title}”`) : null;
+      if (!next) unwatch(device.serial);
+      toast.success(`Released ${device.name}`, { description: who ? `${who} has it now.` : "It is free." });
+    } else if (outcome.kind === "already_free") toast.info(`${device.name} was already free`);
+    else if (outcome.kind === "held_by_run") toast.info(`${device.name} is running a QA run now`, { description: "Cancel the run to free it." });
+    else {
+      toast.error(`The lease on ${device.name} changed hands`, {
+        description: `It is now held by ${outcome.holder ?? "another agent"}. Nothing was released.`,
+      });
+    }
+    onDone();
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={(next) => !busy && onOpenChange(next)}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Release {device.name}?</DialogTitle>
+          <DialogDescription>{copy.body}</DialogDescription>
+        </DialogHeader>
+        {copy.wouldEnd && !ended && <p className="text-xs text-muted-foreground">{copy.wouldEnd}</p>}
+        {error && (
+          <Alert variant="destructive">
+            <AlertCircle />
+            <AlertTitle>Could not release {device.name}</AlertTitle>
+            <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
+        <DialogFooter>
+          <Button variant="outline" autoFocus disabled={busy} onClick={() => onOpenChange(false)}>
+            {ended ? "Close" : "Keep lease"}
+          </Button>
+          {ended ? (
+            <p className="self-center text-sm text-muted-foreground">This lease already ended.</p>
+          ) : (
+            <Button variant="destructive" disabled={busy} onClick={() => void confirm()}>
+              {busy ? <Loader2 className="animate-spin" /> : <Unlock />}
+              Release device
+            </Button>
+          )}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
 }
 
 function DeviceCard({
   device,
   run,
   now,
+  expired,
+  watching,
   shuttingDown,
   onNewRun,
   onShutdown,
+  onToggleWatch,
+  onReleased,
 }: {
   device: Device;
   run: RunView | undefined;
   now: number;
+  expired: ExpiredLease | undefined;
+  watching: boolean;
   shuttingDown: boolean;
   onNewRun(): void;
   onShutdown(): void;
+  onToggleWatch(): void;
+  onReleased(): void;
 }) {
   const qa = usedForQa(device);
-  const excluded = device.excluded === true;
   const booting = device.state === "booting";
   const placeholder = device.serial.startsWith("booting:");
   const PlatformIcon = device.platform === "ios" ? Apple : Bot;
-  const canShutdown = Boolean(device.bootedByTapocalypse) && !device.busyRunId && !booting;
+  const { lease } = device;
+  const waiters = device.waiters ?? [];
+  const state = deviceState(device, expired?.chip === true);
+  const canShutdown = Boolean(device.bootedByTapocalypse) && !device.busyRunId && !booting && !lease;
+
+  const cardRef = useRef<HTMLDivElement>(null);
+  const [flash, setFlash] = useState(false);
+  const [releaseOpen, setReleaseOpen] = useState(false);
+  const [releasing, setReleasing] = useState<LeaseView | null>(null);
+
+  // One strike per `expired` event; the class goes away again on the animation's end.
+  const expiredSeq = expired?.seq;
+  useEffect(() => {
+    if (expiredSeq === undefined) return;
+    setFlash(true);
+    const frame = requestAnimationFrame(() => cardRef.current && strikeOnce(cardRef.current));
+    return () => cancelAnimationFrame(frame);
+  }, [expiredSeq]);
 
   let chip: ReactNode;
-  if (!qa) chip = <StateChip tone="neutral">Not used for QA</StateChip>;
-  else if (booting) chip = <StateChip tone="neutral" pulse>Booting…</StateChip>;
-  else if (device.busyRunId) chip = <StateChip tone="busy" pulse>Running</StateChip>;
-  else if (device.artemisOwner) {
-    const owner = device.artemisOwner;
-    chip = <StateChip tone="warn">Artemis task {owner.sessionId ?? `pid ${owner.pid}`}</StateChip>;
-  } else if (excluded) chip = <StateChip tone="neutral">Excluded in config</StateChip>;
-  else if (device.idleShutdownAt) {
-    const m = minutesUntil(device.idleShutdownAt, now);
-    chip = <StateChip tone="warn">{m === 0 ? "Idle — shutting down" : `Idle — shuts down in ${m}m`}</StateChip>;
-  } else chip = <StateChip tone="free">Free</StateChip>;
+  switch (state) {
+    case "not_qa":
+      chip = <StateChip tone="neutral">Not used for QA</StateChip>;
+      break;
+    case "booting":
+      chip = (
+        <StateChip tone="neutral" pulse>
+          Booting…
+        </StateChip>
+      );
+      break;
+    case "running":
+      chip = (
+        <StateChip tone="busy" pulse>
+          Running
+        </StateChip>
+      );
+      break;
+    case "reserved":
+      chip = (
+        <StateChip tone="held" glyph={lease && <LeaseRing size={12} lease={lease} />}>
+          Reserved for {lease?.holder ?? "an agent"}
+        </StateChip>
+      );
+      break;
+    case "held":
+      chip = (
+        <StateChip tone="held" glyph={lease && <LeaseRing size={12} lease={lease} />}>
+          Held by agent
+        </StateChip>
+      );
+      break;
+    case "excluded":
+      chip = <StateChip tone="neutral">Excluded in config</StateChip>;
+      break;
+    case "expired":
+      chip = <StateChip tone="warn">Lease expired</StateChip>;
+      break;
+    case "idle": {
+      const m = device.idleShutdownAt ? minutesUntil(device.idleShutdownAt, now) : 0;
+      chip = <StateChip tone="warn">{m === 0 ? "Idle — shutting down" : `Idle — shuts down in ${m}m`}</StateChip>;
+      break;
+    }
+    case "free":
+      chip = <StateChip tone="free">Free</StateChip>;
+      break;
+  }
 
   return (
-    <Card className={cn("py-4", !qa && "opacity-75")}>
+    <Card
+      ref={cardRef}
+      className={cn("py-4", !qa && "opacity-75", flash && "strike")}
+      onAnimationEnd={(e) => e.animationName === "strike-travel" && setFlash(false)}
+    >
       <CardContent className="flex gap-4 px-4">
         <DeviceFrame
           serial={placeholder || booting ? null : device.serial}
@@ -115,15 +394,21 @@ function DeviceCard({
               {device.kind}
             </Badge>
             {device.bootedByTapocalypse && <Badge variant="outline">Booted by Tapocalypse</Badge>}
-            {device.artemisHelper && <Badge variant="outline">Artemis helper on</Badge>}
           </div>
+          {lease && (state === "held" || state === "reserved") && <LeasePanel lease={lease} />}
+          {state === "expired" && expired && (
+            <p className="text-xs text-muted-foreground">
+              {expired.holder}&rsquo;s lease ran out at {formatClock(expired.at)}.
+            </p>
+          )}
           {run && (
             <a href={runHash(run.id)} className="truncate text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline">
               {run.title}
             </a>
           )}
+          {waiters.length > 0 && <WaitersLine waiters={waiters} />}
           <div className="mt-auto flex flex-wrap gap-2 pt-1">
-            {qa && !excluded && !booting && (
+            {qa && device.excluded !== true && !booting && !lease && (
               <Button size="sm" variant={device.busyRunId ? "outline" : "default"} onClick={onNewRun}>
                 <Play />
                 New run here
@@ -137,6 +422,31 @@ function DeviceCard({
                 </a>
               </Button>
             )}
+            {lease && (
+              <>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    setReleasing(lease);
+                    setReleaseOpen(true);
+                  }}
+                >
+                  <Unlock />
+                  Release…
+                </Button>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Toggle size="sm" variant="outline" pressed={watching} onPressedChange={onToggleWatch} aria-label="Notify me when free">
+                      {watching ? <BellRing /> : <Bell />}
+                    </Toggle>
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    {watching ? `You'll be notified when ${device.name} is free. Click to stop.` : `Notify me when ${device.name} is free`}
+                  </TooltipContent>
+                </Tooltip>
+              </>
+            )}
             {canShutdown && (
               <Button size="sm" variant="ghost" disabled={shuttingDown} onClick={onShutdown}>
                 {shuttingDown ? <Loader2 className="animate-spin" /> : <Power />}
@@ -146,6 +456,7 @@ function DeviceCard({
           </div>
         </div>
       </CardContent>
+      {releasing && <ReleaseDialog device={device} lease={releasing} open={releaseOpen} onOpenChange={setReleaseOpen} onDone={onReleased} />}
     </Card>
   );
 }
@@ -179,10 +490,13 @@ function GhostCard({ target, booting, capped, onBoot }: { target: BootableDevice
   );
 }
 
-function PoolHeader({ pool }: { pool: PoolView }) {
+function PoolHeader({ pool, devices }: { pool: PoolView; devices: Device[] }) {
+  const { held, usable } = deviceCounts(devices);
+  const waiting = (pool.waiting ?? []).map(poolWaitingLine).filter((line): line is string => line !== null);
+  const showLeases = held > 0 || waiting.length > 0;
   return (
     <Card className="mb-6 py-4">
-      <CardContent className="grid gap-4 px-4 sm:grid-cols-2">
+      <CardContent className={cn("grid gap-4 px-4 sm:grid-cols-2", showLeases && "lg:grid-cols-3")}>
         <div className="space-y-1.5">
           <p className="text-sm font-medium tabular-nums">
             {pool.activeRuns} / {pool.maxConcurrentRuns} run slots
@@ -197,6 +511,26 @@ function PoolHeader({ pool }: { pool: PoolView }) {
           <Progress value={pool.maxBooted > 0 ? (pool.bootedCount / pool.maxBooted) * 100 : 0} aria-label="Emulators booted by Tapocalypse" />
           <p className="text-xs text-muted-foreground">Emulators Tapocalypse started itself (maxBooted). Idle ones shut down automatically.</p>
         </div>
+        {showLeases && (
+          <div className="space-y-1.5">
+            <p className="text-sm font-medium tabular-nums">
+              {held} / {usable} devices held by agents
+            </p>
+            <Progress
+              value={usable > 0 ? (held / usable) * 100 : 0}
+              aria-label="Devices held by agents"
+              className="bg-violet-500/20 [&>[data-slot=progress-indicator]]:bg-violet-500"
+            />
+            <p className="text-xs text-muted-foreground">
+              Coding agents borrow devices with device_acquire. A lease ends when the agent releases it or its time runs out.
+            </p>
+            {waiting.map((line) => (
+              <p key={line} className="text-xs">
+                {line}
+              </p>
+            ))}
+          </div>
+        )}
       </CardContent>
     </Card>
   );
@@ -214,9 +548,12 @@ export function Devices() {
   const { runs: activeRuns } = useActiveRuns();
   const { projectId } = useProjectScope();
   const { openNewRun } = useNewRun();
+  const { watched, toggle: toggleWatch } = useWatchedDevices();
   const now = useNow(15_000);
   const [booting, setBooting] = useState<ReadonlySet<string>>(new Set());
   const [shuttingDown, setShuttingDown] = useState<ReadonlySet<string>>(new Set());
+  const [expired, setExpired] = useState<ReadonlyMap<string, ExpiredLease>>(new Map());
+  const expiredSeq = useRef(0);
 
   // An optimistic "Booting…" ends as soon as the pool stops offering the target (it is running or placeholder-listed).
   useEffect(() => {
@@ -238,6 +575,30 @@ export function Devices() {
     }, 3_000);
     return () => clearInterval(timer);
   }, [pendingBoots, refreshDevices, refreshPool]);
+
+  // An `expired` lease event flashes the card and shows "Lease expired" for a few seconds; nothing else (not load, not release) does.
+  useEffect(() => {
+    const timers = new Set<ReturnType<typeof setTimeout>>();
+    const off = listenLeaseEvent((event, ended) => {
+      if (event.change !== "expired") return;
+      const entry: ExpiredLease = { ...expiredNote(event, ended, Date.now()), seq: ++expiredSeq.current };
+      setExpired((m) => new Map(m).set(event.serial, entry));
+      const timer = setTimeout(() => {
+        timers.delete(timer);
+        setExpired((m) => {
+          if (m.get(event.serial) !== entry) return m;
+          const next = new Map(m);
+          next.delete(event.serial);
+          return next;
+        });
+      }, EXPIRED_CHIP_MS);
+      timers.add(timer);
+    });
+    return () => {
+      off();
+      for (const t of timers) clearTimeout(t);
+    };
+  }, []);
 
   async function boot(target: BootableDevice) {
     const key = bootKey(target);
@@ -274,7 +635,9 @@ export function Devices() {
     }
   }
 
-  const sorted = [...devices].sort((a, b) => sortRank(a) - sortRank(b) || a.serial.localeCompare(b.serial));
+  const sorted = [...devices].sort(
+    (a, b) => sortRank(a, expired.get(a.serial)?.chip === true) - sortRank(b, expired.get(b.serial)?.chip === true) || a.serial.localeCompare(b.serial),
+  );
   const ghosts = (pool?.bootable ?? []).filter((b) => !devices.some((d) => d.serial === `booting:${b.target}`));
   const androidCapped = pool !== null && pool.bootedCount >= pool.maxBooted;
   const showEmpty = !loading && !error && devices.length === 0 && ghosts.length === 0;
@@ -308,7 +671,7 @@ export function Devices() {
       )}
 
       {pool ? (
-        <PoolHeader pool={pool} />
+        <PoolHeader pool={pool} devices={devices} />
       ) : poolError ? (
         <Alert className="mb-6">
           <AlertCircle />
@@ -351,11 +714,18 @@ export function Devices() {
               device={d}
               run={d.busyRunId ? activeRuns.find((r) => r.id === d.busyRunId) : undefined}
               now={now}
+              expired={expired.get(d.serial)}
+              watching={watched.has(d.serial)}
               shuttingDown={shuttingDown.has(d.serial)}
               onNewRun={() =>
                 openNewRun({ ...(projectId && { projectId }), device: { platform: d.platform, serial: d.serial } })
               }
               onShutdown={() => void shutdown(d)}
+              onToggleWatch={() => toggleWatch(d.serial)}
+              onReleased={() => {
+                refreshDevices();
+                refreshPool();
+              }}
             />
           ))}
           {ghosts.map((b) => (

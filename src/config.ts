@@ -20,7 +20,6 @@ export const ConfigSchema = z.object({
   maxConcurrentRuns: z.number().int().positive(),
   /** Wall-clock budget per run (`90m`, `1h30m`, `45s`; a bare number is minutes). Validated so every harness gets a usable limit. */
   runMaxTime: z.string().refine((s) => (parseDurationMs(s) ?? 0) > 0, "must be a positive duration such as 90m, 1h30m or 45s"),
-  artemisPath: z.string().min(1).optional(),
   /** Loose entries: the project registry validates them individually so one bad project never blocks boot. */
   projects: z.array(z.record(z.string(), z.unknown())),
   /**
@@ -126,6 +125,7 @@ function loadConfig(): Config {
   }
   const parsed = ConfigSchema.safeParse(raw);
   if (!parsed.success) fatal(`config: ${parsed.error.message}`);
+  if (raw !== null && typeof raw === "object" && "artemisPath" in raw) console.warn("artemisPath is no longer used");
   const envPort = Number(process.env.TAPOCALYPSE_PORT);
   if (process.env.TAPOCALYPSE_PORT && (!Number.isInteger(envPort) || envPort <= 0)) fatal(`TAPOCALYPSE_PORT must be a port number`);
   return deepFreeze(process.env.TAPOCALYPSE_PORT ? { ...parsed.data, port: envPort } : parsed.data);
@@ -148,7 +148,6 @@ export const ADB_BIN = process.env.ADB_BIN ?? "adb";
 export const XCRUN_BIN = process.env.XCRUN_BIN ?? "xcrun";
 export const GIT_BIN = process.env.GIT_BIN ?? "git";
 export const GH_BIN = process.env.GH_BIN ?? "gh";
-export const ARTEMIS_LOCK_DIR = path.join(os.tmpdir(), "artemis", "device-locks");
 
 /** Android emulator binary: explicit env, then the SDK locations Android Studio uses on macOS and Linux. */
 export function findEmulator(
@@ -171,7 +170,8 @@ export const EMULATOR_BIN = findEmulator();
 export const MAX_STEER_CHARS = 4000;
 
 export class HttpError extends Error {
-  constructor(public status: number, message: string) {
+  /** `code` is a stable machine-readable error id (e.g. `lease_not_found`) that API/MCP surfaces forward next to the message. */
+  constructor(public status: number, message: string, public code?: string) {
     super(message);
   }
 }

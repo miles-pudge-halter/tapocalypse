@@ -141,7 +141,6 @@ function makeOpts(over: Partial<SpawnOptions> = {}) {
     model: null,
     effort: null,
     mcpServers: [TPC, MOBILE],
-    backend: "mobile-mcp",
     limits: { maxTime: null, maxTurns: null, maxBudgetUsd: null },
     settings: {},
     onEvent: (e) => events.push(e),
@@ -507,7 +506,6 @@ describe("codex spawn", () => {
     expect(realHarness.capabilities.steer).toBe(false);
     expect(realHarness.capabilities.interrupt).toBe(false);
     expect(realHarness.capabilities.appendSystemPrompt).toBe(true);
-    expect(realHarness.capabilities.backends).toEqual(["mobile-mcp"]);
   });
 
   test("tool names are mcp__<server>__<tool>", () => {
@@ -558,10 +556,10 @@ describe("codex abort", () => {
 });
 
 describe("codex toActivity", () => {
-  async function replay(name: string, backend: ReplayContext["backend"] = "mobile-mcp") {
+  async function replay(name: string) {
     const frames = lines(await fixture(name)).map((l, i) => ({ ...JSON.parse(l), _ts: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString() }));
     const starts: ReplayContext["starts"] = new Map();
-    return frames.map((f, seq) => realHarness.toActivity(f, { backend, seq, starts }));
+    return frames.map((f, seq) => realHarness.toActivity(f, { seq, starts }));
   }
 
   test("shows device, shell, edit and search calls with durations, and hides progress calls", async () => {
@@ -595,21 +593,19 @@ describe("codex toActivity", () => {
     expect(out[0]?.text).toContain("stream disconnected");
   });
 
-  test("tapocalypse's own MCP tools and the other backend's tools are flagged as violations", () => {
+  test("tapocalypse's own MCP tools are flagged as violations, device tools are plain tool lines", () => {
     const starts: ReplayContext["starts"] = new Map();
-    const call = (id: string, server: string, tool: string, backend: ReplayContext["backend"]) =>
+    const call = (id: string, server: string, tool: string) =>
       realHarness.toActivity(
         { type: "item.started", item: { id, type: "mcp_tool_call", server, tool, arguments: {}, status: "in_progress" } },
-        { backend, seq: 0, starts },
+        { seq: 0, starts },
       );
-    expect(call("a", "tapocalypse", "qa_start_run", "mobile-mcp")?.kind).toBe("warn");
-    expect(call("b", "artemis", "mobile_run_task", "mobile-mcp")?.kind).toBe("warn");
-    expect(call("c", "mobile_mcp", "mobile_list_apps", "artemis")?.kind).toBe("warn");
-    expect(call("d", "mobile_mcp", "mobile_list_apps", "mobile-mcp")?.kind).toBe("tool");
+    expect(call("a", "tapocalypse", "qa_start_run")?.kind).toBe("warn");
+    expect(call("d", "mobile_mcp", "mobile_list_apps")?.kind).toBe("tool");
   });
 
   test("Tapocalypse's own _activity lines and unknown frames replay sanely", () => {
-    const ctx = { backend: "mobile-mcp", seq: 3, starts: new Map() } as const;
+    const ctx = { seq: 3, starts: new Map() } as const;
     expect(realHarness.toActivity({ type: "_activity", kind: "info", text: "hello", _ts: "2026-01-01T00:00:00.000Z" }, ctx)).toEqual({
       ts: "2026-01-01T00:00:00.000Z",
       seq: 3,

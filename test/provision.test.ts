@@ -16,8 +16,7 @@ function writeJson(file: string, value: unknown): void {
   fs.writeFileSync(file, JSON.stringify(value));
 }
 
-const launch = (backend: "mobile-mcp" | "artemis" = "mobile-mcp") =>
-  mcpLaunchArgs({ repoPath: repo }, backend, { home, pluginRoot, profile: null });
+const launch = () => mcpLaunchArgs({ repoPath: repo }, { home, pluginRoot, profile: null });
 
 beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), "tapocalypse-provision-"));
@@ -76,15 +75,10 @@ describe("mcpLaunchArgs", () => {
 
   test("a named omp profile reads that profile's user config, not the default one", async () => {
     writeJson(path.join(home, ".omp", "agent", "mcp.json"), { mcpServers: { mm: MOBILE_MCP } });
-    const plan = await mcpLaunchArgs({ repoPath: repo }, "mobile-mcp", { home, pluginRoot, profile: "qa" });
+    const plan = await mcpLaunchArgs({ repoPath: repo }, { home, pluginRoot, profile: "qa" });
     expect(plan.args).toHaveLength(2);
     writeJson(path.join(home, ".omp", "profiles", "qa", "agent", "mcp.json"), { mcpServers: { mm: MOBILE_MCP } });
-    expect((await mcpLaunchArgs({ repoPath: repo }, "mobile-mcp", { home, pluginRoot, profile: "qa" })).args).toEqual([]);
-  });
-
-  test("the artemis backend never provisions mobile-mcp", async () => {
-    expect(await launch("artemis")).toMatchObject({ args: [], expectedMobileMcp: null, pluginDir: null });
-    expect(fs.existsSync(pluginRoot)).toBe(false);
+    expect((await mcpLaunchArgs({ repoPath: repo }, { home, pluginRoot, profile: "qa" })).args).toEqual([]);
   });
 
   test("rewriting is idempotent and repairs a stale plugin file", async () => {
@@ -103,22 +97,16 @@ describe("prefixesFromState", () => {
   const prompt = (routes: string[]) => ({ systemPrompt: ["intro", ...routes.map((r) => `- "x" → \`xd://${r}\` — doc`)] });
 
   test("reads both naming forms from the MCP route list", () => {
-    expect(prefixesFromState(prompt(["mcp__mobile_mcp_mobile_list_elements_on_screen", "mcp__artemis_mobile_run_task"]))).toMatchObject({
-      mobileMcp: "mcp__mobile_mcp_",
-      artemis: "mcp__artemis_",
-    });
-    expect(prefixesFromState(prompt(["mcp__tpc_mobile_mcp_mobile_list_elements_on_screen"]))).toMatchObject({
-      mobileMcp: "mcp__tpc_mobile_mcp_",
-      artemis: null,
-    });
+    expect(prefixesFromState(prompt(["mcp__mobile_mcp_mobile_list_elements_on_screen"])).mobileMcp).toBe("mcp__mobile_mcp_");
+    expect(prefixesFromState(prompt(["mcp__tpc_mobile_mcp_mobile_list_elements_on_screen"])).mobileMcp).toBe("mcp__tpc_mobile_mcp_");
   });
 
   test("finds tools mounted as plain tools via dumpTools and reports nothing for unrelated servers", () => {
     expect(prefixesFromState({ dumpTools: [{ name: "mcp__tpc_mobile_mcp_mobile_list_elements_on_screen" }, { name: "read" }] }).mobileMcp).toBe(
       "mcp__tpc_mobile_mcp_",
     );
-    expect(prefixesFromState(prompt(["mcp__atlassian_search"]))).toMatchObject({ mobileMcp: null, artemis: null });
-    expect(prefixesFromState(null)).toMatchObject({ mobileMcp: null, artemis: null });
+    expect(prefixesFromState(prompt(["mcp__atlassian_search"])).mobileMcp).toBeNull();
+    expect(prefixesFromState(null).mobileMcp).toBeNull();
   });
 
   test("flags a bounded route list so absence is not treated as proof", () => {

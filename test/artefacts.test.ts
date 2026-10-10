@@ -222,12 +222,13 @@ describe("exportRun destination safety", () => {
   });
 
   test("exporting a legacy run into its own reports folder does not delete its screenshots", async () => {
-    fs.mkdirSync(path.join(repo, "qa", "screenshots", "legacy-self"), { recursive: true });
-    fs.writeFileSync(path.join(repo, "qa", "QA-REPORT-legacy-self.md"), "# legacy\n");
-    fs.writeFileSync(path.join(repo, "qa", "screenshots", "legacy-self", "01.png"), PNG);
-    const legacy = makeRun({ id: "legacy-self", storage: "repo", reportPath: "qa/QA-REPORT-legacy-self.md" });
+    const legacy = makeRun({ storage: "repo" });
+    legacy.reportPath = `qa/QA-REPORT-${legacy.id}.md`;
+    fs.mkdirSync(path.join(repo, "qa", "screenshots", legacy.id), { recursive: true });
+    fs.writeFileSync(path.join(repo, "qa", `QA-REPORT-${legacy.id}.md`), "# legacy\n");
+    fs.writeFileSync(path.join(repo, "qa", "screenshots", legacy.id, "01.png"), PNG);
     await exportRun(legacy, project(), path.join(repo, "qa"));
-    expect(fs.readFileSync(path.join(repo, "qa", "screenshots", "legacy-self", "01.png"))).toEqual(PNG);
-    expect(fs.readFileSync(path.join(repo, "qa", "QA-REPORT-legacy-self.md"), "utf8")).toBe("# legacy\n");
+    expect(fs.readFileSync(path.join(repo, "qa", "screenshots", legacy.id, "01.png"))).toEqual(PNG);
+    expect(fs.readFileSync(path.join(repo, "qa", `QA-REPORT-${legacy.id}.md`), "utf8")).toBe("# legacy\n");
   });
 });

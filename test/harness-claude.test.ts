@@ -5,7 +5,7 @@ import path from "node:path";
 import type { ExecResult } from "../src/devices/devices";
 import { createClaudeHarness } from "../src/harness/claude";
 import type { ClaudeProcess } from "../src/harness/claude/session";
-import type { Activity, Backend } from "../src/runs/types";
+import type { Activity } from "../src/runs/types";
 import type { HarnessEvent, HarnessSession, McpServerSpec, ReplayContext, SpawnOptions } from "../src/harness/types";
 
 const fixtureFrames = (name: string): Record<string, unknown>[] =>
@@ -177,7 +177,6 @@ function rig(
     model: null,
     effort: null,
     mcpServers: [progressServer, mobileServer],
-    backend: "mobile-mcp",
     limits: { maxTime: null, maxTurns: null, maxBudgetUsd: null },
     settings: {},
     onEvent: (e) => events.push(e),
@@ -625,8 +624,8 @@ describe("claude ready", () => {
 const BASE_TS = Date.parse("2026-10-09T10:00:00.000Z");
 
 /** Replays frames the way `store.readActivity` does: one shared ReplayContext, seq = line index, `_ts` stamped by the runner. */
-function replay(frames: Record<string, unknown>[], backend: Backend = "mobile-mcp"): (Activity | null)[] {
-  const ctx: ReplayContext = { backend, seq: 0, starts: new Map() };
+function replay(frames: Record<string, unknown>[]): (Activity | null)[] {
+  const ctx: ReplayContext = { seq: 0, starts: new Map() };
   return frames.map((f, i) => {
     ctx.seq = i;
     return createClaudeHarness().toActivity({ ...f, _ts: new Date(BASE_TS + i * 1000).toISOString() }, ctx);
@@ -690,7 +689,6 @@ describe("claude canonical tool names", () => {
       toolUse("t8", "mcp__mobile-mcp__mobile_list_apps", { device: "x" }),
       toolUse("t9", "mcp__plugin_tpc_mobile-mcp__mobile_click", { x: 1 }),
       toolUse("t10", "mcp__tpc__qa_check", { id: "C1", status: "pass" }),
-      toolUse("t11", "mcp__artemis__mobile_run_task", { task: "t" }),
       resultFrame({}),
     ]);
     expect(events.filter((e) => e.type === "tool_call").map((e) => (e.type === "tool_call" ? [e.tool, e.server, e.args] : null))).toEqual([
@@ -704,7 +702,6 @@ describe("claude canonical tool names", () => {
       ["mcp__mobile_mcp_mobile_list_apps", "mobile_mcp", { device: "x" }],
       ["mcp__mobile_mcp_mobile_click", "mobile_mcp", { x: 1 }],
       ["qa_check", "tpc", { id: "C1", status: "pass" }],
-      ["mcp__artemis_mobile_run_task", "artemis", { task: "t" }],
     ]);
   });
 });
@@ -715,14 +712,12 @@ describe("claude toActivity details", () => {
     message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, is_error: isError, content }] },
   });
 
-  test("calls of the other backend, and the user's own Tapocalypse MCP, are flagged as violations", () => {
-    const frames = [toolUse("a", "mcp__artemis__mobile_click", {}), toolUse("b", "mcp__tapocalypse__qa_start_run", {})];
-    expect(replay(frames, "mobile-mcp").map((x) => x && [x.kind, x.text])).toEqual([
-      ["warn", "backend violation: mcp__artemis_mobile_click"],
+  test("the user's own Tapocalypse MCP is flagged as a violation, device tools are plain tool lines", () => {
+    const frames = [toolUse("a", "mcp__tapocalypse__qa_start_run", {}), toolUse("b", "mcp__mobile_mcp__mobile_click", {})];
+    expect(replay(frames).map((x) => x && [x.kind, x.text])).toEqual([
       ["warn", "backend violation: mcp__tapocalypse_qa_start_run"],
+      ["tool", "mcp__mobile_mcp_mobile_click {}"],
     ]);
-    const mobileOnArtemis = replay([toolUse("c", "mcp__mobile_mcp__mobile_click", {})], "artemis");
-    expect(mobileOnArtemis[0]).toMatchObject({ kind: "warn", text: "backend violation: mcp__mobile_mcp_mobile_click" });
   });
 
   test("a rejected progress call stays visible while an accepted one is silent", () => {
@@ -764,7 +759,7 @@ describe("claude toActivity details", () => {
   test("raw non-JSON lines, control frames and garbage are ignored", () => {
     const a = replay([{ type: "_raw", line: "oops" }, { type: "stream_event" }, { type: "system", subtype: "status" }, {}]);
     expect(a).toEqual([null, null, null, null]);
-    expect(createClaudeHarness().toActivity("nope", { backend: "mobile-mcp", seq: 0, starts: new Map() })).toBeNull();
+    expect(createClaudeHarness().toActivity("nope", { seq: 0, starts: new Map() })).toBeNull();
   });
 });
 

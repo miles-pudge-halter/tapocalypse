@@ -1,5 +1,6 @@
 import { config, EMULATOR_BIN, HttpError, XCRUN_BIN } from "../config";
 import type { Platform } from "../runs/types";
+import { deviceOwner } from "./leases";
 import {
   adb,
   androidDeviceType,
@@ -182,13 +183,15 @@ export interface PoolView {
   /** Configured AVDs / simulators that are not running. */
   bootable: { platform: Platform; target: string; name: string }[];
   idle: { serial: string; shutdownAt: string }[];
+  /** Agents and queued runs that wait for *any* device of a platform (waiters for one serial are on that device). */
+  waiting: { platform: Platform; holders: string[]; runIds: string[] }[];
 }
 
 /**
  * Pool state for the Devices page. Reads what the latest `listDevices()` saw, so call that first for a fresh view.
- * `activeRuns` is the scheduler's count of assigned + booting runs.
+ * `activeRuns` is the scheduler's count of assigned + booting runs; `waiting` is its per-platform wait list.
  */
-export function poolView(activeRuns = 0): PoolView {
+export function poolView(activeRuns = 0, waiting: PoolView["waiting"] = []): PoolView {
   const { devices, simulators } = lastDeviceSnapshot();
   const runningAvds = new Set(devices.flatMap((d) => (d.avdName ? [d.avdName] : [])));
   const bootedUdids = new Set(devices.filter((d) => d.platform === "ios").map((d) => d.serial));
@@ -211,6 +214,7 @@ export function poolView(activeRuns = 0): PoolView {
     bootedCount: bootedCount("android") + inFlightCount("android"),
     bootable,
     idle,
+    waiting,
   };
 }
 
@@ -239,11 +243,14 @@ export async function bootTarget(platform: Platform, target: string): Promise<st
   }
 }
 
-/** Shuts down a device this process booted and no run is using. */
+/** Shuts down a device this process booted that no run or agent lease is using. */
 export async function shutdownDevice(serial: string): Promise<void> {
+  const owner = deviceOwner(serial);
+  if (owner?.kind === "agent") throw new HttpError(409, `${serial} is held by ${owner.lease.holder}`);
+  if (owner?.kind === "run") throw new HttpError(409, `${serial} is in use by a run`);
   const b = booted.get(serial);
   if (!b) throw new HttpError(409, `${serial} was not booted by Tapocalypse`);
-  if (b.lastReleasedAt === null) throw new HttpError(409, `${serial} is in use by a run`);
+  if (b.lastReleasedAt === null) throw new HttpError(409, `${serial} is in use`);
   await shutdownEntry(serial, b);
 }
 

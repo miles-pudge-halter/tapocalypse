@@ -6,6 +6,7 @@ import pkg from "../../package.json";
 import { batchView, devicesView, findRun, runDurationMs, runner, runScreenshots, scheduler } from "../app";
 import { config, HttpError, MAX_STEER_CHARS } from "../config";
 import { runDoctor } from "../doctor";
+import { release as releaseLease, renew as renewLease, TTL } from "../devices/leases";
 import { HARNESS_IDS, type HarnessId } from "../harness/types";
 import { detectProject } from "../projects/detect";
 import { createProject, deleteProject, getProject, listProjects, PACKAGE_RE, updateProject } from "../projects/registry";
@@ -14,6 +15,7 @@ import { realpathLoose } from "../reports/reports";
 import { runMatches } from "../runs/source";
 import { listRuns } from "../runs/store";
 import { ACTIVE, type Run } from "../runs/types";
+import type { AcquireResult, LeaseGrant } from "../runs/scheduler";
 import { listSuites } from "../suites";
 
 const TERMINAL = (run: Run) => !ACTIVE.includes(run.status);
@@ -59,7 +61,6 @@ export function runSummary(run: Run) {
     summary: run.summary,
     error: run.error,
     deviceSerial: run.deviceSerial,
-    backend: run.backend,
     queuePosition: scheduler.queuePosition(run.id),
     checks: run.checks.map(({ id, title, status, note }) => ({ id, title, status, note })),
     reportPath: reportFile(run, project ?? null),
@@ -126,12 +127,6 @@ const RunOptions = {
     .enum(HARNESS_IDS)
     .optional()
     .describe("Agent harness that drives the QA run: omp, claude (Claude Code) or codex (Codex CLI). Defaults to the project/config default; see qa_doctor for what is installed"),
-  backend: z
-    .enum(["mobile-mcp", "artemis"])
-    .optional()
-    .describe(
-      "Driver backend; default mobile-mcp. artemis is optional, Android-only, and only available when the operator configured artemisPath (see qa_doctor)",
-    ),
   packageId: z.string().max(200).regex(PACKAGE_RE, "must look like com.example.app").optional().describe("App package/bundle id; defaults to the project's package"),
   model: z.string().max(200).optional().describe("Harness-native model id for the QA agent (omp: anthropic/claude-sonnet-4-5, claude: sonnet, codex: gpt-5); defaults to the suite/persona/config model"),
   thinking: z
@@ -153,8 +148,56 @@ async function respond(fn: () => unknown | Promise<unknown>): Promise<ToolResult
     return { content: [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result, null, 2) }] };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    return { isError: true, content: [{ type: "text", text: message }] };
+    // Errors with a stable code read "<code>: <message>" so agents can branch on the prefix.
+    const text = err instanceof HttpError && err.code ? `${err.code}: ${message}` : message;
+    return { isError: true, content: [{ type: "text", text }] };
   }
+}
+
+const Holder = z.string().trim().min(1).max(80);
+const LeaseIdArg = z.string().min(1).max(64);
+const TtlMinutes = z.number().int().min(TTL.min).max(TTL.max);
+
+const DeviceAcquireShape = {
+  serial: z.string().max(200).optional().describe("Specific device from qa_list_devices; physical devices only this way"),
+  platform: z.enum(["android", "ios"]).optional().describe("Any free emulator/simulator of this platform; may boot one"),
+  holder: Holder.describe("Who you are and what you work on, e.g. 'claude-code · checkout-redesign'"),
+  reason: z.string().trim().max(200).optional().describe("What you need the device for; shown to people and agents who wait"),
+  ttlMinutes: TtlMinutes.optional().describe(`Lease length, ${TTL.min}-${TTL.max} minutes; default ${TTL.default}. Renew with device_renew`),
+  waitSeconds: z.number().min(0).max(110).optional().describe("How long to wait for a free device, 0-110; default 0. While timedOut is true, call again with the same arguments plus ticket to keep your place"),
+  ticket: z.string().max(64).optional().describe("The ticket from a previous timedOut result"),
+  cwd: z.string().max(4096).optional().describe("Absolute working directory of the agent"),
+};
+const DeviceAcquireArgs = z
+  .object(DeviceAcquireShape)
+  .refine((a) => Boolean(a.serial) !== Boolean(a.platform), { message: "give serial or platform, not both" });
+const DeviceRenewArgs = z.object({ leaseId: LeaseIdArg, ttlMinutes: TtlMinutes.optional() });
+const DeviceReleaseArgs = z.object({ leaseId: LeaseIdArg });
+
+function parseArgs<T extends z.ZodType>(schema: T, input: unknown): z.infer<T> {
+  const parsed = schema.safeParse(input);
+  if (!parsed.success) throw new HttpError(400, parsed.error.issues.map((i) => i.message).join("; "), "invalid_argument");
+  return parsed.data;
+}
+/**
+ * Shared by the `device_acquire` tool and `POST /api/leases`: validates once, then asks the scheduler (long-polls up to
+ * `waitSeconds`). A grant is the flat `LeaseGrant`; otherwise `{ timedOut: true, ticket, ... }`.
+ */
+export async function acquireDevice(input: unknown, signal?: AbortSignal): Promise<LeaseGrant | Exclude<AcquireResult, { lease: LeaseGrant }>> {
+  const { waitSeconds, ...request } = parseArgs(DeviceAcquireArgs, input);
+  const result = await scheduler.acquire(request, Math.min(110, Math.max(0, waitSeconds ?? 0)) * 1000, signal);
+  return "lease" in result ? result.lease : result;
+}
+
+export function renewDevice(input: unknown): { serial: string; expiresAt: string | null } {
+  const { leaseId, ttlMinutes } = parseArgs(DeviceRenewArgs, input);
+  const lease = renewLease(leaseId, ttlMinutes);
+  return { serial: lease.serial, expiresAt: lease.expiresAt };
+}
+
+export function releaseDevice(input: unknown): { released: true; serial: string } {
+  const { leaseId } = parseArgs(DeviceReleaseArgs, input);
+  return { released: true, serial: releaseLease(leaseId).serial };
 }
 
 function buildServer(): McpServer {
@@ -246,9 +289,43 @@ function buildServer(): McpServer {
     {
       title: "List devices",
       description:
-        "List connected Android emulators/devices and iOS simulators, including busy (busyRunId), booting and Artemis-owner flags.",
+        "List connected Android emulators/devices and iOS simulators, including busy (busyRunId), booting, the agent lease on each device (lease: holder, reason, expiresAt; null when free) and who is waiting for it (waiters). Call this before device_acquire to see what is free.",
     },
     () => respond(() => devicesView()),
+  );
+
+  server.registerTool(
+    "device_acquire",
+    {
+      title: "Acquire a device",
+      description:
+        "Reserve an emulator/simulator before you use it: devices are shared with other agents and QA runs. Give a serial (from qa_list_devices) or a platform (any free one, may boot one). Returns the leaseId (keep it: it cannot be recovered), serial (adb/simctl) and mobileDeviceId (mobile-mcp tools). If the device is busy the result has timedOut: true, ticket, position and heldBy: call again with the same arguments plus ticket to keep your place, or tell the user who holds it. Never touch a device you do not hold. Release it with device_release when done.",
+      inputSchema: z.object(DeviceAcquireShape),
+    },
+    (args, ctx) => respond(() => acquireDevice(args, ctx.mcpReq.signal)),
+  );
+
+  server.registerTool(
+    "device_renew",
+    {
+      title: "Renew a device lease",
+      description: `Extend your lease to now + ttlMinutes (default: the lease's own). Do it when less than 10 minutes are left. Errors with lease_not_found when the lease ended (expired, released or revoked): stop using the device and acquire again.`,
+      inputSchema: z.object({
+        leaseId: LeaseIdArg.describe("The leaseId from device_acquire"),
+        ttlMinutes: TtlMinutes.optional().describe(`New length, ${TTL.min}-${TTL.max} minutes`),
+      }),
+    },
+    (args) => respond(() => renewDevice(args)),
+  );
+
+  server.registerTool(
+    "device_release",
+    {
+      title: "Release a device",
+      description: "Give the device back so the next agent or QA run can use it. Always call this when you are done, also after a failure or abort.",
+      inputSchema: z.object({ leaseId: LeaseIdArg.describe("The leaseId from device_acquire") }),
+    },
+    (args) => respond(() => releaseDevice(args)),
   );
 
   server.registerTool(
@@ -256,7 +333,7 @@ function buildServer(): McpServer {
     {
       title: "Check Tapocalypse setup",
       description:
-        "Report which prerequisites are installed (agent runtimes omp / Claude Code / Codex and whether they are signed in, npx, adb, emulators, simulators, git, gh), configured projects, and which driver backends are available, with a fix for anything missing. Call this when runs fail to start.",
+        "Report which prerequisites are installed (agent runtimes omp / Claude Code / Codex and whether they are signed in, npx, adb, emulators, simulators, git, gh) and the configured projects, with a fix for anything missing. Call this when runs fail to start.",
     },
     () => respond(() => runDoctor({ fresh: true })),
   );
@@ -289,7 +366,6 @@ function buildServer(): McpServer {
           suiteId: args.suiteId,
           device: { platform: args.platform, serial: args.serial },
           harness: args.harness,
-          backend: args.backend,
           packageId: args.packageId,
           model: args.model,
           thinking: args.thinking,
@@ -338,7 +414,6 @@ function buildServer(): McpServer {
           suiteId: args.suiteId,
           devices: args.devices,
           harness: args.harness,
-          backend: args.backend,
           packageId: args.packageId,
           model: args.model,
           thinking: args.thinking,
@@ -365,7 +440,7 @@ function buildServer(): McpServer {
     {
       title: "Re-run a finished run",
       description:
-        "Queue a new run from a finished one. only=failed re-tests just the checks that did not pass or skip (with their previous status and note); only=all repeats the whole brief. Same project, harness, backend, package, model and source unless you override the harness.",
+        "Queue a new run from a finished one. only=failed re-tests just the checks that did not pass or skip (with their previous status and note); only=all repeats the whole brief. Same project, harness, package, model and source unless you override the harness.",
       inputSchema: z.object({
         runId: z.string(),
         only: z.enum(["failed", "all"]),
@@ -617,9 +692,15 @@ export async function handleMcp(req: Request): Promise<Response> {
     enableJsonResponse: true,
   });
   await server.connect(transport);
+  // A client that disconnects mid-call (its tool timeout fired) ends the server, which aborts the tool's `ctx.mcpReq.signal`;
+  // in stateless mode the SDK's own cancel notification arrives as a separate request that could never reach this one.
+  const onAbort = () => void server.close();
+  req.signal.addEventListener("abort", onAbort, { once: true });
+  if (req.signal.aborted) onAbort();
   try {
     return await transport.handleRequest(req);
   } finally {
+    req.signal.removeEventListener("abort", onAbort);
     // enableJsonResponse: the response is complete once handleRequest resolves
     void server.close();
   }

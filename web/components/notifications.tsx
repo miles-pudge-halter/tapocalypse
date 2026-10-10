@@ -4,7 +4,19 @@ import { toast } from "sonner";
 import notificationIcon from "../logo-192.png";
 import { SidebarMenuButton } from "@/components/ui/sidebar";
 import { ACTIVE_STATUSES, type RunStatus, type RunView, runHash } from "@/lib/api";
-import { listenEvent, navigate, useActiveRuns, useNotifications } from "@/lib/hooks";
+import {
+  isWatched,
+  lastOwnRelease,
+  listenEvent,
+  listenLeaseEvent,
+  navigate,
+  useActiveRuns,
+  useLeases,
+  useNewRun,
+  useNotifications,
+  useWatchedDevices,
+} from "@/lib/hooks";
+import { leaseToast } from "@/lib/leases";
 
 const APP_TITLE = "Tapocalypse";
 /** A terminal event for a run we never saw active only counts when it ended this recently (fast cancel/error). */
@@ -34,6 +46,15 @@ function showDesktopNotification(run: RunView): void {
   };
 }
 
+function showLeaseNotification(serial: string, title: string, body: string): void {
+  const n = new Notification(title, { body, tag: `lease:${serial}`, icon: notificationIcon });
+  n.onclick = () => {
+    window.focus();
+    navigate("#/devices");
+    n.close();
+  };
+}
+
 /**
  * Headless watcher mounted once in the app shell: toast on every run reaching a terminal status, a desktop
  * notification when enabled and the tab is hidden, and a `(n) Tapocalypse` title badge for runs that finished
@@ -41,11 +62,15 @@ function showDesktopNotification(run: RunView): void {
  */
 export function Notifications() {
   const { enabled } = useNotifications();
+  const { unwatch } = useWatchedDevices();
+  const { openNewRun } = useNewRun();
   const enabledRef = useRef(enabled);
   enabledRef.current = enabled;
   const known = useRef(new Map<string, RunStatus>());
   const [unseen, setUnseen] = useState(0);
   const { runs: active } = useActiveRuns();
+  // Keeps the last known lease per device fresh: the ending events themselves carry none.
+  useLeases();
 
   // Seed from the active list so a run that was already in flight when the page loaded is recognised as "was active".
   useEffect(() => {
@@ -75,6 +100,30 @@ export function Notifications() {
         }
       }),
     [],
+  );
+
+  // Devices the user watches (bell on a held card): a toast when one frees up, plus a desktop notification while the tab is hidden.
+  useEffect(
+    () =>
+      listenLeaseEvent((event, ended) => {
+        const lease = leaseToast(event, { watching: isWatched(event.serial), ownRelease: lastOwnRelease(), lease: ended });
+        if (!lease) return;
+        if (lease.unwatch) unwatch(event.serial);
+        const target = lease.action?.to;
+        const action =
+          lease.action && target
+            ? {
+                label: lease.action.label,
+                onClick: () => {
+                  if (target.type === "run") navigate(runHash(target.runId));
+                  else openNewRun({ device: { platform: target.platform, serial: target.serial } });
+                },
+              }
+            : undefined;
+        toast[lease.kind](lease.title, { description: lease.description, duration: TOAST_MS, ...(action && { action }) });
+        if (document.hidden && enabledRef.current) showLeaseNotification(event.serial, lease.title, lease.description);
+      }),
+    [unwatch, openNewRun],
   );
 
   useEffect(() => {

@@ -9,6 +9,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { screenUrl, type CheckStatus, type Device, type RunView } from "@/lib/api";
 import { deviceSubtitle } from "@/lib/format";
 import { useNow } from "@/lib/hooks";
+import { queueHoldCopy } from "@/lib/leases";
 import { cn } from "@/lib/utils";
 import { screenshotOfCheck, type GalleryItem } from "./evidence";
 import { useLiveScreen } from "./use-workbench";
@@ -127,6 +128,7 @@ export function DevicePane({
   const aspect = deviceAspect(device?.deviceType ?? "unknown", device?.screen ?? null, imgAspect);
   const platform = device?.platform ?? run.deviceRequest.platform;
   const Icon = TYPE_ICON[device?.deviceType ?? "unknown"];
+  const holdCopy = run.status === "queued" && run.queueHold ? queueHoldCopy(run.queueHold, run.deviceRequest) : null;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -200,10 +202,10 @@ export function DevicePane({
         <div className="flex flex-1 items-center justify-center p-4">
           <EmptyState
             icon={Smartphone}
-            title={run.status === "queued" ? "Waiting for a device" : "No screenshots"}
+            title={run.status === "queued" ? (holdCopy?.paneTitle ?? "Waiting for a device") : "No screenshots"}
             description={
               run.status === "queued"
-                ? "The live screen appears once a device is assigned."
+                ? (holdCopy?.paneDescription ?? "The live screen appears once a device is assigned.")
                 : "This run did not save any screenshots."
             }
           />

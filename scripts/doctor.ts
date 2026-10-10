@@ -11,7 +11,7 @@ const MARKS: Record<DoctorCheck["status"], string> = {
   skip: paint("90", "–"),
 };
 
-const { checks, backends } = await runDoctor({ fresh: true });
+const { checks } = await runDoctor({ fresh: true });
 
 for (const c of checks) {
   const tag = c.required ? "" : paint("90", " (optional)");
@@ -20,7 +20,6 @@ for (const c of checks) {
 }
 
 const blockers = checks.filter((c) => c.required && c.status === "error");
-console.log(`\nBackends: ${backends.join(", ")}`);
 if (blockers.length > 0) {
   console.log(paint("31", `${blockers.length} required check(s) failed: ${blockers.map((c) => c.id).join(", ")}`));
   process.exit(1);

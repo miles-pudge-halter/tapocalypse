@@ -95,7 +95,6 @@ function spawn(over: Partial<SpawnOptions> = {}, timing: Partial<OmpTiming> = {}
     model: null,
     effort: null,
     mcpServers: [],
-    backend: "mobile-mcp",
     limits: { maxTime: "60s", maxTurns: null, maxBudgetUsd: null },
     settings: { bin: fakeBin },
     onEvent: (e) => {

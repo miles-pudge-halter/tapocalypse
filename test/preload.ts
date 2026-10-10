@@ -20,7 +20,6 @@ fs.writeFileSync(
     port: 4399,
     maxConcurrentRuns: 4,
     runMaxTime: "10m",
-    artemisPath: path.join(root, "artemis"),
     projects: [
       {
         id: "test-proj",

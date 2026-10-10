@@ -28,18 +28,16 @@ import os from "node:os";
 import path from "node:path";
 import { DATA_DIR } from "../../config";
 import type { Project } from "../../projects/registry";
-import type { Backend } from "../../runs/types";
 import { MOBILE_MCP_PACKAGE } from "../types";
 import type { OmpRpc } from "./rpc";
 
 export interface ToolPrefixes {
   mobileMcp: string | null;
-  artemis: string | null;
 }
 
 export interface LaunchPlan {
   args: string[];
-  /** Prefix the mobile-mcp tools will have according to the config we found or wrote; null for non-mobile-mcp backends. */
+  /** Prefix the mobile-mcp tools will have according to the config we found or wrote. */
   expectedMobileMcp: string | null;
   /** Plugin dir passed to omp, when Tapocalypse had to provision mobile-mcp itself. */
   pluginDir: string | null;
@@ -135,10 +133,9 @@ function ensurePluginDir(pluginRoot: string): string {
 
 /**
  * Extra omp CLI args needed so the agent has mobile-mcp. Adds Tapocalypse's plugin dir only when no enabled
- * mobile-mcp server is configured in the user's or the project's omp config; only the mobile-mcp backend needs it.
+ * mobile-mcp server is configured in the user's or the project's omp config.
  */
-export async function mcpLaunchArgs(project: Pick<Project, "repoPath">, backend: Backend, opts: ProvisionOptions = {}): Promise<LaunchPlan> {
-  if (backend !== "mobile-mcp") return { args: [], expectedMobileMcp: null, pluginDir: null, checked: [] };
+export async function mcpLaunchArgs(project: Pick<Project, "repoPath">, opts: ProvisionOptions = {}): Promise<LaunchPlan> {
   const home = opts.home ?? os.homedir();
   const profile = opts.profile === undefined ? (process.env.OMP_PROFILE ?? process.env.PI_PROFILE ?? null) : opts.profile;
   const files = configFiles(project.repoPath, home, profile || null);
@@ -154,7 +151,6 @@ export async function mcpLaunchArgs(project: Pick<Project, "repoPath">, backend:
 }
 
 const MOBILE_MCP_MARKER = "mobile_list_elements_on_screen";
-const ARTEMIS_MARKER = "mobile_run_task";
 const ROUTE_RE = /xd:\/\/(mcp__[A-Za-z0-9_:.-]+)/g;
 const ROUTES_OMITTED_RE = /mappings omitted/i;
 
@@ -168,7 +164,7 @@ export interface StatePrefixes extends ToolPrefixes {
   routesOmitted: boolean;
 }
 
-/** Derives backend tool prefixes from an RPC `get_state` payload (plain tools and `xd://` routes). */
+/** Derives the mobile-mcp tool prefix from an RPC `get_state` payload (plain tools and `xd://` routes). */
 export function prefixesFromState(state: unknown): StatePrefixes {
   const data = (state && typeof state === "object" ? state : {}) as { dumpTools?: unknown; systemPrompt?: unknown };
   const names: string[] = [];
@@ -182,7 +178,6 @@ export function prefixesFromState(state: unknown): StatePrefixes {
   for (const m of prompt.matchAll(ROUTE_RE)) names.push(m[1]!);
   return {
     mobileMcp: prefixOf(names, MOBILE_MCP_MARKER),
-    artemis: prefixOf(names, ARTEMIS_MARKER),
     routesOmitted: ROUTES_OMITTED_RE.test(prompt),
   };
 }
@@ -192,35 +187,28 @@ const MCP_POLL_MS = 500;
 
 /**
  * Discovers the real tool-name prefixes after `ready`. MCP servers connect in the background, so this polls
- * `get_state` until the backend's prefix shows up (or `timeoutMs` passes). A null prefix in the result means
- * the backend's tools are not available to the agent.
+ * `get_state` until the mobile-mcp prefix shows up (or `timeoutMs` passes). A null prefix in the result means
+ * the mobile-mcp tools are not available to the agent.
  */
 export async function resolveToolPrefixes(
   rpc: OmpRpc,
-  backend: Backend,
   opts: { expectedMobileMcp?: string | null; timeoutMs?: number } = {},
 ): Promise<ToolPrefixes> {
-  const need = backend === "mobile-mcp" ? "mobileMcp" : "artemis";
   const deadline = Date.now() + (opts.timeoutMs ?? MCP_WAIT_MS);
   let latest: StatePrefixes;
   for (;;) {
     latest = prefixesFromState(await rpc.send({ type: "get_state" }));
-    if (latest[need] || Date.now() >= deadline) break;
+    if (latest.mobileMcp || Date.now() >= deadline) break;
     await Bun.sleep(MCP_POLL_MS);
   }
   const { routesOmitted, ...prefixes } = latest;
   // The route list is bounded in the system prompt; absence then proves nothing, so trust what we provisioned.
-  if (!prefixes.mobileMcp && routesOmitted && opts.expectedMobileMcp && backend === "mobile-mcp") {
-    prefixes.mobileMcp = opts.expectedMobileMcp;
-  }
+  if (!prefixes.mobileMcp && routesOmitted && opts.expectedMobileMcp) prefixes.mobileMcp = opts.expectedMobileMcp;
   return prefixes;
 }
 
-/** The actionable error for a run whose backend tools never appeared. */
-export function missingToolsMessage(backend: Backend, plan: LaunchPlan): string {
-  if (backend === "artemis") {
-    return "Artemis tools are not available to the agent: no MCP server exposing mobile_run_task is configured in omp (add the artemis server to ~/.omp/agent/mcp.json); see README §Prerequisites";
-  }
+/** The actionable error for a run whose mobile-mcp tools never appeared. */
+export function missingToolsMessage(plan: LaunchPlan): string {
   const how = plan.pluginDir
     ? `no mobile-mcp server in ${plan.checked.join(", ")}; tried Tapocalypse's bundled plugin ${plan.pluginDir} but its server did not connect within ${MCP_WAIT_MS / 1000}s (is \`npx\` on PATH and the network reachable?)`
     : `mobile-mcp is configured in omp (${plan.checked.join(", ")}) but its server did not connect within ${MCP_WAIT_MS / 1000}s`;

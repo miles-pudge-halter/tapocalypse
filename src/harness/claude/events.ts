@@ -3,8 +3,9 @@
  * Frame shapes: `.agent-memory/research/harness-agnostic.md` §3 and §9 (E1–E2).
  */
 import { z } from "zod";
-import type { Activity, Backend, RunUsage } from "../../runs/types";
-import { ARTEMIS_SERVER, MOBILE_MCP_SERVER, PROGRESS_SERVER, type HarnessEvent, type HarnessExit, type ReplayContext } from "../types";
+import type { Activity, RunUsage } from "../../runs/types";
+import { backendViolation } from "../../runs/prompt";
+import { PROGRESS_SERVER, type HarnessEvent, type HarnessExit, type ReplayContext } from "../types";
 
 const PROGRESS_TOOLS = ["qa_plan", "qa_check", "qa_finish"] as const;
 
@@ -288,13 +289,6 @@ function formatDuration(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`;
 }
 
-/** The agent reached a tool of the other backend, or the user's own Tapocalypse MCP (run management), which is never allowed. */
-function backendViolation(tool: string, backend: Backend): boolean {
-  if (tool.startsWith("mcp__tapocalypse_")) return true;
-  if (backend === "mobile-mcp") return tool.startsWith(`mcp__${ARTEMIS_SERVER}_`);
-  return tool.startsWith(`mcp__${MOBILE_MCP_SERVER}_mobile_`) || tool === `mcp__${ARTEMIS_SERVER}_mobile_run_task`;
-}
-
 /**
  * Maps one persisted raw frame to a feed line. `ctx.seq` is the frame's 0-based line index in events.jsonl; `ctx.starts`
  * carries tool starts across frames so results resolve their tool and duration. A frame holds several content blocks,
@@ -320,7 +314,7 @@ export function toActivity(raw: unknown, ctx: ReplayContext): Activity | null {
         ctx.starts.set(b.id, { ts: Date.parse(ts), tool: c.tool });
         if (activity || isProgressTool(c)) continue;
         const base = { ts, seq, callId: b.id, tool: c.tool, args: truncateArgs(c.args) };
-        activity = backendViolation(c.tool, ctx.backend)
+        activity = backendViolation(c.tool)
           ? { ...base, kind: "warn", text: `backend violation: ${c.tool}` }
           : { ...base, kind: "tool", text: `${c.tool} ${(JSON.stringify(c.args) ?? "").slice(0, 200)}` };
       }

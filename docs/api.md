@@ -4,10 +4,11 @@ Back to the [README](../README.md). Everything the web UI does goes through this
 
 ## Conventions
 
-- Errors are JSON `{ "error": "<message>" }` with the matching status (400 invalid input, 403 forbidden host or origin, 404 unknown id, 409 conflict, 415 wrong content type).
+- Errors are JSON `{ "error": "<message>" }` with the matching status (400 invalid input, 403 forbidden host or origin, 404 unknown id, 409 conflict, 415 wrong content type). The device lease routes also add a machine-readable `code` (see [Lease errors](#lease-errors)).
 - `POST`/`PUT` routes that take a body need `Content-Type: application/json`. Request bodies are limited to 1 MiB.
 - A `Run` in responses carries everything in `run.json` (status, checks, verdict, `verdictSource`, `errorKind`, `usage`, `source`, `build`, `attempt`, `retryOf`/`retriedBy`, `harness`, `model`, `effort`, `storage`, …) plus `queuePosition`, `queueReason` (why a queued run is still waiting), `durationMs` and `reportFile` (the absolute path of the report, or `null`). `storage` is `"data"` for runs whose report and screenshots live in Tapocalypse's data folder (`<data dir>/runs/<id>/report.md`, `screenshots/`) and `"repo"` for runs from before that change, whose repo-relative paths keep working.
 - `harness` is `omp`, `claude` or `codex` (see [Agent runtimes](guide.md#agent-runtimes)); an unknown value is a 400. `model` is a harness-native string and `thinking` carries the reasoning level in that harness's terms (omp thinking, Claude Code `--effort`, Codex CLI `model_reasoning_effort`). A run records the `harness` it used, `effort` (the same level; omp runs also keep `thinking`), and runs from before harnesses existed read as `omp`.
+- Unknown fields in a request body or tool call are ignored, not rejected. In particular a `backend` that an old client still sends to `POST /api/runs`, `POST /api/batches` or the MCP start tools is dropped and never stored: runs no longer have a backend.
 - Run ids look like `20260101-093015-a1b2-dark-mode-toggle`, batch ids like `b-20260101-093015-a1b2`.
 
 ## HTTP routes
@@ -16,7 +17,7 @@ Back to the [README](../README.md). Everything the web UI does goes through this
 
 | Route | Purpose |
 | --- | --- |
-| `POST /api/runs` | Queue a run. Body: `{ projectId, title?, brief?, suiteId?, device?: { platform?, serial? }, harness?, backend?, packageId?, model?, thinking?, effort?, install?: { path }, source?, requestedBy? }`. Give a `brief` or a `suiteId`. Without `harness` the default is resolved (project, persona, config, first installed and signed in, else first installed, else omp). `backend: "artemis"` with a harness other than `omp` is a 400. Title ≤ 200 chars, brief ≤ 20 000. Returns 201 and the run |
+| `POST /api/runs` | Queue a run. Body: `{ projectId, title?, brief?, suiteId?, device?: { platform?, serial? }, harness?, packageId?, model?, thinking?, effort?, install?: { path }, source?, requestedBy? }`. Give a `brief` or a `suiteId`. Without `harness` the default is resolved (project, persona, config, first installed and signed in, else first installed, else omp). Title ≤ 200 chars, brief ≤ 20 000. Returns 201 and the run. While the run waits for a device held by a coding agent, the run carries `queueHold: { serial, deviceName, holder, reason, expiresAt }` and `queueReason` names the holder |
 | `GET /api/runs` | Newest-first page `{ runs, hasMore }`. Query: `project`, `status` (comma list), `verdict` (comma list; `none` matches runs without one), `q` (title, branch, PR, ticket, commit), `batch`, `branch`, `pr`, `ticket`, `commit` (sha prefix), `limit` (default 100, max 500), `before` (a `createdAt` cursor) |
 | `GET /api/runs/:id` | One run |
 | `DELETE /api/runs/:id` | Delete a finished run and its folder (409 while it is queued or active) |
@@ -31,9 +32,9 @@ Back to the [README](../README.md). Everything the web UI does goes through this
 | `GET /api/runs/:id/report` | `{ markdown }`, the report as the agent wrote it (404 when the run has none) |
 | `POST /api/runs/:id/export` | `{ dir }` (absolute path, no NUL byte) copies the report as `QA-REPORT-<id>.md` and the screenshots as `screenshots/<name>` into `dir`, creating it. `dir` is as trusted as any local client, but never inside Tapocalypse's data folder or a `.git` folder (400). Returns `{ report, screenshots }`: the absolute paths written |
 | `GET /api/runs/:id/transcript` | The full agent transcript as HTML, served sandboxed (404 until exported; only harnesses with `capabilities.transcriptExport`, today omp, write one) |
-| `POST /api/batches` | `{ projectId, title?, brief?, suiteId?, devices: [{ platform?, serial? }] (1-8), harness?, backend?, packageId?, model?, thinking?, effort?, install?, source?, requestedBy? }`. Returns 201 `{ batchId, runs }` |
+| `POST /api/batches` | `{ projectId, title?, brief?, suiteId?, devices: [{ platform?, serial? }] (1-8), harness?, packageId?, model?, thinking?, effort?, install?, source?, requestedBy? }`. Returns 201 `{ batchId, runs }` |
 | `GET /api/batches/:id` | `{ id, projectId, title, runs, status: "active" \| "done", verdict, cost, startedAt, endedAt }` |
-| `GET /api/events` | Global server-sent events: every `run` update and `projects` changes; drives the live lists |
+| `GET /api/events` | Global server-sent events: every `run` update, every [`lease`](#lease-events) change and `projects` changes; drives the live lists |
 | `GET /api/stats?project=&days=7` | Totals for the last 1-90 days: runs, pass/fail/issues/other, cost, median duration, per-day buckets |
 
 ### Projects, reports and suites
@@ -57,18 +58,55 @@ Back to the [README](../README.md). Everything the web UI does goes through this
 
 | Route | Purpose |
 | --- | --- |
-| `GET /api/devices` | Connected devices with busy, booting and Artemis flags, friendly name, OS version, screen and device type |
-| `GET /api/devices/pool` | Run slots in use, emulators booted vs `maxBooted`, bootable AVDs/simulators, idle shutdown times |
+| `GET /api/devices` | Connected devices with busy and booting flags, friendly name, OS version, screen and device type. `lease` is the agent [lease](#device-leases) holding the device (a `LeaseView`, never the secret) or `null`, and `waiters` lists who waits for it: `{ kind: "agent", holder, since }` or `{ kind: "run", runId, title }` |
+| `GET /api/devices/pool` | Run slots in use, emulators booted vs `maxBooted`, bootable AVDs/simulators, idle shutdown times, and `waiting`: `{ platform, holders, runIds }` for agents and runs waiting for any device of a platform |
 | `POST /api/devices/boot` | `{ platform, target }` boots a configured AVD or simulator (202) |
-| `POST /api/devices/:serial/shutdown` | Shut down a device Tapocalypse booted (409 if it is in use or was not booted by Tapocalypse) |
+| `POST /api/devices/:serial/shutdown` | Shut down a device Tapocalypse booted (409 if it was not booted by Tapocalypse, or a run (`held_by_run`) or an agent lease (`held_by_agent`) is using it) |
 | `GET /api/devices/:serial/screen.png` | Current screenshot (`Cache-Control: no-store`; 404 when not connected) |
-| `GET /api/doctor?fresh=1` | The prerequisite report behind `bun run doctor` and the Setup page |
-| `GET /api/harnesses` | `{ default, harnesses: [{ id, label, installed, capabilities }] }`: the three agent runtimes, which are installed, and the resolved default. `capabilities` is `{ steer, interrupt, appendSystemPrompt, nativeProgressTools, costReported, limits: { maxTime, maxTurns, maxBudgetUsd }, transcriptExport, backends }`; the UI uses it for the harness picker, the steer box and the Transcript button |
+| `GET /api/doctor?fresh=1` | The prerequisite report behind `bun run doctor` and the Setup page (including which agent harnesses are installed and signed in) |
+| `GET /api/harnesses` | `{ default, harnesses: [{ id, label, installed, capabilities }] }`: the three agent runtimes, which are installed, and the resolved default. `capabilities` is `{ steer, interrupt, appendSystemPrompt, nativeProgressTools, costReported, limits: { maxTime, maxTurns, maxBudgetUsd }, transcriptExport }`; the UI uses it for the harness picker, the steer box and the Transcript button |
 | `GET /api/models?harness=` | `{ models }`: model ids to offer for a harness (recently used, configured and persona models first, then what the harness itself lists; any string is still accepted). Defaults to the default harness; unknown `harness` is a 400 |
 | `GET /api/templates` | Built-in brief templates |
 | `GET /api/mcp/status` | MCP URL and the last tool call received (used by the Setup page) |
 | `POST /mcp` | The MCP endpoint (streamable HTTP, stateless; other methods get 405) |
 | `POST /mcp/runs/:id` | The run-scoped progress endpoint, called by the agent a run starts; see [Run progress endpoint](#run-progress-endpoint) |
+
+### Device leases
+
+A lease is an exclusive claim on one device ([Sharing devices between agents](guide.md#sharing-devices-between-agents)). These routes are for agents without MCP, scripts and the UI. Secrets travel in JSON bodies, never in URLs. All of them need `Content-Type: application/json` where they take a body.
+
+| Route | Purpose |
+| --- | --- |
+| `GET /api/leases` | The active leases as `LeaseView[]` (no secrets) |
+| `POST /api/leases` | Acquire. Body as in [`device_acquire`](#borrowing-devices): `{ serial \| platform, holder, reason?, ttlMinutes?, waitSeconds?, ticket?, cwd? }`. Long-polls for up to `waitSeconds` (max 110) and answers 200 with the grant `{ serial, platform, name, mobileDeviceId, leaseId, expiresAt, ttlMinutes }`, or with `{ timedOut: true, ticket, position, state: "waiting" \| "booting", heldBy, reason }`; call again with the `ticket` to keep your place |
+| `POST /api/leases/renew` | `{ leaseId, ttlMinutes? }` → `{ serial, expiresAt }` |
+| `POST /api/leases/release` | `{ leaseId }` → `{ released: true, serial }` |
+| `POST /api/devices/:serial/release` | The UI's force release. Body `{ ref }`, the public handle of the lease as shown in `GET /api/devices` (so a page that is out of date never releases someone else's lease). 204 when released; 400 `invalid_argument` when `ref` is missing; 404 when the device has no lease; 409 with `code: "ref_mismatch"` when `ref` no longer matches (the body carries the `lease` that holds the device now), or with `code: "held_by_run"` when a QA run holds it (cancel the run instead) |
+
+A `LeaseView` is `{ ref, serial, platform, avdName, holder, reason, source: "agent" \| "run", runId?, ttlMinutes, acquiredAt, renewedAt, expiresAt, gated, claimPending }`. `ref` is a public 8-character handle; the secret `leaseId`, the lease's `cwd` and the claim ticket never appear in any list, event or view. `claimPending` is true while a grant made to a waiting ticket has not been picked up yet (then `expiresAt` is the 60 s claim deadline).
+
+#### Lease events
+
+`GET /api/events` emits a `lease` event on every change: `{ serial, deviceName, change, lease, next }`. `change` is `acquired`, `renewed`, `released` (the holder gave it back), `expired` (time ran out, or the claim window), `revoked` (released from the Devices page) or `gone` (the device disappeared for 2 minutes, or came back as a different AVD). `lease` is the `LeaseView` for `acquired` and `renewed` and always `null` for the ending changes (`released`, `expired`, `revoked`, `gone`), so a client that needs the holder or platform of what just ended keeps the last lease it saw for that `serial` (from `GET /api/leases`, `GET /api/devices` or the `acquired`/`renewed` events). `next` says who got the device right away: `{ kind: "agent", holder }`, `{ kind: "run", runId, title }` or `null`.
+
+#### Lease errors
+
+| `code` | Status | Meaning |
+| --- | --- | --- |
+| `invalid_argument` | 400 | Bad input, for example neither or both of `serial` and `platform` |
+| `device_unsupported` | 400 | A watch or TV |
+| `device_excluded` | 400 | The serial is in `devicePool.android.excludeSerials` |
+| `device_not_found` | 404 | The serial is not connected |
+| `no_device` | 409 | `{ platform }` with nothing free and nothing bootable: there is nothing to wait for |
+| `queue_full` | 409 | 32 agents are already waiting |
+| `device_busy` | 409 | The device is already held: another claim won the race for it. Call again |
+| `boot_failed` | 502 | The emulator or simulator booted for a waiting `{ platform }` request did not come up (`boot failed: <cause>`); call again |
+| `lease_not_found` | 404 | The `leaseId` is wrong, unknown, expired or released. When Tapocalypse still remembers the ended lease the message says why (`released`, `expired`, `revoked` from the Devices page, `gone`) |
+| `ref_mismatch` | 409 | Force release with a `ref` that is no longer the device's lease (HTTP only) |
+| `held_by_run` | 409 | Force release or shutdown of a device that a QA run holds |
+| `held_by_agent` | 409 | Shutdown of a device an agent holds (HTTP only) |
+
+Over MCP, arguments that fail the tool's input schema (a missing `holder`, `ttlMinutes` outside 5-120, `waitSeconds` above 110) are rejected by the MCP SDK before the tool runs, with text starting `Input validation error:` and no `<code>:` prefix. Treat that text as `invalid_argument`. Rules the schema cannot express (both or neither of `serial` and `platform`) do carry the `invalid_argument:` prefix.
 
 ## MCP tools
 
@@ -85,16 +123,26 @@ Register `http://127.0.0.1:<port>/mcp` in your agent; see [Dispatching runs from
 | `qa_create_project { repoPath, id?, name?, defaultPackage?, defaultPlatform?, personaFile? }` | Register a project; omitted fields come from detection |
 | `qa_update_project { id, repoPath?, name?, defaultPackage?, defaultPlatform?, personaFile? }` | Change only the fields you pass |
 | `qa_delete_project { id }` | Remove a project (fails while it has queued or active runs) |
-| `qa_list_devices` | Connected devices with `busyRunId`, booting and Artemis flags |
+| `qa_list_devices` | Connected devices with `busyRunId`, booting flags, `lease` (the agent lease holding the device, without its secret, or `null`) and `waiters` |
 | `qa_doctor` | Prerequisite report with a fix for anything missing, including which agent harnesses are installed and signed in |
 | `qa_list_suites { projectId }` | Saved suites (reusable briefs with fixed check ids) |
+
+### Borrowing devices
+
+Device leases for coding agents ([Sharing devices between agents](guide.md#sharing-devices-between-agents)). Failures are returned as MCP errors whose text is `<code>: <message>`, with the codes of [Lease errors](#lease-errors), so an agent can branch on them. Set a tool timeout of at least 120 s: `device_acquire` can block for up to 110 s.
+
+| Tool | Purpose |
+| --- | --- |
+| `device_acquire { serial?, platform?, holder, reason?, ttlMinutes?, waitSeconds?, ticket?, cwd? }` | Give exactly one of `serial` (a device from `qa_list_devices`; the only way to get a physical device) or `platform` (`android` or `ios`: the first free emulator or simulator, booting one from your pool when none is free). `holder` is required, 1-80 chars, `"<agent> · <task>"`; `reason` ≤ 200 chars; `ttlMinutes` 5-120 (default 30); `waitSeconds` 0-110 (default 0); `ticket` resumes a place in line; `cwd` is the agent's absolute working directory. Returns `{ serial, platform, name, mobileDeviceId, leaseId, expiresAt, ttlMinutes }`, or `{ timedOut: true, ticket, position, state: "waiting" \| "booting", heldBy, reason }` where `heldBy` is `{ kind: "agent", holder, reason, expiresAt }`, `{ kind: "run", runId, title }`, `{ kind: "booting" }` or `null`. `leaseId` is a secret: keep it, it cannot be recovered |
+| `device_renew { leaseId, ttlMinutes? }` | Extend the lease to now + its TTL (or the new `ttlMinutes`); returns `{ serial, expiresAt }` |
+| `device_release { leaseId }` | End the lease so the next waiter gets the device; returns `{ released: true, serial }` |
 
 ### Starting and steering runs
 
 | Tool | Purpose |
 | --- | --- |
-| `qa_start_run { projectId, title?, brief?, suiteId?, platform?, serial?, harness?, backend?, packageId?, model?, thinking?, install?, requester?, source? }` | Queue a run; returns `runId`, `status`, `queuePosition`, a UI `url` and the recorded `source`. `install` is an absolute `.apk` / `.app` / `.ipa` path installed before the run |
-| `qa_start_batch { projectId, title?, brief?, suiteId?, devices: [{ platform?, serial? }] (1-8), harness?, backend?, packageId?, model?, thinking?, install?, requester?, source? }` | One run per device entry; returns `batchId`, a `url` and the runs |
+| `qa_start_run { projectId, title?, brief?, suiteId?, platform?, serial?, harness?, packageId?, model?, thinking?, install?, requester?, source? }` | Queue a run; returns `runId`, `status`, `queuePosition`, a UI `url` and the recorded `source`. `install` is an absolute `.apk` / `.app` / `.ipa` path installed before the run |
+| `qa_start_batch { projectId, title?, brief?, suiteId?, devices: [{ platform?, serial? }] (1-8), harness?, packageId?, model?, thinking?, install?, requester?, source? }` | One run per device entry; returns `batchId`, a `url` and the runs |
 | `qa_rerun { runId, only: "failed" \| "all", platform?, serial?, harness?, requester? }` | New run from a finished one, on the same harness unless you pass another |
 | `qa_steer_run { runId, message }` | Send an instruction to a running agent; fails when the run's harness cannot be steered |
 | `qa_cancel_run { runId }` | Cancel a queued or active run |

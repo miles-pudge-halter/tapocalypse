@@ -1,0 +1,40 @@
+/** The instruction every agent gets once (or in its project instructions); docs/agent-setup.md step 8 carries the same text (a test keeps them identical). */
+export const LEASE_PROMPT = [
+  "## Using a device (Tapocalypse device broker)",
+  "Devices on this machine are shared with other agents. Before your first device action (mobile tool, adb, simctl, flutter run/install):",
+  "1. `device_acquire { platform | serial, holder: \"<your client> · <task>\", reason, ttlMinutes?, waitSeconds: 60, cwd: <your working dir> }`.",
+  "   - Success → note `leaseId`, `serial` (adb/simctl) and `mobileDeviceId` (mobile tools). Keep the leaseId in your notes; it cannot be recovered.",
+  "   - `timedOut: true` → it is busy (`heldBy`). Call again with the same args plus `ticket` to keep your place, or tell the user who holds it. Never use a device you do not hold.",
+  "2. Use only that device: `serial` for adb/simctl/flutter, `mobileDeviceId` for mobile tools.",
+  "3. Renew with `device_renew { leaseId }` when less than 10 minutes are left.",
+  "4. Always `device_release { leaseId }` when done, also on failure or abort.",
+  "If a call says the lease ended, stop touching the device and acquire again.",
+].join("\n");
+
+/** A SKILL.md that teaches the same protocol to agents with a skills directory. */
+export const LEASE_SKILL = [
+  "---",
+  "name: device-lease",
+  "description: Use before driving any Android emulator, iOS simulator or phone on this machine. Borrow the device from Tapocalypse so parallel agents never share one.",
+  "---",
+  "",
+  "# Borrow devices from Tapocalypse",
+  "",
+  "Tapocalypse (MCP server `tapocalypse`) lends this machine's devices to one agent at a time. Its own QA runs borrow them too, from the same queue.",
+  "",
+  "## Before any device work",
+  '1. `device_acquire` { platform: "android" | "ios" (or serial), holder: "<agent> · <branch or task>", reason: "<one line>", ttlMinutes: 30, waitSeconds: 110 }.',
+  "2. `timedOut: true` means the device is taken. Call again within 60 s with the same arguments plus `ticket` to keep your place. After 5 minutes of waiting, tell the user who holds it (`heldBy`).",
+  "3. Keep `leaseId`, `serial` and `mobileDeviceId` in your notes. Use only that device: `serial` for adb, simctl and flutter, `mobileDeviceId` for mobile tools. `leaseId` is a secret: never share it.",
+  "",
+  "## While you work",
+  "- Call `device_renew` { leaseId } when less than 10 minutes are left (TTL 5 to 120 minutes).",
+  "- An error saying the lease ended means you lost the device. Stop, then acquire again.",
+  "",
+  "## When you are done",
+  "- Call `device_release` { leaseId }, also when you fail or give up.",
+  "",
+  "## Never",
+  "- Use adb, simctl or mobile-mcp on a device you have not leased.",
+  "- Release a lease you did not acquire.",
+].join("\n");

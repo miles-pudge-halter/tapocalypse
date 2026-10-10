@@ -12,6 +12,7 @@ Back to the [README](../README.md). This is the long-form reference: every page 
 - [Tour of the UI](#tour-of-the-ui)
 - [Projects](#projects)
 - [Devices](#devices)
+- [Sharing devices between agents](#sharing-devices-between-agents)
 - [Run outcomes](#run-outcomes)
 - [Costs and usage](#costs-and-usage)
 - [Dispatching runs from your coding agent (MCP)](#dispatching-runs-from-your-coding-agent-mcp)
@@ -24,7 +25,6 @@ Back to the [README](../README.md). This is the long-form reference: every page 
 - [Configuration](#configuration)
 - [Data and retention](#data-and-retention)
 - [How it works](#how-it-works)
-- [Optional: Artemis backend](#optional-artemis-backend)
 - [Security model](#security-model)
 - [Troubleshooting](#troubleshooting)
 - [What's not here yet](#whats-not-here-yet)
@@ -69,7 +69,6 @@ Tapocalypse does not ship a model or an agent loop: it drives a coding-agent CLI
 | Steer a running agent | Yes | Yes | No (the control is hidden; the 80% wrap-up reminder is skipped and the agent relies on the deadline in its prompt) |
 | Cost | Yes, when the provider reports one | Yes (Claude Code's own estimate) | Tokens only; cost shows `—` |
 | Full transcript (`transcript.html`) | Yes | No; the activity feed and `events.jsonl` are the record | No; same |
-| [Artemis backend](#optional-artemis-backend) | Yes | No | No |
 | Limits it enforces itself | Time (`--max-time`; Tapocalypse still kills it at budget + 5 min) | Turns and budget (`agent.maxTurns`, `agent.maxBudgetUsd`); Tapocalypse kills it at the time budget | None; Tapocalypse kills it at the time budget |
 | Model and effort strings | `provider/model[:thinking]` | An alias (`opus`, `sonnet`, `haiku`) or a full model id; effort `low` … `max` | A `gpt-…` id; effort `minimal`, `low`, `medium`, `high` or `xhigh` |
 
@@ -110,10 +109,10 @@ The sidebar is on every page: a **project switcher** that scopes the whole UI to
 
 | Page | What you do there |
 | --- | --- |
-| **Runs** (`#/`) | A live strip (running, queued, devices busy, 7-day pass rate and spend; each segment is a filter shortcut), an **Active** lane with a card per queued or running run (live screen, current check, progress, queue position and reason), and the history below. Filter by status, verdict, project and free text (title, branch, PR, ticket, commit); group by day, batch or nothing. Filters live in the URL, so they can be bookmarked. **New run** opens a sheet with brief templates, saved suites, recent briefs, harness, device, backend, model, effort, package, working directory/PR and an optional app to install |
+| **Runs** (`#/`) | A live strip (running, queued, devices busy, how many are held by agents, 7-day pass rate and spend; each segment is a filter shortcut), an **Active** lane with a card per queued or running run (live screen, current check, progress, queue position and reason), and the history below. Filter by status, verdict, project and free text (title, branch, PR, ticket, commit); group by day, batch or nothing. Filters live in the URL, so they can be bookmarked. **New run** opens a sheet with brief templates, saved suites, recent briefs, harness, device, model, effort, package, working directory/PR and an optional app to install |
 | **Run** (`#/runs/<id>`) | The workbench. Header with status, the harness badge, verdict (tagged *derived* when the agent never reported one), device and actions: Cancel, Re-run (all checks or failed only), Open report, Transcript (when the harness exports one), Details, Delete. A phase stepper while active, an outcome callout when it ended (what went wrong in plain words, the stderr tail, Retry / Re-run failed), then three panes: the **checks** list, the **timeline** of the agent's tool calls paired with their results and the **device** pane (live screen, or the evidence screenshot of the selected check). A Screenshots tab shows the gallery; a steer box sends instructions to a running agent (hidden when the run's harness cannot be steered). Narrow windows switch to tabs |
 | **Batch** (`#/batches/<id>`) | One lane per device of a [batch](#batches), the rolled-up verdict and total cost, and **Re-run failed lanes** |
-| **Devices** | Run slots and emulators booted vs `maxBooted`; a card per connected device with a live thumbnail and its state (Free, Running, Booting, Idle with a shutdown countdown, held by an Artemis task, Excluded, "not used for QA" for watches and TVs); **New run here**, **Shut down** (devices Tapocalypse booted) and ghost cards with a **Boot** button for your configured AVDs and simulators |
+| **Devices** | Run slots and emulators booted vs `maxBooted`, and how many devices are held by agents; a card per connected device with a live thumbnail and its state (Free, Running, Held by an agent with its holder, reason, time left and the agents and runs waiting, Booting, Idle with a shutdown countdown, Excluded, "not used for QA" for watches and TVs); **New run here**, **Release…** (end an agent's lease), a bell to be notified when a held device frees up, **Shut down** (devices Tapocalypse booted) and ghost cards with a **Boot** button for your configured AVDs and simulators. See [Sharing devices between agents](#sharing-devices-between-agents) |
 | **Setup** | A *Get started* checklist that ticks itself off (prerequisites, add a project, connect a device, first run, connect your coding agent), every doctor check (one pair per installed harness) with copyable fixes, and **Connect agent** snippets for omp, Claude Code and Cursor with live status of the first MCP call |
 | **Projects** | A card per project with its last runs, 7-day pass rate and spend; New run, Edit, Reports, Suites and Delete. The add-project wizard suggests folders and shows what detection found |
 | **Reports** | Per-project report list (search, verdict tabs, grouped by day). A report page has an "On this page" outline, the run's details with a link back to it, a screenshot gallery (click any image) and a reading-progress bar |
@@ -173,15 +172,38 @@ The model for a run is, in order: the run's own `model`, the suite's, the projec
 
 ## Devices
 
-- **Platform-only requests** ("Any android", "Any ios", or just a project default) go to the first free emulator or simulator, ordered by serial. Free means: connected and ready, not used by another run, not listed in `devicePool.android.excludeSerials`, and not held by an Artemis task.
+- **Platform-only requests** ("Any android", "Any ios", or just a project default) go to the first free emulator or simulator, ordered by serial. Free means: connected and ready, not used by another run, not listed in `devicePool.android.excludeSerials`, and not [leased by a coding agent](#sharing-devices-between-agents).
 - **Physical devices are never picked automatically.** They are used only when a run names their serial, so your own phone is never grabbed by accident. Watches and TVs never run QA: they are skipped, and naming one is rejected. Wear OS, TV and Automotive AVDs are never booted automatically.
 - **Explicit serial.** If the device is busy the run waits in the queue (it is not rejected). A serial that is not connected, or is in `excludeSerials`, is rejected immediately. Runs for other devices are not blocked by a waiting run.
-- **Queueing.** Runs start in order as devices free up, at most `maxConcurrentRuns` at a time. The queue survives restarts. A queued run shows its position and the reason it is waiting (for example `maxConcurrentRuns (2) reached`, `all android devices busy`, `emulator-5554 is busy`, `maxBooted (1) reached`).
+- **Queueing.** Runs start in order as devices free up, at most `maxConcurrentRuns` at a time. The queue survives restarts. A queued run shows its position and the reason it is waiting (for example `maxConcurrentRuns (2) reached`, `all android devices busy (1 held by agents, 1 running QA)`, `emulator-5554 is held by claude · checkout-redesign until 14:32`, `emulator-5554 is busy`, `maxBooted (1) reached`). Runs and waiting agents share one first-in, first-out queue.
 - **Auto-boot.** If no device is free, Tapocalypse boots one from your pool: an AVD from `devicePool.android.avds` that is not already running (while fewer than `maxBooted` emulators are booted), or a simulator UDID from `devicePool.ios.simulators` (list them with `xcrun simctl list devices`). Emulators start with `-no-snapshot-save -no-boot-anim -no-audio` on even ports from `basePort` (`emulator-5560`, `emulator-5562`, …) and must finish booting within 180 s. Set `maxBooted` to `0` to disable auto-boot.
-- **Manual boot and shutdown.** The **Devices** page boots any configured AVD or simulator on demand, and shuts down devices Tapocalypse booted that no run is using (`POST /api/devices/boot`, `POST /api/devices/:serial/shutdown`).
+- **Manual boot and shutdown.** The **Devices** page boots any configured AVD or simulator on demand, and shuts down devices Tapocalypse booted that no run or agent lease is using (`POST /api/devices/boot`, `POST /api/devices/:serial/shutdown`).
 - **Idle shutdown.** A device Tapocalypse booted is shut down after sitting unused for `idleShutdownMinutes` (checked every minute). Devices you started yourself are never shut down.
 - **Minimum resolution.** Some AVDs boot with tiny screens that make screenshots unreadable. A booted emulator whose screen is smaller than `minSize` (default 720x1280) is switched to `minSize` at `minDensity` dpi.
 - **Restarts.** Tapocalypse forgets which devices it booted; after a restart they are ordinary devices and are not shut down automatically.
+
+## Sharing devices between agents
+
+Your coding agents (Claude Code, Codex, omp, Cursor, in as many windows as you like) often need an emulator or simulator too, and two agents tapping through one device at once wreck each other's work. Tapocalypse is the **device broker** for the machine: an agent borrows a device with a **lease**, and nobody else (another agent, or a QA run) is given that device until the lease ends.
+
+- **What a lease is.** An exclusive claim on one device, held by a named holder. A QA run already holds one implicitly from the moment its device is assigned until it finishes, so a leased device is never given to a run, and a device in use by a run is never leased. Agent leases last `ttlMinutes` (default 30, 5-120) from the last renewal.
+- **Tools.** Three MCP tools on `/mcp` (or the same operations over [HTTP](api.md#device-leases)):
+
+  | Tool | Purpose |
+  | --- | --- |
+  | `device_acquire` | Borrow a device: `{ serial }` or `{ platform }`, a required `holder` (who you are and what you work on, for example `claude-code · checkout-redesign`), an optional `reason`, `ttlMinutes`, `waitSeconds` (0-110, default 0), `ticket` and `cwd`. Returns `serial`, `platform`, `name`, `mobileDeviceId` (the id mobile-mcp tools expect), `leaseId`, `expiresAt` and `ttlMinutes` |
+  | `device_renew` | `{ leaseId, ttlMinutes? }`: extend the lease to now + its TTL (or a new `ttlMinutes`) |
+  | `device_release` | `{ leaseId }`: give the device back so the next waiter gets it |
+
+  `qa_list_devices` shows each device's `lease` (holder, reason, times; never the secret) and who is waiting for it.
+- **Choosing a device.** `{ platform }` takes the first free emulator or simulator, and boots one from your configured pool under `maxBooted` when none is free (booting can take up to 180 s, so the call may return `state: "booting"`). Physical devices are leased only by explicit `serial`. Devices in `excludeSerials` (`device_excluded`) and watches and TVs (`device_unsupported`) cannot be leased.
+- **Waiting and tickets.** If nothing fits, `device_acquire` waits up to `waitSeconds`, then returns `timedOut: true` with a `ticket`, its `position`, `state` (`waiting` or `booting`), who holds the device (`heldBy`) and a `reason`. Call again with the same arguments plus the `ticket` to keep your place; a ticket is kept for 60 s after its call returns, and at most 32 tickets exist at once (`queue_full`). Waiting agents and queued QA runs share one first-in, first-out queue: the earliest compatible entry gets each freed device, and an entry that cannot be served yet does not block later ones. If a device is granted to your ticket between calls, it is held for you for 60 s; call again with the `ticket` to pick it up, or it goes to the next in line. `{ platform }` with nothing free and nothing bootable fails at once with `no_device` instead of waiting. MCP clients should allow a tool timeout of at least 120 s so a `waitSeconds: 110` call is not cut off.
+- **Renewing and expiry.** `leaseId` is returned once and cannot be recovered; the agent keeps it in its notes. It renews with `device_renew` while it works (the [snippet](agent-setup.md#8-let-your-agents-borrow-devices-optional) says when) and always calls `device_release` when done, also on failure. A lease that is not renewed ends on its own at `expiresAt` (checked every 15 s), so an agent that crashed frees its device within one TTL. A lease also ends when its device disappears for 2 minutes or comes back as a different AVD (`emulator-5556` can be another emulator after a restart). A late `device_renew` or `device_release` is told why the lease ended (`released`, `expired`, `revoked` or `gone`) when Tapocalypse still remembers it (the last 100 ended leases).
+- **In the UI.** On **Devices**, a held card shows the holder, reason, since/until times, a ring counting the time left, and the agents and runs waiting (`2 waiting: omp · checkout-redesign, run “Login smoke”`). **Release…** ends a stuck lease after a confirmation (it cannot stop the agent, which learns the next time it calls a lease tool); a lease held by a QA run is ended by cancelling the run instead. The bell notifies you when a held device frees up. The pool header counts devices held by agents and who waits for "any Android" or "any iOS", the live strip and the sidebar badge count leases as busy, the New run picker disables held devices and shows who holds them and when they free up, and a queued run says which agent it waits for. A device granted to a waiting agent shows "Reserved for <holder>" during its 60 s claim window.
+- **Restarts and idle shutdown.** Agent leases are stored in `<data dir>/leases.json` (owner-only permissions) and survive a restart until they expire, because the agent in another window still holds its `leaseId`. Run leases and tickets are not stored: runs become `interrupted` and waiting agents call again. A device Tapocalypse booted is never idle-shut down or shut down from the UI while it is leased.
+- **Limits.** Leases are **cooperative**. Tapocalypse refuses to hand a leased device to a run or another agent that asks through it, but cannot stop a process that ignores the broker: raw `adb`, `xcrun simctl`, an agent's own mobile-mcp, Appium, Maestro, `flutter run` or an IDE deploy all reach the device regardless. The lease protocol in the agent's instructions is what keeps them away. A QA run that names a serial its own agent holds waits behind the lease like any other (it does not take it over). Tapocalypse instances on other ports have their own data folders and do not see each other's leases. Because `leaseId` is the only secret, treat it like a password: see [Security model](#security-model).
+
+Set your agents up with the [lease snippet in agent-setup.md](agent-setup.md#8-let-your-agents-borrow-devices-optional) or the **Setup** page.
 
 ## Run outcomes
 
@@ -195,7 +217,7 @@ The model for a run is, in order: the run's own `model`, the suite's, the projec
 
 | Kind | Meaning |
 | --- | --- |
-| `infra` | Tapocalypse or the machine failed: emulator did not boot, the agent runtime did not start or crashed (exit ≠ 0, other than SIGTERM) before any check resolved, mobile-mcp or the progress tools did not appear, app install failed, an Artemis task holds the device |
+| `infra` | Tapocalypse or the machine failed: emulator did not boot, the agent runtime did not start or crashed (exit ≠ 0, other than SIGTERM) before any check resolved, mobile-mcp or the progress tools did not appear, app install failed |
 | `agent` | The agent ended without a report and without a resolved check ("agent ended without qa_finish"), or the harness reported a run error |
 | `timeout` | The run used up its time budget, or the harness hit a turn or budget limit (`error` says which: "turn limit", "budget") |
 | `cancelled` | You cancelled it |
@@ -241,7 +263,8 @@ tool_timeout_sec = 120
 | `qa_list_projects` | Registered projects with `status` (`ok`/`invalid`) and problems. Only `ok` projects can start runs |
 | `qa_detect_project` | Inspect a repo and suggest project settings |
 | `qa_create_project` / `qa_update_project` / `qa_delete_project` | Register a project (omitted fields come from detection), change only the fields you pass, or remove one (not while it has active runs) |
-| `qa_list_devices` | Connected emulators, simulators and devices with busy/booting/Artemis flags |
+| `qa_list_devices` | Connected emulators, simulators and devices with busy/booting flags, the agent `lease` holding each and who is waiting |
+| `device_acquire` / `device_renew` / `device_release` | Borrow a device for a coding agent with a lease, extend it, give it back; see [Sharing devices between agents](#sharing-devices-between-agents) |
 | `qa_doctor` | Prerequisite report with a fix for anything missing; call it when runs fail to start |
 | `qa_list_suites` | Saved suites of a project (reusable briefs with fixed check ids) |
 | `qa_start_run` | Queue a run (optional `harness`: `omp`, `claude` or `codex`); returns `runId`, `status`, `queuePosition`, a UI `url` and the recorded `source` |
@@ -430,7 +453,7 @@ One JSON file plus a few environment variables. The keys you will touch most:
 | `agent.harness` | unset: first installed and signed in, else first installed, else omp | Default [agent runtime](#agent-runtimes): `omp`, `claude` or `codex` |
 | `agent.harnesses.<id>` | unset | Per-harness `bin`, `model`, `effort`, and `permissions` (Claude Code) or `sandbox` (Codex CLI) |
 
-The full key list (`agent` and its per-harness settings, `artemisPath`, ports, sizes, idle shutdown, `excludeSerials`) and every environment variable (`TAPOCALYPSE_CONFIG`, `TAPOCALYPSE_DATA_DIR`, `OMP_BIN`, `CLAUDE_BIN`, `CODEX_BIN`, `ADB_BIN`, `GIT_BIN`, `GH_BIN`, `EMULATOR_BIN`, `ANDROID_HOME`, `OMP_PROFILE`, …) are in [docs/configuration.md](configuration.md). The file is validated at startup (`fatal: config: …`, exit 1) and read once; restart after editing it by hand.
+The full key list (`agent` and its per-harness settings, ports, sizes, idle shutdown, `excludeSerials`) and every environment variable (`TAPOCALYPSE_CONFIG`, `TAPOCALYPSE_DATA_DIR`, `OMP_BIN`, `CLAUDE_BIN`, `CODEX_BIN`, `ADB_BIN`, `GIT_BIN`, `GH_BIN`, `EMULATOR_BIN`, `ANDROID_HOME`, `OMP_PROFILE`, …) are in [docs/configuration.md](configuration.md). The file is validated at startup (`fatal: config: …`, exit 1) and read once; restart after editing it by hand.
 
 ## Data and retention
 
@@ -456,6 +479,7 @@ Tapocalypse keeps three things outside your repositories: its config, its run hi
   session/         the omp session (omp runs only)
   transcript.html  full agent transcript (omp runs only)
 <data dir>/batches/                                     batch titles
+<data dir>/leases.json                                  agent device leases (owner-only; holds lease secrets)
 <data dir>/omp-plugins/tpc/.mcp.json                    the mobile-mcp plugin for omp runs, if provisioned
 <data dir>/logs/service.log                             output of the background service, if installed
 ```
@@ -474,22 +498,6 @@ Run ids look like `20260101-093015-a1b2-dark-mode-toggle`. By default nothing is
 6. **The prompt.** Besides your brief, the agent is told: its device (and the mobile-mcp device id), that it must not touch other devices or boot its own, the app package, the run id, the time budget, the code under test ([Run metadata](#run-metadata)), which driver tools to use and not use, to never spawn subagents or ask the user questions, and the reporting protocol: save every screenshot into the absolute screenshot folder it is given (`<data dir>/runs/<run-id>/screenshots/`), never write anything into the repository, and finish with `qa_finish { verdict, summary, reportMarkdown }` embedding images as `screenshots/<name>`. A folder per run keeps parallel runs from colliding. If it is blocked it records why and finishes with `BLOCKED`.
 7. **Finish.** After the agent ends, Tapocalypse collects usage (omp: session statistics; Claude Code: the final result; Codex CLI: token counts), exports `transcript.html` on harnesses that can (omp), closes the agent's stdin and waits for it to exit, then applies the rules in [Run outcomes](#run-outcomes) (reported or derived verdict, error kind, retry). Cancelling interrupts the agent and kills it after 10 s; "steer" sends your message to the live agent on harnesses that support it (omp and Claude Code; others answer `409 steering is not supported by <harness>`).
 
-## Optional: Artemis backend
-
-The default driver is mobile-mcp: it works on Android and iOS, needs nothing but Node, and returns the real accessibility labels of Flutter, React Native and native apps. **Artemis** is an optional second driver for Android that reads the UI tree through an on-device accessibility service, which is much faster on large UI trees, and returns a fresh screenshot plus element list with every action.
-
-Measured on one large Flutter app (Android emulator): reading the element tree took 0.6 s with Artemis versus 17-25 s per call with mobile-mcp; the same one-check smoke test finished in about 51 s versus 107 s. On ordinary native screens mobile-mcp answered in about 0.5 s, so the gain depends on your UI tree. Both returned the same verdict.
-
-What it costs: Android only; a local clone of Artemis with Python 3.12+ and [uv](https://docs.astral.sh/uv/) (a virtualenv of roughly 900 MB); and a helper app on each device that shows a persistent notification and an entry under Accessibility settings.
-
-To enable it:
-
-1. Set up Artemis, and add its MCP server to your omp config (`~/.omp/agent/mcp.json`) so omp sessions can use its tools (any server name works; Tapocalypse finds the tools by name). Artemis runs need the omp harness: the other harnesses mount only the servers Tapocalypse gives them, so a run that asks for `backend: "artemis"` on Claude Code or Codex CLI is rejected with a 400.
-2. Set `"artemisPath": "/path/to/artemis"` in the config file and restart. `bun run doctor` then reports the Artemis check and lists `artemis` under *Backends*.
-3. Choose **Backend: artemis** in the New run form, or pass `backend: "artemis"` to `qa_start_run` / `POST /api/runs`.
-
-For such runs Tapocalypse installs or upgrades the helper on the device (`uv run artemis helper install`), stops mobile-mcp's on-device server (only one tool can hold Android's UI-automation connection at a time), and tells the agent to use only Artemis's direct tools (click, swipe, input text, key press, long press, device state, app launch/stop), never its autonomous `mobile_run_task`. Devices with a live Artemis task are skipped by the scheduler, so a run for one waits in the queue until the task ends.
-
 ## Security model
 
 Tapocalypse is a local developer tool with no login.
@@ -500,7 +508,8 @@ Tapocalypse is a local developer tool with no login.
 - **Reports are sanitized.** Markdown reports are rendered to HTML on the server and then sanitized: scripts, event handlers, iframes, styles, forms and `javascript:`-style links are stripped, and only `http`, `https`, `mailto`, relative and `#` links survive. External images are dropped and replaced by their alt text, so opening a report never contacts a third party. Task-list checkboxes are rendered disabled. Transcripts, which omp exports, are served with a `sandbox` Content-Security-Policy.
 - **Content-Security-Policy.** The UI page allows only same-origin scripts, styles and connections, images from itself or `data:`/`blob:`, fonts from itself or `data:` (the bundled monospace font is inlined), and no plugins, base tags or foreign form targets.
 - **Frame protection.** Every API and file response carries `X-Frame-Options: DENY` and `frame-ancestors 'none'`; the UI page itself refuses to render inside another page. This stops clickjacking of a running instance.
-- **Guards on destructive actions.** Only finished runs can be deleted, only devices Tapocalypse booted (and no run is using) can be shut down from the UI, projects with active runs cannot be removed, and retention only deletes run folders inside the data directory.
+- **Guards on destructive actions.** Only finished runs can be deleted, only devices Tapocalypse booted (and no run or agent lease is using) can be shut down from the UI, projects with active runs cannot be removed, and retention only deletes run folders inside the data directory.
+- **Device leases are cooperative.** A lease keeps well-behaved agents apart; it is not a security boundary. The `leaseId` returned by `device_acquire` is a capability for renewing and releasing that lease: it is stored in `<data dir>/leases.json` (readable only by your user), never appears in lists, events or the UI, and is compared in constant time. But anything that can reach the port, or run `adb`, can still touch a device or end a lease from the Devices page.
 - **Path safety.** A run's files are served only from that run's own folder in the data directory, and only images (`png`, `jpg`, `jpeg`, `webp`, `gif`) whose first bytes really are an image (served with `X-Content-Type-Options: nosniff`). Files that old runs wrote into a repo are served only from the project's legacy `reportsDir`, with a short extension list. Screenshots and reports an agent names must lie inside the repo, the run's folder or the OS temp directory (a screenshot is capped at 25 MB, a report at 2 MB), are copied in and are never served from where they were; `qa_export` and `--export` write only into the folder you give, never inside Tapocalypse's data folder or a `.git` folder. Persona files and a legacy `reportsDir` must resolve inside the repo (symlinks included), and `source.path` must be the project's repo or one of its git worktrees.
 
 See [SECURITY.md](../SECURITY.md) to report a vulnerability.
@@ -514,8 +523,8 @@ Start with `bun run doctor` (or the **Setup** page): it checks every prerequisit
 - **`steering is not supported by Codex CLI` (409).** Codex CLI cannot take a message mid-run. Cancel and start a new run, or use omp or Claude Code for runs you want to steer.
 - **Codex CLI marked my repo as trusted.** The first `codex exec` in a directory makes Codex CLI add `[projects."<repo path>"] trust_level = "trusted"` to `~/.codex/config.toml`. That is Codex's own behaviour and Tapocalypse does not undo it; remove the entry if you do not want it.
 - **A Claude Code run fails immediately as root.** `--permission-mode bypassPermissions` refuses to run as root. Run Tapocalypse as a normal user, or set `agent.harnesses.claude.permissions` to `"allowlist"`.
-- **A run stays queued.** The run's card and page show the reason in plain words: `maxConcurrentRuns (n) reached`, `all android devices busy`, `no android device available`, `maxBooted (n) reached`, or `<serial> is busy` / `is not connected` / `is held by an Artemis task` / `is booting` for a run that named a device. Physical devices are only used when requested by serial; to let a run start, free a device, raise the limits or list an AVD in `devicePool.android.avds`. The scheduler re-checks every 10 s.
-- **Slow element lists on Flutter apps.** mobile-mcp can take 15-25 s to dump a large Flutter tree. The agent is told to list elements once per screen and to batch actions. The [Artemis backend](#optional-artemis-backend) avoids this on Android.
+- **A run stays queued.** The run's card and page show the reason in plain words: `maxConcurrentRuns (n) reached`, `all android devices busy`, `no android device available`, `maxBooted (n) reached`, or `<serial> is busy` / `is not connected` / `is booting` for a run that named a device. When a coding agent holds the device the reason names it: `<serial> is held by <holder> until HH:MM`, or `all android devices busy (2 held by agents, 1 running QA)`. Physical devices are only used when requested by serial; to let a run start, free a device, raise the limits or list an AVD in `devicePool.android.avds`. A device held by a stuck agent can be released from the **Devices** page. The scheduler re-checks every 10 s.
+- **Slow element lists on Flutter apps.** mobile-mcp can take 15-25 s to dump a large Flutter tree. The agent is told to list elements once per screen and to batch actions.
 - **Emulator does not boot.** Names in `devicePool.android.avds` must match `emulator -list-avds` exactly (doctor flags unknown ones). Tapocalypse finds the emulator under `$ANDROID_HOME`, `$ANDROID_SDK_ROOT`, `~/Library/Android/sdk` (macOS) or `~/Android/Sdk` (Linux); elsewhere set `ANDROID_HOME` or `EMULATOR_BIN`. On Linux check KVM access (see [Operating systems](#operating-systems)). Try `emulator -avd <name>` by hand to see hardware-acceleration or disk-space errors. Booting is abandoned after 180 s.
 - **Port 4310 is in use.** Start with another port: `TAPOCALYPSE_PORT=4311 bun start` (or set `port`), and update the URL in your MCP client config. Requests to a different host or port get `403 forbidden host`.
 - **A run ended `done` but the verdict is tagged "derived".** The agent stopped without calling `qa_finish` (often because it hit `runMaxTime`) and the verdict was computed from its checks. Open the activity feed (or, on omp, the transcript) to see why, then re-run the failed checks with a narrower brief or a larger `runMaxTime`. If no check had resolved, the run is `error` with kind `agent` ("agent ended without qa_finish").

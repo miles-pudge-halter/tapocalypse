@@ -4,13 +4,13 @@ import { legacyProgressActivity } from "../src/harness/omp/activity";
 import { harness } from "../src/harness/omp";
 import { type Frame, LineParser } from "../src/harness/omp/rpc";
 import type { ReplayContext } from "../src/harness/types";
-import type { Activity, Backend } from "../src/runs/types";
+import type { Activity } from "../src/runs/types";
 
 type ToolStarts = ReplayContext["starts"];
 
 /** One frame through the omp adapter's replay mapping; pass the same `starts` across a session. */
-function frameToActivity(frame: unknown, backend: Backend, seq: number, starts: ToolStarts = new Map()): Activity | null {
-  return harness.toActivity(frame, { backend, seq, starts });
+function frameToActivity(frame: unknown, seq: number, starts: ToolStarts = new Map()): Activity | null {
+  return harness.toActivity(frame, { seq, starts });
 }
 
 function parseChunks(data: Uint8Array, size: number): Frame[] {
@@ -59,7 +59,7 @@ describe("frameToActivity on the captured session", () => {
   const frames = parseChunks(fixture, 37);
   const starts: ToolStarts = new Map();
   const activities = frames
-    .map((f, seq) => frameToActivity(f, "mobile-mcp", seq, starts))
+    .map((f, seq) => frameToActivity(f, seq, starts))
     .filter((a) => a !== null);
 
   test("tool calls name each tool", () => {
@@ -96,44 +96,29 @@ describe("frameToActivity on the captured session", () => {
 describe("frameToActivity backend rules", () => {
   const start = (toolName: string): Frame => ({ type: "tool_execution_start", toolName, args: {} });
 
-  test("mobile-mcp tools under the artemis backend are violations", () => {
-    expect(frameToActivity(start("mcp__mobile_mcp_mobile_click"), "artemis", 0)).toMatchObject({
-      kind: "warn",
-      text: "backend violation: mcp__mobile_mcp_mobile_click",
-    });
+  test("mobile-mcp tools are plain tool lines", () => {
+    expect(frameToActivity(start("mcp__mobile_mcp_mobile_click"), 0)?.kind).toBe("tool");
   });
 
-  test("artemis run_task is a violation under artemis, direct tools are fine", () => {
-    expect(frameToActivity(start("mcp__artemis_mobile_run_task"), "artemis", 0)?.kind).toBe("warn");
-    expect(frameToActivity(start("mcp__artemis_mobile_click"), "artemis", 0)?.kind).toBe("tool");
-  });
-
-  test("artemis tools under mobile-mcp are violations, mobile-mcp tools are fine", () => {
-    expect(frameToActivity(start("mcp__artemis_mobile_click"), "mobile-mcp", 0)).toMatchObject({
-      kind: "warn",
-      text: "backend violation: mcp__artemis_mobile_click",
-    });
-    expect(frameToActivity(start("mcp__mobile_mcp_mobile_click"), "mobile-mcp", 0)?.kind).toBe("tool");
-  });
-
-  test("Tapocalypse's plugin-namespaced mobile-mcp tools follow the same rules as the user-config form, under the canonical name", () => {
+  test("Tapocalypse's plugin-namespaced mobile-mcp tools show under the canonical name", () => {
     const namespaced = "mcp__tpc_mobile_mcp_mobile_click_on_screen_at_coordinates";
     const canonical = "mcp__mobile_mcp_mobile_click_on_screen_at_coordinates";
-    expect(frameToActivity(start(namespaced), "artemis", 0)).toMatchObject({ kind: "warn", text: `backend violation: ${canonical}` });
-    expect(frameToActivity(start(namespaced), "mobile-mcp", 0)).toMatchObject({ kind: "tool", tool: canonical });
+    expect(frameToActivity(start(namespaced), 0)).toMatchObject({ kind: "tool", tool: canonical });
   });
 
   test("a user-configured server under another name still canonicalizes to its device server", () => {
-    expect(frameToActivity(start("mcp__my_phone_mobile_mcp_mobile_click"), "mobile-mcp", 0)).toMatchObject({ tool: "mcp__mobile_mcp_mobile_click" });
+    expect(frameToActivity(start("mcp__my_phone_mobile_mcp_mobile_click"), 0)).toMatchObject({ tool: "mcp__mobile_mcp_mobile_click" });
   });
 
-  test("tapocalypse MCP tools are violations under both backends", () => {
-    for (const backend of ["mobile-mcp", "artemis"] as const) {
-      expect(frameToActivity(start("mcp__tapocalypse_qa_start_run"), backend, 0)).toMatchObject({
-        kind: "warn",
-        text: "backend violation: mcp__tapocalypse_qa_start_run",
-      });
-    }
+  test("tapocalypse MCP tools are violations", () => {
+    expect(frameToActivity(start("mcp__tapocalypse_qa_start_run"), 0)).toMatchObject({
+      kind: "warn",
+      text: "backend violation: mcp__tapocalypse_qa_start_run",
+    });
+  });
+
+  test("tool lines of runs recorded with the removed artemis backend replay as ordinary tool lines", () => {
+    expect(frameToActivity(start("mcp__artemis_mobile_run_task"), 0)).toMatchObject({ kind: "tool", tool: "mcp__artemis_mobile_run_task" });
   });
 
   test("MCP calls made through omp's xd:// write are attributed to the MCP tool", () => {
@@ -142,16 +127,16 @@ describe("frameToActivity backend rules", () => {
       toolName,
       args: { path, content: '{"device":"emulator-5556"}' },
     });
-    expect(frameToActivity(xd("write", "xd://mcp__mobile_mcp_mobile_click_on_screen_at_coordinates"), "artemis", 0)).toMatchObject({
-      kind: "warn",
-      text: "backend violation: mcp__mobile_mcp_mobile_click_on_screen_at_coordinates",
-    });
-    expect(frameToActivity(xd("write", "xd://mcp__artemis_mobile_click"), "artemis", 0)).toMatchObject({
+    expect(frameToActivity(xd("write", "xd://mcp__mobile_mcp_mobile_click_on_screen_at_coordinates"), 0)).toMatchObject({
       kind: "tool",
-      text: 'mcp__artemis_mobile_click {"device":"emulator-5556"}',
+      tool: "mcp__mobile_mcp_mobile_click_on_screen_at_coordinates",
+    });
+    expect(frameToActivity(xd("write", "xd://mcp__tapocalypse_qa_start_run"), 0)).toMatchObject({
+      kind: "warn",
+      text: "backend violation: mcp__tapocalypse_qa_start_run",
     });
     // Reading a device's docs is not a call.
-    expect(frameToActivity(xd("read", "xd://mcp__mobile_mcp_mobile_click_on_screen_at_coordinates"), "artemis", 0)?.kind).toBe("tool");
+    expect(frameToActivity(xd("read", "xd://mcp__mobile_mcp_mobile_click_on_screen_at_coordinates"), 0)?.kind).toBe("tool");
   });
 });
 
@@ -165,8 +150,8 @@ describe("frameToActivity enrichment", () => {
       ["qa_check", { id: "C1", status: "pass" }],
       ["qa_finish", { verdict: "PASS", summary: "s", reportMarkdown: "# r" }],
     ] as const) {
-      expect(frameToActivity(frame({ type: "tool_execution_start", toolCallId: name, toolName: name, args }), "mobile-mcp", 0, starts)).toBeNull();
-      expect(frameToActivity(frame({ type: "tool_execution_end", toolCallId: name, toolName: name, isError: false }), "mobile-mcp", 1, starts)).toBeNull();
+      expect(frameToActivity(frame({ type: "tool_execution_start", toolCallId: name, toolName: name, args }), 0, starts)).toBeNull();
+      expect(frameToActivity(frame({ type: "tool_execution_end", toolCallId: name, toolName: name, isError: false }), 1, starts)).toBeNull();
     }
   });
 
@@ -183,13 +168,11 @@ describe("frameToActivity enrichment", () => {
     const starts: ToolStarts = new Map();
     frameToActivity(
       frame({ type: "tool_execution_start", toolCallId: "c", toolName: "qa_check", args: { id: "C2", status: "pass", screenshot: "/etc/passwd" } }),
-      "mobile-mcp",
       0,
       starts,
     );
     const end = frameToActivity(
       frame({ type: "tool_execution_end", toolCallId: "c", toolName: "qa_check", isError: true, result: { content: [{ type: "text", text: "screenshot path must be inside the repo" }] } }),
-      "mobile-mcp",
       1,
       starts,
     );
@@ -207,14 +190,12 @@ describe("frameToActivity enrichment", () => {
         args: { path: "xd://mcp__tpc_mobile_mcp_mobile_click", content: '{"x":1}' },
         _ts: "2026-01-01T00:00:00.000Z",
       }),
-      "mobile-mcp",
       0,
       starts,
     );
     expect(start).toMatchObject({ kind: "tool", tool: "mcp__mobile_mcp_mobile_click", args: { x: 1 } });
     const end = frameToActivity(
       frame({ type: "tool_execution_end", toolCallId: "t1", toolName: "write", isError: true, result: { content: [{ type: "text", text: "boom" }] }, _ts: "2026-01-01T00:00:02.500Z" }),
-      "mobile-mcp",
       1,
       starts,
     );
@@ -223,7 +204,7 @@ describe("frameToActivity enrichment", () => {
   });
 
   test("args over 2 KB are truncated to a string", () => {
-    const big = frameToActivity(frame({ type: "tool_execution_start", toolCallId: "b", toolName: "bash", args: { command: "x".repeat(5000) } }), "mobile-mcp", 0);
+    const big = frameToActivity(frame({ type: "tool_execution_start", toolCallId: "b", toolName: "bash", args: { command: "x".repeat(5000) } }), 0);
     expect(typeof big?.args).toBe("string");
     expect((big?.args as string).length).toBeLessThanOrEqual(2049);
     expect(big?.text.length).toBeLessThanOrEqual(220);

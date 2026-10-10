@@ -67,7 +67,6 @@ export function createCodexHarness(deps: { spawn?: CodexSpawn } & Partial<CodexT
       costReported: false,
       limits: { maxTime: false, maxTurns: false, maxBudgetUsd: false },
       transcriptExport: false,
-      backends: ["mobile-mcp"],
     },
     spawn: (opts) => startSession(spawn, opts, timing),
     toActivity: frameToActivity,

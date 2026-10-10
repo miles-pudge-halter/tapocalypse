@@ -4,7 +4,6 @@ import type { DoctorCheck } from "../../doctor";
 import type { ExecResult } from "../../devices/devices";
 import type { RunUsage } from "../../runs/types";
 import {
-  ARTEMIS_SERVER,
   type Harness,
   type HarnessDoctorEnv,
   type HarnessEvent,
@@ -48,7 +47,7 @@ class OmpSession implements HarnessSession {
   private readonly resolveExit: (exit: HarnessExit) => void;
   private rpc: OmpRpc | null = null;
   private launch: LaunchPlan | null = null;
-  private prefixes: ToolPrefixes = { mobileMcp: null, artemis: null };
+  private prefixes: ToolPrefixes = { mobileMcp: null };
   private readonly started: Promise<OmpRpc>;
   private readonly usageFrames = new UsageAccumulator();
   private promptResult: { status: string; error: string | null } | null = null;
@@ -74,7 +73,7 @@ class OmpSession implements HarnessSession {
 
   private async start(): Promise<OmpRpc> {
     const { opts } = this;
-    const launch = await mcpLaunchArgs({ repoPath: opts.cwd }, opts.backend);
+    const launch = await mcpLaunchArgs({ repoPath: opts.cwd });
     if (this.killed) throw new Error("killed before omp started");
     this.launch = launch;
     const sessionDir = path.join(opts.runDir, "session");
@@ -184,15 +183,15 @@ class OmpSession implements HarnessSession {
   async ready(): Promise<SessionInfo> {
     const rpc = await this.started;
     const launch = this.launch!;
-    const { opts } = this;
     await rpc.ready();
     // MCP servers connect in the background; prompting before they are up makes the agent fail with "No such tool".
-    this.prefixes = await resolveToolPrefixes(rpc, opts.backend, { expectedMobileMcp: launch.expectedMobileMcp });
-    const server = opts.backend === "mobile-mcp" ? MOBILE_MCP_SERVER : ARTEMIS_SERVER;
-    const prefix = opts.backend === "mobile-mcp" ? this.prefixes.mobileMcp : this.prefixes.artemis;
-    const mcp: SessionInfo["mcp"] = [prefix ? { name: server, ok: true } : { name: server, ok: false, error: missingToolsMessage(opts.backend, launch) }];
+    this.prefixes = await resolveToolPrefixes(rpc, { expectedMobileMcp: launch.expectedMobileMcp });
+    const prefix = this.prefixes.mobileMcp;
+    const mcp: SessionInfo["mcp"] = [
+      prefix ? { name: MOBILE_MCP_SERVER, ok: true } : { name: MOBILE_MCP_SERVER, ok: false, error: missingToolsMessage(launch) },
+    ];
     if (prefix) {
-      this.emit({ type: "notice", level: "info", text: `${opts.backend} tools: ${prefix}*${launch.pluginDir ? " (provisioned by Tapocalypse)" : ""}` });
+      this.emit({ type: "notice", level: "info", text: `mobile-mcp tools: ${prefix}*${launch.pluginDir ? " (provisioned by Tapocalypse)" : ""}` });
       await rpc.send({ type: "set_host_tools", tools: PROGRESS_TOOLS });
     }
     return { sessionId: null, model: this.model, mcp };
@@ -200,7 +199,6 @@ class OmpSession implements HarnessSession {
 
   toolName(server: string, tool: string): string {
     if (server === PROGRESS_SERVER) return tool;
-    if (server === ARTEMIS_SERVER) return `${this.prefixes.artemis ?? "mcp__artemis_"}${tool}`;
     return `${this.prefixes.mobileMcp ?? "mcp__mobile_mcp_"}${tool}`;
   }
 
@@ -323,7 +321,6 @@ export function createOmpHarness(timing: Partial<OmpTiming> = {}): Harness {
       costReported: true,
       limits: { maxTime: true, maxTurns: false, maxBudgetUsd: false },
       transcriptExport: true,
-      backends: ["mobile-mcp", "artemis"],
     },
     spawn: (opts) => new OmpSession(opts, t),
     toActivity,

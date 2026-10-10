@@ -27,7 +27,6 @@ const CAPS: HarnessCapabilities = {
   costReported: true,
   limits: { maxTime: false, maxTurns: true, maxBudgetUsd: true },
   transcriptExport: false,
-  backends: ["mobile-mcp"],
 };
 
 const MCP_OK: SessionInfo["mcp"] = [
@@ -177,7 +176,6 @@ function setup(harnessId: HarnessId, o: FakeOptions = {}, runOver: Partial<Run> 
     deviceSerial: null,
     deviceName: null,
     bootedByRun: false,
-    backend: "mobile-mcp",
     packageId: "com.example.app",
     status: "queued",
     verdict: null,

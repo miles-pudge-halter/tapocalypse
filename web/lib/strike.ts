@@ -7,10 +7,8 @@ const HOST = ".strike";
 const ATTR = "data-strike";
 const TRAVEL = "strike-travel";
 
-function onClick(e: MouseEvent): void {
-  if (!(e.target instanceof Element)) return;
-  const host = e.target.closest<HTMLElement>(HOST);
-  if (!host || host.matches(":disabled, [aria-disabled='true']")) return;
+/** Plays the arc once on `host` (restarting it mid-strike); a no-op under reduced motion, where no `animationend` would clear the mark. */
+export function strikeOnce(host: HTMLElement): void {
   // Without motion there is no animation and so no `animationend` to clear the mark.
   if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
   // Re-activation mid-strike restarts the arc: the attribute has to go away for a style flush before coming back.
@@ -19,6 +17,13 @@ function onClick(e: MouseEvent): void {
     void host.offsetWidth;
   }
   host.setAttribute(ATTR, "");
+}
+
+function onClick(e: MouseEvent): void {
+  if (!(e.target instanceof Element)) return;
+  const host = e.target.closest<HTMLElement>(HOST);
+  if (!host || host.matches(":disabled, [aria-disabled='true']")) return;
+  strikeOnce(host);
 }
 
 function onAnimationDone(e: AnimationEvent): void {

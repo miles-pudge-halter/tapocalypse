@@ -51,6 +51,7 @@ import {
   useProjects,
   useRoute,
 } from "@/lib/hooks";
+import { deviceCounts } from "@/lib/leases";
 import { type Theme, useTheme } from "@/lib/theme";
 import { cn } from "@/lib/utils";
 
@@ -127,8 +128,8 @@ function RunsNav({ active }: { active: boolean }) {
 
 function DevicesNav({ active }: { active: boolean }) {
   const { devices } = useDevices();
-  const usable = devices.filter((d) => d.state === "ready" && d.deviceType !== "watch" && d.deviceType !== "tv");
-  const busy = usable.filter((d) => d.busyRunId).length;
+  const { usable, running, held, busy, free } = deviceCounts(devices);
+  const title = [running > 0 ? `${running} running` : null, held > 0 ? `${held} held by agents` : null, `${free} free`].filter(Boolean).join(" · ");
   return (
     <SidebarMenuItem>
       <SidebarMenuButton asChild isActive={active} tooltip="Devices" className="strike">
@@ -137,9 +138,16 @@ function DevicesNav({ active }: { active: boolean }) {
           <span>Devices</span>
         </a>
       </SidebarMenuButton>
-      {usable.length > 0 && (
-        <SidebarMenuBadge title={`${busy} busy of ${usable.length} devices`}>
-          {busy}/{usable.length}
+      {usable > 0 && (
+        <SidebarMenuBadge
+          className={cn(
+            running > 0 && "bg-blue-500/15 text-blue-700 dark:text-blue-300",
+            running === 0 && held > 0 && "bg-violet-50 text-violet-800 dark:bg-violet-950/40 dark:text-violet-300",
+          )}
+          title={title}
+        >
+          {held > 0 && <span className="mr-1 inline-block size-1.5 rounded-full bg-violet-500" />}
+          {busy}/{usable}
         </SidebarMenuBadge>
       )}
     </SidebarMenuItem>

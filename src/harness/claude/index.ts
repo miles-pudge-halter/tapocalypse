@@ -11,7 +11,6 @@ const capabilities: HarnessCapabilities = {
   costReported: true,
   limits: { maxTime: false, maxTurns: true, maxBudgetUsd: true },
   transcriptExport: false,
-  backends: ["mobile-mcp"],
 };
 
 export function createClaudeHarness(overrides: Partial<ClaudeDeps> = {}): Harness {

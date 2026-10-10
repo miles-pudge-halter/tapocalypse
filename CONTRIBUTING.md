@@ -40,7 +40,7 @@ The CLI is `src/cli.ts` (`bun src/cli.ts --help`); it only needs a running serve
 
 ## Adding a harness
 
-A harness is one folder, `src/harness/<id>/index.ts`, that exports `harness: Harness` (see `src/harness/types.ts`) and is registered in `src/harness/index.ts`. It spawns the CLI headless, normalizes its event stream into `HarnessEvent`s, maps tool names to the canonical form, reports its capabilities (steer, cost, transcript, backends, limits) and doctor checks, and writes any per-run config under the run folder, never into the repository or the user's home. Secrets such as the run's progress token go through the environment, not argv. Keep the raw frames verbatim in `events.jsonl`; `toActivity` replays them. Test it test-first with a fixture stream and a fake child process.
+A harness is one folder, `src/harness/<id>/index.ts`, that exports `harness: Harness` (see `src/harness/types.ts`) and is registered in `src/harness/index.ts`. It spawns the CLI headless, normalizes its event stream into `HarnessEvent`s, maps tool names to the canonical form, reports its capabilities (steer, cost, transcript, limits) and doctor checks, and writes any per-run config under the run folder, never into the repository or the user's home. Secrets such as the run's progress token go through the environment, not argv. Keep the raw frames verbatim in `events.jsonl`; `toActivity` replays them. Test it test-first with a fixture stream and a fake child process.
 
 ## Code style
 

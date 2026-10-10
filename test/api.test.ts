@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -6,6 +6,7 @@ import { z } from "zod";
 import { fetchHandler } from "../src/api";
 import { scheduler } from "../src/app";
 import { config, MAX_STEER_CHARS } from "../src/config";
+import { deviceOwner, grantAgent, grantRun, releaseRun, revoke } from "../src/devices/leases";
 import { HARNESS_IDS } from "../src/harness/types";
 import { getProject } from "../src/projects/registry";
 import { appendStderr, runDir } from "../src/runs/store";
@@ -409,6 +410,12 @@ describe("run-management MCP artefact tools", () => {
     expect(full).not.toContain("reportsDir");
   });
 
+  test("no tool offers a driver backend or mentions Artemis", async () => {
+    const full = JSON.stringify((await rpc("tools/list")).tools).toLowerCase();
+    expect(full).not.toContain("artemis");
+    expect(full).not.toContain("backend");
+  });
+
   test("qa_get_run reports absolute report and screenshot paths in the data dir that share one resolved root", async () => {
     const run = await makeDataRun();
     const out = JSON.parse((await callTool("qa_get_run", { runId: run.id })).text) as { reportPath: string | null; screenshotsDir: string | null };
@@ -461,7 +468,7 @@ describe("harnesses", () => {
   test("GET /api/harnesses lists every harness with install state and capabilities", async () => {
     const res = await call("/api/harnesses");
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { default: string; harnesses: { id: string; label: string; installed: boolean; capabilities: { steer: boolean; backends: string[] } }[] };
+    const body = (await res.json()) as { default: string; harnesses: { id: string; label: string; installed: boolean; capabilities: { steer: boolean } }[] };
     expect(body.harnesses.map((h) => h.id)).toEqual([...HARNESS_IDS]);
     expect(HARNESS_IDS as readonly string[]).toContain(body.default);
     for (const h of body.harnesses) {
@@ -469,7 +476,6 @@ describe("harnesses", () => {
       // The test preload points every harness binary at a path that does not exist.
       expect(h.installed).toBe(false);
       expect(typeof h.capabilities.steer).toBe("boolean");
-      expect(h.capabilities.backends).toContain("mobile-mcp");
     }
   });
 
@@ -524,5 +530,183 @@ describe("run-scoped MCP endpoint", () => {
     const noToken = await call("/mcp/runs/another-id", { method: "POST", json: rpc, headers: mcpHeaders });
     expect(noToken.status).toBe(401);
     expect(await noToken.text()).toBe(await unknown.text());
+  });
+});
+
+describe("device leases", () => {
+  const SERIAL = "emulator-5590";
+  const HOLDER = "api-test · leases";
+  const adbBin = process.env.ADB_BIN!;
+
+  beforeAll(() => {
+    // The preload points ADB_BIN at a path that does not exist; a fake adb there gives the device list one ready emulator.
+    fs.writeFileSync(
+      adbBin,
+      [
+        "#!/bin/sh",
+        'case "$*" in',
+        `  "devices -l") printf 'List of devices attached\\n${SERIAL} device product:sdk model:sdk_test transport_id:1\\n\\n';;`,
+        '  *"emu avd name"*) printf "LEASE_AVD\\nOK\\n";;',
+        '  *"wm size"*) printf "Physical size: 1080x2400\\n";;',
+        '  *getprop*) printf "14\\nemulator,nosdcard\\n\\n";;',
+        "esac",
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+  });
+  afterAll(() => fs.rmSync(adbBin, { force: true }));
+  afterEach(() => {
+    const owner = deviceOwner(SERIAL);
+    if (owner?.kind === "run") releaseRun(owner.lease.runId!);
+    else if (owner?.kind === "agent") revoke(SERIAL, owner.lease.ref);
+  });
+
+  /** An agent lease made straight in the store (the scheduler of this file is stopped, so acquire cannot grant). */
+  const lease = (extra: Partial<Parameters<typeof grantAgent>[0]> = {}) =>
+    grantAgent({ serial: SERIAL, platform: "android", avdName: "LEASE_AVD", holder: HOLDER, reason: "api test", ...extra });
+  const post = (pathname: string, json: unknown) => call(pathname, { method: "POST", json });
+
+  test("every lease route is a JSON-body route", async () => {
+    for (const pathname of ["/api/leases", "/api/leases/renew", "/api/leases/release", `/api/devices/${SERIAL}/release`]) {
+      const res = await call(pathname, { method: "POST", headers: { "content-type": "text/plain" }, body: "{}" });
+      expect(res.status).toBe(415);
+    }
+  });
+
+  test("lists and device views show the lease without its secret", async () => {
+    const held = lease();
+    const listed = await (await call("/api/leases")).text();
+    expect((JSON.parse(listed) as { serial: string; holder: string }[]).find((v) => v.serial === SERIAL)).toMatchObject({ holder: HOLDER });
+    expect(listed).not.toContain(held.leaseId);
+
+    const devices = await (await call("/api/devices")).text();
+    expect((JSON.parse(devices) as { serial: string; lease: { holder: string } | null }[]).find((d) => d.serial === SERIAL)?.lease?.holder).toBe(HOLDER);
+    expect(devices).not.toContain(held.leaseId);
+  });
+
+  test("acquire arguments are validated before the scheduler sees them", async () => {
+    const neither = await post("/api/leases", { holder: HOLDER });
+    expect(neither.status).toBe(400);
+    expect(await neither.json()).toMatchObject({ code: "invalid_argument" });
+    expect((await post("/api/leases", { holder: HOLDER, serial: SERIAL, platform: "android" })).status).toBe(400);
+    expect((await post("/api/leases", { serial: SERIAL })).status).toBe(400);
+    expect((await post("/api/leases", { serial: SERIAL, holder: HOLDER, waitSeconds: 111 })).status).toBe(400);
+    expect((await post("/api/leases", { serial: SERIAL, holder: HOLDER, ttlMinutes: 4 })).status).toBe(400);
+    const unknown = await post("/api/leases", { serial: "emulator-5001", holder: HOLDER });
+    expect(unknown.status).toBe(404);
+    expect(await unknown.json()).toMatchObject({ code: "device_not_found" });
+  });
+
+  test("renew and release work with the leaseId; a wrong or spent id is a 404 lease_not_found", async () => {
+    const held = lease({ ttlMinutes: 10 });
+    const renewed = await post("/api/leases/renew", { leaseId: held.leaseId, ttlMinutes: 60 });
+    expect(renewed.status).toBe(200);
+    const body = (await renewed.json()) as { serial: string; expiresAt: string };
+    expect(body.serial).toBe(SERIAL);
+    // The 10-minute lease now runs for the 60 minutes asked at renewal.
+    expect(Date.parse(body.expiresAt) - Date.now()).toBeGreaterThan(55 * 60_000);
+
+    const wrong = await post("/api/leases/renew", { leaseId: "not-a-lease" });
+    expect(wrong.status).toBe(404);
+    expect(await wrong.json()).toMatchObject({ code: "lease_not_found" });
+    expect((await post("/api/leases/renew", { leaseId: held.leaseId, ttlMinutes: 1 })).status).toBe(400);
+
+    const released = await post("/api/leases/release", { leaseId: held.leaseId });
+    expect(await released.json()).toEqual({ released: true, serial: SERIAL });
+    expect(deviceOwner(SERIAL)).toBeNull();
+    const again = await post("/api/leases/release", { leaseId: held.leaseId });
+    expect(again.status).toBe(404);
+    expect(await again.json()).toMatchObject({ code: "lease_not_found" });
+  });
+
+  test("force release needs the current ref: 204, 404 without a lease, 409 on a stale ref or a run's lease", async () => {
+    const release = (ref: string) => post(`/api/devices/${SERIAL}/release`, { ref });
+    expect((await release("deadbeef")).status).toBe(404);
+    expect((await post(`/api/devices/${SERIAL}/release`, {})).status).toBe(400);
+
+    const held = lease();
+    const stale = await release("00000000");
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toMatchObject({ code: "ref_mismatch", lease: { ref: held.ref, holder: HOLDER } });
+    expect(deviceOwner(SERIAL)?.kind).toBe("agent");
+
+    expect((await release(held.ref)).status).toBe(204);
+    expect(deviceOwner(SERIAL)).toBeNull();
+
+    grantRun(SERIAL, { id: "api-test-run", platform: "android" }, { avdName: "LEASE_AVD" });
+    const forRun = await release("anything");
+    expect(forRun.status).toBe(409);
+    expect(await forRun.json()).toMatchObject({ code: "held_by_run" });
+    expect(deviceOwner(SERIAL)?.kind).toBe("run");
+  });
+
+  test("a leased device cannot be shut down", async () => {
+    lease();
+    const res = await call(`/api/devices/${SERIAL}/shutdown`, { method: "POST" });
+    expect(res.status).toBe(409);
+    expect(await res.text()).toContain(HOLDER);
+    expect(deviceOwner(SERIAL)?.kind).toBe("agent");
+  });
+
+  test("the global event stream carries lease changes without the secret", async () => {
+    const res = await call("/api/events");
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let text = decoder.decode((await reader.read()).value);
+    expect(text).toContain("event: hello");
+    const held = lease();
+    while (!text.includes("event: lease")) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      text += decoder.decode(value);
+    }
+    await reader.cancel();
+    const frame = text.split("\n\n").find((f) => f.startsWith("event: lease"))!;
+    const event = JSON.parse(frame.split("\n")[1]!.slice("data: ".length)) as { serial: string; change: string; lease: { holder: string } | null };
+    expect(event).toMatchObject({ serial: SERIAL, change: "acquired", lease: { holder: HOLDER } });
+    expect(frame).not.toContain(held.leaseId);
+  });
+
+  test("a stale driver backend in a run request is ignored and not stored", async () => {
+    const res = await post("/api/runs", { projectId: "test-proj", title: "t", brief: "b", backend: "artemis" });
+    expect(res.status).toBe(201);
+    expect(await res.json()).not.toHaveProperty("backend");
+  });
+
+  describe("over MCP", () => {
+    async function tool(name: string, args: Record<string, unknown>): Promise<{ isError: boolean; text: string }> {
+      const res = await call("/mcp", {
+        method: "POST",
+        headers: { accept: "application/json, text/event-stream" },
+        json: { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } },
+      });
+      const text = await res.text();
+      const raw = text.startsWith("event:") ? text.split("\n").find((l) => l.startsWith("data: "))!.slice("data: ".length) : text;
+      const result = (JSON.parse(raw) as { result?: { isError?: boolean; content?: { text: string }[] } }).result;
+      return { isError: result?.isError === true, text: result?.content?.[0]?.text ?? "" };
+    }
+
+    test("renew and release take the leaseId; qa_list_devices shows the lease without it", async () => {
+      const held = lease();
+      const listed = await tool("qa_list_devices", {});
+      expect((JSON.parse(listed.text) as { serial: string; lease: { holder: string } | null }[]).find((d) => d.serial === SERIAL)?.lease?.holder).toBe(HOLDER);
+      expect(listed.text).not.toContain(held.leaseId);
+
+      expect(JSON.parse((await tool("device_renew", { leaseId: held.leaseId, ttlMinutes: 45 })).text)).toMatchObject({ serial: SERIAL });
+      expect(JSON.parse((await tool("device_release", { leaseId: held.leaseId })).text)).toEqual({ released: true, serial: SERIAL });
+      expect(deviceOwner(SERIAL)).toBeNull();
+    });
+
+    test("errors read '<code>: <message>'", async () => {
+      const missing = await tool("device_renew", { leaseId: "nope" });
+      expect(missing.isError).toBe(true);
+      expect(missing.text).toStartWith("lease_not_found: ");
+      expect((await tool("device_release", { leaseId: "nope" })).text).toStartWith("lease_not_found: ");
+      const neither = await tool("device_acquire", { holder: HOLDER });
+      expect(neither.isError).toBe(true);
+      expect(neither.text).toStartWith("invalid_argument: ");
+      expect((await tool("device_acquire", { serial: "emulator-5001", holder: HOLDER })).text).toStartWith("device_not_found: ");
+    });
   });
 });

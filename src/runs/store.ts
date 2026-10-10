@@ -6,7 +6,7 @@ import { getHarness } from "../harness";
 import { legacyProgressActivity } from "../harness/omp/activity";
 import { normalizeUsage } from "../harness/omp/usage";
 import { HarnessIdSchema, type ReplayContext } from "../harness/types";
-import type { Activity, Backend, CheckStatus, Run } from "./types";
+import type { Activity, CheckStatus, Run } from "./types";
 
 const RUNS_DIR = path.join(DATA_DIR, "runs");
 
@@ -62,6 +62,8 @@ function normalizeRun(raw: Run): Run {
   raw.harness = HarnessIdSchema.catch("omp").parse(raw.harness);
   // Runs persisted before `usage` existed carry only the raw omp stats (and were always omp runs).
   if (raw.usage === null && raw.stats && raw.harness === "omp") raw.usage = normalizeUsage(raw.stats, raw.model);
+  // `backend` (mobile-mcp | artemis) was dropped when Artemis support was removed; old run.json files still carry it.
+  delete run.backend;
   return raw;
 }
 
@@ -222,7 +224,6 @@ export function readActivity(id: string, opts: { before?: number; limit: number 
   const text = readFileSync(file, "utf8");
   const lines = text.split("\n");
   const run = getRun(id);
-  const backend: Backend = run?.backend ?? "mobile-mcp";
   const harnessId = run?.harness ?? "omp";
   const harness = getHarness(harnessId);
   // Runs recorded before progress calls were logged server-side have no `check` lines of their own (omp only).
@@ -237,7 +238,7 @@ export function readActivity(id: string, opts: { before?: number; limit: number 
   const complete = lines.length - 1;
   for (let seq = cached.lines; seq < complete; seq++) {
     const line = lines[seq]!;
-    if (line && !line.startsWith('{"type":"_activity"')) harness.toActivity(parseLine(line), { backend, seq, starts: cached.starts });
+    if (line && !line.startsWith('{"type":"_activity"')) harness.toActivity(parseLine(line), { seq, starts: cached.starts });
   }
   cached.lines = Math.max(cached.lines, complete);
   const starts = cached.starts;
@@ -249,7 +250,7 @@ export function readActivity(id: string, opts: { before?: number; limit: number 
     if (!line) continue;
     const frame = parseLine(line);
     const activity =
-      activityFrame(frame, seq) ?? (legacyChecks ? legacyProgressActivity(frame, seq) : null) ?? harness.toActivity(frame, { backend, seq, starts });
+      activityFrame(frame, seq) ?? (legacyChecks ? legacyProgressActivity(frame, seq) : null) ?? harness.toActivity(frame, { seq, starts });
     if (activity) items.push(activity);
   }
   const hasMore = items.length === need;

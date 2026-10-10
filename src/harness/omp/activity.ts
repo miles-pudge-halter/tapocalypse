@@ -1,14 +1,14 @@
 // Maps omp RPC frames (live or replayed from events.jsonl) to feed lines and canonical tool names.
 import { backendViolation } from "../../runs/prompt";
 import type { Activity, CheckStatus } from "../../runs/types";
-import { ARTEMIS_SERVER, MOBILE_MCP_SERVER, type ReplayContext } from "../types";
+import { MOBILE_MCP_SERVER, type ReplayContext } from "../types";
 
 const ARGS_LIMIT = 2048;
 const CHECK_STATUSES: readonly CheckStatus[] = ["pending", "running", "pass", "fail", "blocked", "skipped"];
 const PROGRESS_TOOL_NAMES: readonly string[] = ["qa_plan", "qa_check", "qa_finish"];
 
 /** `mcp__mobile_mcp_x`, `mcp__<plugin>_mobile_mcp_x` (Tapocalypse's plugin) and user-config forms all canonicalize to `mcp__<server>_x`. */
-const DEVICE_TOOL = new RegExp(`^mcp__\\w*?(${MOBILE_MCP_SERVER}|${ARTEMIS_SERVER})_(.+)$`);
+const DEVICE_TOOL = new RegExp(`^mcp__\\w*?(${MOBILE_MCP_SERVER})_(.+)$`);
 
 /** Canonical form of an omp tool name (see `CANONICAL_TOOL_PREFIX` in `harness/types`); built-ins and unknown MCP servers pass through. */
 export function canonicalToolName(name: string): string {
@@ -16,10 +16,9 @@ export function canonicalToolName(name: string): string {
   return m ? `mcp__${m[1]}_${m[2]}` : name;
 }
 
-/** The MCP server (`mobile_mcp` / `artemis`) a canonical tool name belongs to; null otherwise. */
+/** The MCP server (`mobile_mcp`) a canonical tool name belongs to; null otherwise. */
 export function serverOf(canonical: string): string | null {
-  for (const server of [MOBILE_MCP_SERVER, ARTEMIS_SERVER]) if (canonical.startsWith(`mcp__${server}_`)) return server;
-  return null;
+  return canonical.startsWith(`mcp__${MOBILE_MCP_SERVER}_`) ? MOBILE_MCP_SERVER : null;
 }
 
 export interface ResolvedCall {
@@ -106,7 +105,7 @@ export function legacyProgressActivity(frame: unknown, seq: number): Activity | 
 export function toActivity(frame: unknown, ctx: ReplayContext): Activity | null {
   if (!frame || typeof frame !== "object") return null;
   const f = frame as Record<string, unknown>;
-  const { seq, starts, backend } = ctx;
+  const { seq, starts } = ctx;
   const ts = typeof f._ts === "string" ? f._ts : new Date().toISOString();
   switch (f.type) {
     case "tool_execution_start": {
@@ -116,7 +115,7 @@ export function toActivity(frame: unknown, ctx: ReplayContext): Activity | null 
       if (callId) starts.set(callId, { ts: Date.parse(ts), tool });
       if (PROGRESS_TOOL_NAMES.includes(tool)) return null;
       const base = { ts, seq, callId, tool, args: truncateArgs(args) };
-      if (backendViolation(tool, backend)) return { ...base, kind: "warn", text: `backend violation: ${tool}` };
+      if (backendViolation(tool)) return { ...base, kind: "warn", text: `backend violation: ${tool}` };
       const shown = typeof args === "string" ? args : JSON.stringify(args);
       return { ...base, kind: "tool", text: `${tool} ${shown.slice(0, 200)}` };
     }

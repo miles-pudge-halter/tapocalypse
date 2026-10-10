@@ -1,6 +1,5 @@
 import type { HarnessId } from "../harness/types";
 
-export type Backend = "mobile-mcp" | "artemis";
 export type Platform = "android" | "ios";
 export type RunStatus =
   | "queued"
@@ -103,10 +102,9 @@ export interface Run {
   deviceSerial: string | null;
   /** Friendly name of the assigned device (`Device.name`), kept after the device is gone. Set at preflight. */
   deviceName: string | null;
-  /** The id mobile-mcp tools must be given for the assigned device (AVD name for emulators, UDID for simulators, serial otherwise). Set at preflight for the mobile-mcp backend. */
+  /** The id mobile-mcp tools must be given for the assigned device (AVD name for emulators, UDID for simulators, serial otherwise). Set at preflight. */
   deviceLabel?: string | null;
   bootedByRun: boolean;
-  backend: Backend;
   packageId: string;
   status: RunStatus;
   verdict: Verdict | null;

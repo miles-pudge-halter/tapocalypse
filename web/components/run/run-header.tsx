@@ -143,8 +143,6 @@ export function RunHeader({
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground">
         {deviceText ? <span>{deviceText}</span> : <span>no device yet</span>}
         <span aria-hidden>·</span>
-        <span>{run.backend}</span>
-        <span aria-hidden>·</span>
         <span>by {run.requestedBy}</span>
       </div>
 

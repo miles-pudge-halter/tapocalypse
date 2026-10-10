@@ -1,5 +1,6 @@
 import { AlertCircle, ListChecks, RefreshCw } from "lucide-react";
 import { PageHeader } from "@/components/page-header";
+import { ShareDevices } from "@/components/share-devices";
 import { DoctorList, SetupChecklist } from "@/components/setup-checklist";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -19,6 +20,8 @@ export function Setup() {
       />
 
       <SetupChecklist />
+
+      <ShareDevices />
 
       <section className="mt-10" aria-labelledby="all-checks">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-3">

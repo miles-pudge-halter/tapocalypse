@@ -228,7 +228,6 @@ describe("buildPrompt", () => {
       id: "r1",
       brief: "do it",
       packageId: "com.x",
-      backend: "mobile-mcp",
       deviceSerial: "emulator-5554",
       deviceLabel: "Pixel",
       deviceRequest: { platform: "android" },
@@ -264,7 +263,7 @@ describe("buildPrompt", () => {
 });
 
 describe("buildPrompt harness neutrality", () => {
-  const run = { id: "r1", brief: "do it", packageId: "com.x", backend: "mobile-mcp", deviceSerial: "emulator-5554", deviceLabel: "Pixel", deviceRequest: { platform: "android" }, source: null, build: null, suiteId: null, suiteChecks: null } as Run;
+  const run = { id: "r1", brief: "do it", packageId: "com.x", deviceSerial: "emulator-5554", deviceLabel: "Pixel", deviceRequest: { platform: "android" }, source: null, build: null, suiteId: null, suiteChecks: null } as Run;
 
   test("names every tool through the harness's own tool names", () => {
     const prompt = buildPrompt(run, (server, tool) => `<${server}.${tool}>`, { runMaxTime: "60m" });
@@ -281,11 +280,5 @@ describe("buildPrompt harness neutrality", () => {
     const withPersona = buildPrompt(run, names, { runMaxTime: "60m", prependPersona: "Be thorough.\n" });
     expect(withPersona.startsWith("Your system instructions")).toBe(true);
     expect(withPersona).toContain("Be thorough.");
-  });
-
-  test("the artemis backend names the artemis tools and forbids run_task", () => {
-    const prompt = buildPrompt({ ...run, backend: "artemis" } as Run, (s, t) => `${s}:${t}`, { runMaxTime: "60m" });
-    expect(prompt).toContain("artemis:mobile_click");
-    expect(prompt).toContain("NEVER call artemis:mobile_run_task");
   });
 });

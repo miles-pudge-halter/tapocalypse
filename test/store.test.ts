@@ -12,7 +12,6 @@ const OLD_RUN = {
   deviceRequest: { platform: "android" },
   deviceSerial: "emulator-5554",
   bootedByRun: false,
-  backend: "mobile-mcp",
   packageId: "com.x",
   status: "done",
   verdict: "PASS",
@@ -64,6 +63,17 @@ describe("store", () => {
       storage: "repo",
     });
     expect(run.checks).toEqual(OLD_RUN.checks as typeof run.checks);
+  });
+
+  test("a persisted artemis run loads without its dropped backend key, and saving does not bring it back", () => {
+    const legacy = { ...OLD_RUN, id: "20260101-000000-abcd-artemis", backend: "artemis" };
+    fs.mkdirSync(runDir(legacy.id), { recursive: true });
+    fs.writeFileSync(path.join(runDir(legacy.id), "run.json"), JSON.stringify(legacy));
+    const run = getRun(legacy.id)!;
+    expect(run.title).toBe("old");
+    expect("backend" in run).toBe(false);
+    saveRun(run);
+    expect("backend" in (JSON.parse(fs.readFileSync(path.join(runDir(legacy.id), "run.json"), "utf8")) as object)).toBe(false);
   });
 
   test("createRun fills defaults, listRuns serves it newest-first and deleteRun forgets it", () => {

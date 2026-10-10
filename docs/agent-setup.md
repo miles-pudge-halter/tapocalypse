@@ -81,7 +81,7 @@ bun run doctor
 
 - If `TPC_DIR` already holds a Tapocalypse clone, do not clone again. Run `git -C "$TPC_DIR" status --short`; if it is clean, `git -C "$TPC_DIR" pull --ff-only`. If it has local changes, leave it as it is.
 - `bun run doctor` prints one line per check: `✓` ok, `!` warning, `✗` failed, `–` skipped, with a `fix:` line under anything that needs attention. It exits 1 when a required check failed and lists their ids (for example `agent-runtime`, `npx`, `adb`).
-- Exit 0 means you can continue. Warnings marked `(optional)` (gh, Artemis) can be ignored.
+- Exit 0 means you can continue. Warnings marked `(optional)` (gh) can be ignored.
 - Exit 1: relay the failed lines and their `fix:` text to the user, and stop until they are fixed. Re-run `bun run doctor` afterwards.
 
 ## 3. Start the server
@@ -193,7 +193,7 @@ A `400` or a project with `status: "invalid"` lists its problems. Fix the fields
 
 ## 6. Make sure a device is ready
 
-List devices with `qa_list_devices` or `curl -fsS "$TPC_URL/api/devices"`. You need one entry with the project's platform, `kind` `emulator` or `simulator`, no `busyRunId`, and not `excluded`.
+List devices with `qa_list_devices` or `curl -fsS "$TPC_URL/api/devices"`. You need one entry with the project's platform, `kind` `emulator` or `simulator`, no `busyRunId`, no `lease` (another coding agent may be holding it; see step 8) and not `excluded`.
 
 **No suitable device?** Ask the user which they prefer, then do one of:
 
@@ -206,6 +206,8 @@ List devices with `qa_list_devices` or `curl -fsS "$TPC_URL/api/devices"`. You n
 - iOS simulator: `xcrun simctl get_app_container <udid> <bundle-id>` exits 0.
 
 If it is not installed, tell the user. If they have a build (`.apk` for Android, `.app` or `.ipa` for the simulator), pass its absolute path as `install` in step 7 and Tapocalypse installs it before the run. Build it yourself only if they ask.
+
+**Need the device yourself?** The smoke run in step 7 gets its own device. If you must touch a device directly (`adb install`, `flutter run`, taking a screenshot), borrow it first so QA runs and other agents stay away from it: `device_acquire { platform: "<android|ios>", holder: "<your harness> · tapocalypse setup", reason: "<what for>", waitSeconds: 60, cwd: "<APP_REPO>" }`, use the returned `serial` for `adb`/`simctl` and `mobileDeviceId` for mobile tools, and call `device_release { leaseId }` when done. Without the MCP tools: `POST "$TPC_URL/api/leases"` with the same JSON and `POST "$TPC_URL/api/leases/release"` with `{"leaseId":"…"}`. Do not use a device another holder has leased; wait for it or tell the user who holds it (`heldBy`).
 
 ## 7. Run one smoke test
 
@@ -246,7 +248,25 @@ It prints `started run <run-id>: <url>` and progress on stderr, and the final re
 
 A `FAIL` or `BLOCKED` verdict with no `errorKind` means Tapocalypse works and the agent found a problem in the app (or could not get past a login wall). That still counts as a successful setup. More fixes: [Troubleshooting](guide.md#troubleshooting).
 
-## 8. Report back
+## 8. Let your agents borrow devices (optional)
+
+Tapocalypse is also the device broker for your coding agents: with a lease, two agents (and QA runs) never drive the same emulator or simulator at once. This is cooperative; it works because every agent follows the same instructions. Ask the user whether to add the snippet below to the instructions the agents on this machine read (for example `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, the repo's `AGENTS.md`, a Cursor rule). Merge it as its own section and do not write it without their go-ahead. The Setup page of the UI has the same text as a copyable prompt and skill file.
+
+```md
+## Using a device (Tapocalypse device broker)
+Devices on this machine are shared with other agents. Before your first device action (mobile tool, adb, simctl, flutter run/install):
+1. `device_acquire { platform | serial, holder: "<your client> · <task>", reason, ttlMinutes?, waitSeconds: 60, cwd: <your working dir> }`.
+   - Success → note `leaseId`, `serial` (adb/simctl) and `mobileDeviceId` (mobile tools). Keep the leaseId in your notes; it cannot be recovered.
+   - `timedOut: true` → it is busy (`heldBy`). Call again with the same args plus `ticket` to keep your place, or tell the user who holds it. Never use a device you do not hold.
+2. Use only that device: `serial` for adb/simctl/flutter, `mobileDeviceId` for mobile tools.
+3. Renew with `device_renew { leaseId }` when less than 10 minutes are left.
+4. Always `device_release { leaseId }` when done, also on failure or abort.
+If a call says the lease ended, stop touching the device and acquire again.
+```
+
+Check that `qa_list_devices` is callable, and tell the user that leases are advisory: they do not stop a process that runs `adb` or `xcrun simctl` on its own. Details: [Sharing devices between agents](guide.md#sharing-devices-between-agents).
+
+## 9. Report back
 
 Send the user one short message:
 
@@ -256,6 +276,7 @@ Tapocalypse is set up.
 - MCP: registered as `tapocalypse` in <config file or command>. <Start a new session to load the qa_* tools | Tools are live>.
 - Project: <id> (<defaultPackage>, <platform>).
 - Smoke run: <verdict>. <summary>. Watch or replay: <url>. Report: <reportPath from `qa_get_run`, in Tapocalypse's data folder; read it with `qa_get_report` or `tapocalypse report <run-id>`>. Cost: <cost, or tokens>.
+- Device sharing: <snippet added to <file> | not added>.
 - Still missing: <optional items, or "nothing">.
 Next time, ask me to "QA what you just built with Tapocalypse" and I will start a run, wait for it and fix what fails.
 ```

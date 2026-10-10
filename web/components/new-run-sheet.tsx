@@ -9,7 +9,6 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Popover, PopoverAnchor, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -18,9 +17,9 @@ import {
   api,
   batchHash,
   runHash,
-  type Backend,
   type Device,
   type HarnessId,
+  type PoolView,
   type HarnessInfo,
   type DeviceTarget,
   type Platform,
@@ -28,11 +27,13 @@ import {
   type Suite,
   type Template,
 } from "@/lib/api";
-import { deviceDisplayName, deviceSubtitle } from "@/lib/format";
+import { deviceDisplayName, deviceSubtitle, formatClock } from "@/lib/format";
+import { anyDeviceHint, heldRowCopy } from "@/lib/leases";
 import {
   navigate,
   useDevices,
-  useDoctor,
+  useNow,
+  usePool,
   useHarnesses,
   useModels,
   useNewRun,
@@ -154,7 +155,7 @@ function NewRunForm({ prefill, onDone }: { prefill: NewRunPrefill | null; onDone
   const ready = useMemo(() => projects.filter((p) => p.status === "ok"), [projects]);
   const { projectId: scopeProject } = useProjectScope();
   const { devices } = useDevices();
-  const { report: doctor } = useDoctor();
+  const { pool } = usePool();
   const { templates } = useTemplates();
   const { harnesses, defaultId, loading: harnessesLoading, error: harnessesError } = useHarnesses();
 
@@ -202,7 +203,7 @@ function NewRunForm({ prefill, onDone }: { prefill: NewRunPrefill | null; onDone
       defaultHarness={defaultId}
       harnessesLoading={harnessesLoading}
       harnessesError={harnessesError}
-      artemisAvailable={doctor?.backends.includes("artemis") ?? false}
+      pool={pool}
       onDone={onDone}
     />
   );
@@ -218,7 +219,7 @@ interface BodyProps {
   defaultHarness: HarnessId | null;
   harnessesError: string | null;
   harnessesLoading: boolean;
-  artemisAvailable: boolean;
+  pool: PoolView | null;
   onDone(): void;
 }
 
@@ -232,13 +233,12 @@ function RunFormBody({
   defaultHarness,
   harnessesError,
   harnessesLoading,
-  artemisAvailable,
+  pool,
   onDone,
 }: BodyProps) {
   const [projectId, setProjectId] = useState(initialProject.id);
   const project = projects.find((p) => p.id === projectId) ?? initialProject;
   const [targets, setTargets] = useState<Targets>(() => targetsFromPrefill(prefill, initialProject.defaultPlatform));
-  const [backend, setBackend] = useState<Backend>(prefill?.backend ?? "mobile-mcp");
   const [packageId, setPackageId] = useState(prefill?.packageId ?? initialProject.defaultPackage);
   const installed = useMemo(() => harnesses.filter((h) => h.installed), [harnesses]);
   /** Set by the user or a prefill; null = untouched, so the run request names no harness and the project or persona decides. */
@@ -321,10 +321,20 @@ function RunFormBody({
     if (found.model && !prefill.model) setModel(found.model);
   }, [suites, prefill?.suiteId, prefill?.model, dirty]);
 
-  const hasIos = targets.anyIos > 0 || targets.serials.some((t) => t.platform === "ios");
-  const harnessAllowsArtemis = harnessInfo ? harnessInfo.capabilities.backends.includes("artemis") : true;
-  const effectiveBackend: Backend = artemisAvailable && !hasIos && harnessAllowsArtemis ? backend : "mobile-mcp";
   const total = targetCount(targets);
+  const anyHints: Record<Platform, string | null> = {
+    android: anyDeviceHint("android", devices, pool),
+    ios: anyDeviceHint("ios", devices, pool),
+  };
+  const anyNotes = (["android", "ios"] as const).flatMap((p) => {
+    const hint = anyHints[p];
+    return hint && (p === "ios" ? targets.anyIos : targets.anyAndroid) > 0 ? [hint] : [];
+  });
+  const heldNotes = targets.serials.flatMap((t) => {
+    const d = devices.find((x) => x.serial === t.serial);
+    if (!d?.lease?.expiresAt) return [];
+    return [`${deviceDisplayName(d)} is held by ${d.lease.holder} until ${formatClock(d.lease.expiresAt)}. The run waits until it is free.`];
+  });
   const suggested = suggestTitle(brief);
   const shownTitle = titleTouched ? title : suggested;
   const activeSuite = suite && brief === suite.brief ? suite : null;
@@ -417,7 +427,6 @@ function RunFormBody({
       projectId,
       title: runTitle || undefined,
       ...(activeSuite ? { suiteId: activeSuite.id } : { brief: brief.trim() }),
-      backend: effectiveBackend,
       packageId: packageId.trim() || project.defaultPackage,
       ...(explicitHarness ? { harness: explicitHarness } : {}),
       model: model.trim() || undefined,
@@ -462,7 +471,6 @@ function RunFormBody({
   }
 
   const advancedSummary = [
-    effectiveBackend,
     harnessInfo?.label ?? (noRuntime ? "no runtime" : null),
     packageId.trim() || project.defaultPackage,
     model.trim() || null,
@@ -513,7 +521,17 @@ function RunFormBody({
 
         <div className="space-y-2">
           <Label>Device</Label>
-          <DevicePicker devices={devices} targets={targets} onChange={setTargets} artemisAvailable={artemisAvailable} />
+          <DevicePicker devices={devices} targets={targets} onChange={setTargets} anyHints={anyHints} />
+          {heldNotes.map((note) => (
+            <p key={note} className="text-xs text-orange-700 dark:text-orange-400">
+              {note}
+            </p>
+          ))}
+          {anyNotes.map((hint) => (
+            <p key={hint} className="text-xs text-muted-foreground">
+              {hint}
+            </p>
+          ))}
           {total > 1 && (
             <p className="text-xs text-muted-foreground">
               {total} runs start in parallel as one batch, each on its own device.
@@ -606,35 +624,6 @@ function RunFormBody({
                 setEffort("");
               }}
             />
-            {artemisAvailable && (
-              <div className="space-y-2">
-                <Label>Backend</Label>
-                <RadioGroup
-                  value={effectiveBackend}
-                  onValueChange={(v) => setBackend(v === "artemis" ? "artemis" : "mobile-mcp")}
-                  className="grid grid-cols-2 gap-3"
-                >
-                  <BackendOption value="mobile-mcp" title="mobile-mcp" description="Android and iOS" />
-                  <BackendOption
-                    value="artemis"
-                    title="artemis"
-                    description={
-                      !harnessAllowsArtemis
-                        ? `Not available with ${harnessInfo?.label ?? "this agent runtime"}`
-                        : hasIos
-                          ? "Android only — iOS device selected"
-                          : "Android only"
-                    }
-                    disabled={hasIos || !harnessAllowsArtemis}
-                  />
-                </RadioGroup>
-                {!harnessAllowsArtemis && (
-                  <p className="text-xs text-muted-foreground">
-                    The artemis backend needs your own MCP config, which only omp sessions inherit.
-                  </p>
-                )}
-              </div>
-            )}
             <div className="space-y-2">
               <Label htmlFor="nr-package">Package</Label>
               <Input id="nr-package" className="font-mono" value={packageId} onChange={(e) => setPackageId(e.target.value)} autoComplete="off" />
@@ -762,13 +751,14 @@ function StartFrom({
   );
 }
 
-function DeviceChip({ children, tone }: { children: string; tone?: "busy" | "free" }) {
+function DeviceChip({ children, tone }: { children: string; tone?: "busy" | "free" | "held" }) {
   return (
     <span
       className={cn(
         "rounded border px-1 py-px text-[10px] leading-none",
         tone === "free" && "border-emerald-500/30 text-emerald-700 dark:text-emerald-400",
         tone === "busy" && "border-orange-500/30 text-orange-700 dark:text-orange-400",
+        tone === "held" && "border-violet-500/40 text-violet-700 dark:text-violet-300",
         !tone && "text-muted-foreground",
       )}
     >
@@ -777,24 +767,26 @@ function DeviceChip({ children, tone }: { children: string; tone?: "busy" | "fre
   );
 }
 
-function deviceStatus(d: Device): { label: string; tone?: "busy" | "free" } {
+function deviceStatus(d: Device, now: number): { label: string; tone?: "busy" | "free" | "held" } {
   if (d.state === "booting") return { label: "Booting" };
   if (d.busyRunId) return { label: "Busy", tone: "busy" };
-  if (d.artemisOwner) return { label: "Artemis task", tone: "busy" };
+  if (d.lease) return { label: heldRowCopy(d.lease, now).status, tone: "held" };
   return { label: "Free", tone: "free" };
 }
 
 function DevicePicker({
   devices,
   targets,
+  anyHints,
   onChange,
-  artemisAvailable,
 }: {
   devices: Device[];
   targets: Targets;
+  /** Why "Any <platform>" would wait (null: no reason to say); shown under the row while that row is ticked. */
+  anyHints: Record<Platform, string | null>;
   onChange(next: Targets): void;
-  artemisAvailable: boolean;
 }) {
+  const now = useNow(15_000);
   const total = targetCount(targets);
   const atCap = total >= MAX_TARGETS;
   const byPlatform = (platform: Platform, kind: "virtual" | "physical") =>
@@ -826,28 +818,32 @@ function DevicePicker({
 
   const anyRow = (platform: Platform, label: string) => {
     const count = platform === "ios" ? targets.anyIos : targets.anyAndroid;
+    const hint = count > 0 ? anyHints[platform] : null;
     return (
-      <div className="flex items-center gap-2 rounded-sm px-2 py-1.5 hover:bg-accent">
-        <Checkbox
-          id={`nr-any-${platform}`}
-          checked={count > 0}
-          disabled={count === 0 && atCap}
-          onCheckedChange={(v) => setAny(platform, v === true ? 1 : 0)}
-        />
-        <Label htmlFor={`nr-any-${platform}`} className="flex-1 cursor-pointer font-normal">
-          {label}
-        </Label>
-        {count > 0 && (
-          <span className="flex items-center gap-1" aria-label={`${label} count`}>
-            <Button type="button" variant="outline" size="icon" className="size-6" aria-label="Fewer" onClick={() => setAny(platform, count - 1)}>
-              <Minus />
-            </Button>
-            <span className="w-6 text-center text-sm tabular-nums">×{count}</span>
-            <Button type="button" variant="outline" size="icon" className="size-6" aria-label="More" disabled={atCap} onClick={() => setAny(platform, count + 1)}>
-              <Plus />
-            </Button>
-          </span>
-        )}
+      <div>
+        <div className="flex items-center gap-2 rounded-sm px-2 py-1.5 hover:bg-accent">
+          <Checkbox
+            id={`nr-any-${platform}`}
+            checked={count > 0}
+            disabled={count === 0 && atCap}
+            onCheckedChange={(v) => setAny(platform, v === true ? 1 : 0)}
+          />
+          <Label htmlFor={`nr-any-${platform}`} className="flex-1 cursor-pointer font-normal">
+            {label}
+          </Label>
+          {count > 0 && (
+            <span className="flex items-center gap-1" aria-label={`${label} count`}>
+              <Button type="button" variant="outline" size="icon" className="size-6" aria-label="Fewer" onClick={() => setAny(platform, count - 1)}>
+                <Minus />
+              </Button>
+              <span className="w-6 text-center text-sm tabular-nums">×{count}</span>
+              <Button type="button" variant="outline" size="icon" className="size-6" aria-label="More" disabled={atCap} onClick={() => setAny(platform, count + 1)}>
+                <Plus />
+              </Button>
+            </span>
+          )}
+        </div>
+        {hint && <p className="pb-1.5 pl-8 pr-2 text-xs text-muted-foreground">{hint}</p>}
       </div>
     );
   };
@@ -875,28 +871,29 @@ function DevicePicker({
                 {g.note && <span className="font-normal"> · {g.note}</span>}
               </p>
               {g.devices.map((d) => {
-                const status = deviceStatus(d);
+                const status = deviceStatus(d, now);
+                const held = d.lease ? heldRowCopy(d.lease, now) : null;
                 const checked = targets.serials.some((t) => t.serial === d.serial);
+                // A held device that is already ticked (prefill, rerun) can still be un-ticked.
+                const blocked = d.state === "booting" || (!checked && held !== null);
                 return (
                   <label
                     key={d.serial}
-                    className={cn(
-                      "flex items-center gap-2 rounded-sm px-2 py-1.5 hover:bg-accent",
-                      d.state === "booting" ? "cursor-not-allowed opacity-60" : "cursor-pointer",
-                    )}
+                    title={held?.title}
+                    className={cn("flex items-center gap-2 rounded-sm px-2 py-1.5 hover:bg-accent", blocked ? "cursor-not-allowed opacity-60" : "cursor-pointer")}
                   >
                     <Checkbox
                       checked={checked}
-                      disabled={d.state === "booting" || (!checked && atCap)}
+                      disabled={blocked || (!checked && atCap)}
                       onCheckedChange={(v) => toggleSerial(d, v === true)}
                     />
                     <span className="min-w-0 flex-1">
                       <DeviceName device={d} className="text-sm" />
                       <span className="block truncate font-mono text-[11px] text-muted-foreground">{deviceSubtitle(d)}</span>
+                      {held && <span className="block truncate text-[11px] text-muted-foreground">{held.line}</span>}
                     </span>
                     <span className="flex shrink-0 flex-wrap justify-end gap-1">
                       <DeviceChip tone={status.tone}>{status.label}</DeviceChip>
-                      {artemisAvailable && d.artemisHelper && <DeviceChip>helper on</DeviceChip>}
                       {d.bootedByTapocalypse && <DeviceChip>auto-booted</DeviceChip>}
                     </span>
                   </label>
@@ -1114,24 +1111,5 @@ function ModelCombobox({
         ))}
       </PopoverContent>
     </Popover>
-  );
-}
-
-function BackendOption({ value, title, description, disabled }: { value: Backend; title: string; description: string; disabled?: boolean }) {
-  const id = `nr-backend-${value}`;
-  return (
-    <Label
-      htmlFor={id}
-      className={cn(
-        "flex items-start gap-3 rounded-lg border p-3 has-[[data-state=checked]]:border-ring has-[[data-state=checked]]:bg-accent",
-        disabled ? "cursor-not-allowed opacity-50" : "strike cursor-pointer",
-      )}
-    >
-      <RadioGroupItem id={id} value={value} disabled={disabled} className="mt-0.5" />
-      <span className="space-y-0.5">
-        <span className="block text-sm font-medium">{title}</span>
-        <span className="block text-xs font-normal text-muted-foreground">{description}</span>
-      </span>
-    </Label>
   );
 }

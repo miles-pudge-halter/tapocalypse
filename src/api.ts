@@ -5,6 +5,7 @@ import {
   batchView,
   devicesView,
   findRun,
+  poolStateView,
   queryRuns,
   runner,
   runScreenshots,
@@ -13,12 +14,13 @@ import {
 } from "./app";
 import { config, HttpError, MAX_STEER_CHARS, XCRUN_BIN } from "./config";
 import { runDoctor } from "./doctor";
-import { connectedAndroidSerials, exec, listDevices, screencap } from "./devices/devices";
-import { bootTarget, isBootedByTapocalypse, poolView, shutdownDevice } from "./devices/pool";
+import { connectedAndroidSerials, exec, screencap } from "./devices/devices";
+import { bus as leaseBus, deviceOwner, leaseView, listLeases, revoke, type LeaseEvent } from "./devices/leases";
+import { bootTarget, isBootedByTapocalypse, shutdownDevice } from "./devices/pool";
 import { harnesses, defaultHarness, detectInstalled } from "./harness";
 import { HARNESS_IDS, HarnessIdSchema, type HarnessId } from "./harness/types";
 import { handleRunMcp } from "./mcp/run-server";
-import { activeRunIds, handleMcp, mcpStatus } from "./mcp/server";
+import { acquireDevice, activeRunIds, handleMcp, mcpStatus, releaseDevice, renewDevice } from "./mcp/server";
 import { listModels } from "./models";
 import { detectProject } from "./projects/detect";
 import {
@@ -96,11 +98,17 @@ function hasJsonBody(method: string, parts: string[]): boolean {
   if (method !== "POST") return false;
   if (root === "mcp") return parts.length === 1 || (parts.length === 3 && a === "runs");
   if (root !== "api") return false;
-  if (parts.length === 2) return a === "runs" || a === "batches" || a === "projects";
+  if (parts.length === 2) return a === "runs" || a === "batches" || a === "projects" || a === "leases";
   if (parts.length === 3) {
-    return (a === "projects" && (b === "validate" || b === "detect")) || (a === "devices" && b === "boot");
+    return (
+      (a === "projects" && (b === "validate" || b === "detect")) ||
+      (a === "devices" && b === "boot") ||
+      (a === "leases" && (b === "renew" || b === "release"))
+    );
   }
-  if (parts.length === 4) return (a === "projects" && c === "suites") || (a === "runs" && (c === "steer" || c === "rerun" || c === "export"));
+  if (parts.length === 4) {
+    return (a === "projects" && c === "suites") || (a === "runs" && (c === "steer" || c === "rerun" || c === "export")) || (a === "devices" && c === "release");
+  }
   return false;
 }
 
@@ -257,11 +265,14 @@ function globalEvents(req: Request): Response {
     (send) => {
       const onRun = (updated: Run) => send("run", runView(updated));
       const onProjects = () => send("projects", listProjects());
+      const onLease = (event: LeaseEvent) => send("lease", event);
       scheduler.bus.on("run", onRun);
       projectEvents.on("change", onProjects);
+      leaseBus.on("lease", onLease);
       return () => {
         scheduler.bus.off("run", onRun);
         projectEvents.off("change", onProjects);
+        leaseBus.off("lease", onLease);
       };
     },
     ["hello", {}],
@@ -292,6 +303,7 @@ function saveSuiteFromBody(p: Project, body: Record<string, unknown>): Response 
   return json(saveSuite(p, { id: id ?? slug(rest.title), ...rest }), 201);
 }
 
+const ReleaseBodySchema = z.object({ ref: z.string().min(1).max(64) });
 const BootBodySchema = z.object({ platform: z.enum(["android", "ios"]), target: z.string().min(1) });
 const ExportBodySchema = z.object({
   dir: z
@@ -370,12 +382,16 @@ async function route(req: Request, url: URL): Promise<Response> {
     }
   }
 
+  if (parts[1] === "leases") {
+    if (parts.length === 2 && method === "GET") return json(listLeases());
+    if (parts.length === 2 && method === "POST") return json(await acquireDevice(await readJsonObject(req), req.signal));
+    if (parts.length === 3 && method === "POST" && parts[2] === "renew") return json(renewDevice(await readJsonObject(req)));
+    if (parts.length === 3 && method === "POST" && parts[2] === "release") return json(releaseDevice(await readJsonObject(req)));
+  }
+
   if (parts[1] === "devices") {
     if (method === "GET" && parts.length === 2) return json(await devicesView());
-    if (method === "GET" && parts.length === 3 && parts[2] === "pool") {
-      await listDevices();
-      return json(poolView(scheduler.activeCount()));
-    }
+    if (method === "GET" && parts.length === 3 && parts[2] === "pool") return json(await poolStateView());
     if (method === "POST" && parts.length === 3 && parts[2] === "boot") {
       const parsed = BootBodySchema.safeParse(await readJsonObject(req));
       if (!parsed.success) throw new HttpError(400, "platform (android|ios) and target are required");
@@ -384,9 +400,26 @@ async function route(req: Request, url: URL): Promise<Response> {
     }
     if (method === "POST" && parts.length === 4 && parts[3] === "shutdown") {
       const serial = parts[2];
-      if (scheduler.assigned.has(serial)) throw new HttpError(409, `${serial} is in use by a run`);
+      const owner = deviceOwner(serial);
+      if (owner?.kind === "run") throw new HttpError(409, `${serial} is in use by a run`, "held_by_run");
+      if (owner?.kind === "agent") throw new HttpError(409, `${serial} is held by ${owner.lease.holder}`, "held_by_agent");
+      if (owner) throw new HttpError(409, `${serial} is booting`);
       if (!isBootedByTapocalypse(serial)) throw new HttpError(409, `${serial} was not booted by Tapocalypse`);
       await shutdownDevice(serial);
+      return new Response(null, { status: 204 });
+    }
+    if (method === "POST" && parts.length === 4 && parts[3] === "release") {
+      const parsed = ReleaseBodySchema.safeParse(await readJsonObject(req));
+      if (!parsed.success) throw new HttpError(400, "ref is required", "invalid_argument");
+      try {
+        revoke(parts[2], parsed.data.ref);
+      } catch (err) {
+        if (err instanceof HttpError && err.code === "ref_mismatch") {
+          const owner = deviceOwner(parts[2]);
+          return json({ error: err.message, code: err.code, lease: owner && "lease" in owner ? leaseView(owner.lease) : null }, 409);
+        }
+        throw err;
+      }
       return new Response(null, { status: 204 });
     }
     if (method === "GET" && parts.length === 4 && parts[3] === "screen.png") {
@@ -572,7 +605,7 @@ export async function fetchHandler(req: Request): Promise<Response> {
   try {
     return withFramingHeaders(await route(req, new URL(req.url)));
   } catch (err) {
-    if (err instanceof HttpError) return withFramingHeaders(json({ error: err.message }, err.status));
+    if (err instanceof HttpError) return withFramingHeaders(json(err.code ? { error: err.message, code: err.code } : { error: err.message }, err.status));
     if (err instanceof URIError) return withFramingHeaders(json({ error: "malformed URL" }, 400));
     console.error(err);
     return withFramingHeaders(json({ error: err instanceof Error ? err.message : String(err) }, 500));

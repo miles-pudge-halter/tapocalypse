@@ -4,7 +4,7 @@ Guidance for coding agents (omp, Claude Code, Cursor, …) working in this repos
 
 ## What this is
 
-Tapocalypse: a local Bun server + React UI + MCP endpoint that runs parallel, agent-driven mobile QA. A run = project + brief + device; its report and screenshots are stored in `<data dir>/runs/<id>/` (`report.md`, `screenshots/`), never in the repo; the server spawns a headless agent in the app's repo through a *harness* adapter (`omp --mode rpc`, `claude -p` stream-json or `codex exec --json`), which drives an Android emulator / iOS simulator through mobile-mcp (optionally Artemis, omp only) and reports checks back through the progress tools (`qa_plan`, `qa_check`, `qa_finish`): the run-scoped MCP endpoint `POST /mcp/runs/<id>` for every harness, plus omp host tools. User docs: `README.md`, `docs/guide.md`, `docs/configuration.md`, `docs/api.md`, `docs/agent-setup.md`.
+Tapocalypse: a local Bun server + React UI + MCP endpoint that runs parallel, agent-driven mobile QA. A run = project + brief + device; its report and screenshots are stored in `<data dir>/runs/<id>/` (`report.md`, `screenshots/`), never in the repo; the server spawns a headless agent in the app's repo through a *harness* adapter (`omp --mode rpc`, `claude -p` stream-json or `codex exec --json`), which drives an Android emulator / iOS simulator through mobile-mcp and reports checks back through the progress tools (`qa_plan`, `qa_check`, `qa_finish`): the run-scoped MCP endpoint `POST /mcp/runs/<id>` for every harness, plus omp host tools. User docs: `README.md`, `docs/guide.md`, `docs/configuration.md`, `docs/api.md`, `docs/agent-setup.md`.
 
 If `.agent-memory/MEMORY.md` exists (gitignored, maintainer-local), read it first: it holds project history, decisions, research and the next steps.
 
@@ -32,7 +32,7 @@ Smoke a second instance without touching real data: `TAPOCALYPSE_PORT=43xx TAPOC
 | `src/runs/` | `types.ts` (Run model), `store.ts` (run dirs + in-memory index), `scheduler.ts` (queue, devices, batches, rerun, retry), `runner.ts` (lifecycle), `outcome.ts` (pure: derived verdict, exit classification incl. harness limits, usage), `prompt.ts` (persona, prompt built with the harness's `toolName`, progress tool schemas), `progress.ts` (`ProgressRecorder`: records `qa_plan`/`qa_check`/`qa_finish` for both transports, copies screenshots and the report into the run dir, writes the `check` activity), `artefacts.ts` (`runArtefactDir`, `screenshotsDir`, `reportFile`, `screenshotFile`, `exportRun`: where a run's artefacts live for both `storage: "data"` and legacy `"repo"` runs, with the path guards), `source.ts` (git/PR metadata) |
 | `src/service/` | `tapocalypse service`: launchd agent (macOS) / systemd user unit (Linux) that runs `serve` in the background; `serviceCommand` with injectable deps, only ever addresses its own label/unit |
 | `src/harness/` | `types.ts` (the `Harness` interface, `HarnessId`, capabilities, `HarnessEvent`, canonical tool names; change it only deliberately), `index.ts` (registry, `getHarness`, `resolveHarnessId` precedence, cached `detectInstalled`), `omp/` (`rpc.ts` JSONL RPC client, `provision.ts` mobile-mcp via `--plugin-dir` + tool-prefix discovery, frame mapping), `claude/` (`claude -p` stream-json), `codex/` (`codex exec --json`) |
-| `src/devices/` | discovery, screencap, app version, boot/idle pool |
+| `src/devices/` | discovery, screencap, app version, boot/idle pool; `leases.ts` is the single ownership store (`deviceOwner(serial)`): agent leases from `device_acquire` and the implicit lease of every QA run |
 | `src/projects/` | registry (config-backed CRUD), detection, folder suggestions |
 | `src/mcp/server.ts`, `src/mcp/run-server.ts` | MCP tools (stateless streamable HTTP); `run-server.ts` is the run-scoped progress endpoint (`handleRunMcp`, bearer token per run) |
 | `src/reports/`, `src/suites.ts`, `src/batches.ts`, `src/stats.ts`, `src/retention.ts`, `src/doctor.ts`, `src/cli.ts` | as named |
@@ -86,10 +86,18 @@ Smoke a second instance without touching real data: `TAPOCALYPSE_PORT=43xx TAPOC
 ### Devices and tooling
 
 - **mobile-mcp** addresses emulators by AVD name (not adb serial), iOS simulators by UDID. Its own UiAutomation session already exposes Flutter semantics; element listing on large Flutter trees can take 5–25 s.
-- **Artemis** is optional (`artemisPath`, omp only); measured ~2× faster screen reads on Flutter but no correctness gain, heavy install. Its helper and mobile-mcp's on-device DeviceServer can't share UiAutomation.
 - `simctl appinfo` often omits `CFBundleShortVersionString`; read the bundle's `Info.plist`.
 - Bun HTML-import routes (`"/": index`) can't carry response headers → CSP is a `<meta>` in `web/index.html` plus `web/frame-guard.ts`.
 - `bun-plugin-tailwind` peer-depends on `bun`; auto-installing peers shadows the user's Bun binary.
+
+### Device leases
+
+- **One ownership store, `src/devices/leases.ts`.** Every claim on a device is a lease: an agent's (`device_acquire`) or the implicit one a QA run holds from assignment to release. `deviceOwner(serial)` is the only *ownership* check (scheduler `usable`, the shutdown route, the Devices overlay); the idle reaper and `shutdownDevice` also read `booted.lastReleasedAt`, which the store keeps current through `markAssigned`/`markReleased`; `Scheduler.assigned` no longer exists. The store calls `pool.markAssigned`/`markReleased` on every grant and end, so a leased booted device is never idle-reaped. Run leases are not persisted (runs become `interrupted` on restart); agent leases are, in `<data dir>/leases.json` (0600, atomic) with their wall-clock `expiresAt`.
+- **`leaseId` is a secret capability** (16 random bytes, base64url): returned once by `device_acquire`, looked up by SHA-256 digest and compared with `timingSafeEqual`, never in a list, event, view or log. The UI and SSE use the public `ref` (8 hex), which guards the force-release route against stale pages. Wrong, unknown, expired and released ids all give `lease_not_found`; only an id that matches a tombstone (last 100 ended leases) also gets the reason.
+- **One FIFO across runs and agent tickets** with backfill. `maxConcurrentRuns` gates run entries only and *skips* them at the cap (it must not `break` the pass, or agents behind a capped run starve). A ticket outlives its call by 60 s; a grant made while detached is a claim-pending lease with a 60 s deadline. Tickets are not persisted, capped at 32.
+- **Expiry** is lazy (`deviceOwner` treats `expiresAt <= now` as absent) plus a 15 s sweep in `app.ts` that also ends a lease whose serial was absent for 2 min or came back as a different AVD (emulator ports are reused), then calls `scheduler.schedule()`. Excluded serials and watch/TV cannot be leased; physical devices only by explicit serial.
+- **Leases are cooperative.** Raw `adb`, `xcrun simctl`, an agent's own mobile-mcp, Appium and IDE deploys bypass them; do not claim otherwise in docs or UI copy. There is no gateway that proxies `mobile_*` calls (a possible later level).
+- **No external lock files, no `backend` request field.** The only ownership source is the lease store. Old `run.json` files may still carry a `backend` key; `normalizeRun` drops it, and `web/components/run/humanise.ts` keeps a legacy tool-label regex so old activity feeds still read well. Config keys of removed features are ignored (the schema is non-strict).
 
 ## Workflow that has worked here
 

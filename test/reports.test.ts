@@ -238,7 +238,6 @@ describe("reports of runs stored in the data dir", () => {
       deviceRequest: { platform: "android" },
       deviceSerial: null,
       bootedByRun: false,
-      backend: "mobile-mcp",
       packageId: "com.x",
       status: "done",
       verdict: "PASS",

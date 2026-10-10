@@ -43,7 +43,7 @@ describe("humaniseTool: device tools", () => {
     expect(label).toBe("Batch of 2: tap @e9 → list screen elements");
   });
 
-  test("Artemis element-index click and key press", () => {
+  test("legacy element-index click and key press from old activity feeds", () => {
     expect(humaniseTool("mcp__artemis_mobile_click", { target: 21, device_serial: "emulator-5556" }).label).toBe(
       "Tap element #21",
     );

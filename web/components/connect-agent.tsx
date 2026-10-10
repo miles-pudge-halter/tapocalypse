@@ -9,7 +9,10 @@ import { cn } from "@/lib/utils";
 
 const TOOLS: { name: string; purpose: string }[] = [
   { name: "qa_list_projects", purpose: "Registered projects and whether each is ready" },
-  { name: "qa_list_devices", purpose: "Emulators, simulators and devices, with busy / booting flags" },
+  { name: "qa_list_devices", purpose: "Emulators, simulators and devices, with busy / held / booting flags" },
+  { name: "device_acquire", purpose: "Borrow a device for this agent; waits up to 110 s per call and keeps your place in line" },
+  { name: "device_renew", purpose: "Extend your lease before it expires" },
+  { name: "device_release", purpose: "Give the device back as soon as you are done" },
   { name: "qa_start_run", purpose: "Queue one QA run from a free-text brief or a saved suite" },
   { name: "qa_start_batch", purpose: "Fan the same brief out across several devices in parallel" },
   { name: "qa_wait_run", purpose: "Block until a run finishes (or a timeout), then read its checks and verdict" },
@@ -25,6 +28,22 @@ const TOOLS: { name: string; purpose: string }[] = [
   { name: "qa_list_suites", purpose: "Saved test suites of a project" },
   { name: "qa_doctor", purpose: "Prerequisite report, with a fix for anything missing" },
 ];
+
+/** The tools this server gives an agent as a name / purpose grid; `only` narrows it to the named ones. */
+export function ToolList({ className, only }: { className?: string; only?: readonly string[] }) {
+  return (
+    <dl className={cn("grid gap-x-4 gap-y-1.5 text-sm sm:grid-cols-[max-content_1fr]", className)}>
+      {TOOLS.filter((t) => !only || only.includes(t.name)).map((t) => (
+        <div key={t.name} className="contents">
+          <dt>
+            <code className="font-mono text-xs">{t.name}</code>
+          </dt>
+          <dd className="text-muted-foreground">{t.purpose}</dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
 
 const EXAMPLE_PROMPT =
   "Use the tapocalypse MCP tools to QA what you just built on Android: start a run with qa_start_run for this project, wait for it with qa_wait_run, then tell me the verdict and fix whatever failed.";
@@ -129,16 +148,7 @@ export function ConnectAgent({ className }: { className?: string }) {
           Tools your agent gets ({TOOLS.length})
         </CollapsibleTrigger>
         <CollapsibleContent>
-          <dl className="mt-2 grid gap-x-4 gap-y-1.5 text-sm sm:grid-cols-[max-content_1fr]">
-            {TOOLS.map((t) => (
-              <div key={t.name} className="contents">
-                <dt>
-                  <code className="font-mono text-xs">{t.name}</code>
-                </dt>
-                <dd className="text-muted-foreground">{t.purpose}</dd>
-              </div>
-            ))}
-          </dl>
+          <ToolList className="mt-2" />
         </CollapsibleContent>
       </Collapsible>
     </div>

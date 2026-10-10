@@ -6,7 +6,7 @@
 import { z } from "zod";
 import type { ExecResult } from "../devices/devices";
 import type { DoctorCheck } from "../doctor";
-import type { Activity, Backend, RunUsage } from "../runs/types";
+import type { Activity, RunUsage } from "../runs/types";
 
 export const HARNESS_IDS = ["omp", "claude", "codex"] as const;
 export type HarnessId = (typeof HARNESS_IDS)[number];
@@ -16,7 +16,6 @@ export const HarnessIdSchema = z.enum(HARNESS_IDS);
 export const PROGRESS_SERVER = "tpc";
 /** Server names an adapter mounts for the device driver; `toolName(server, tool)` resolves them to the harness's callable name. */
 export const MOBILE_MCP_SERVER = "mobile_mcp";
-export const ARTEMIS_SERVER = "artemis";
 /** npm package of the mobile-mcp device driver every harness mounts through `npx`. */
 export const MOBILE_MCP_PACKAGE = "@mobilenext/mobile-mcp";
 
@@ -39,8 +38,6 @@ export interface HarnessCapabilities {
   limits: { maxTime: boolean; maxTurns: boolean; maxBudgetUsd: boolean };
   /** Can write an HTML transcript of the session (omp `export_html`). */
   transcriptExport: boolean;
-  /** Driver backends this harness can run; artemis needs the user's own MCP config, which only omp sessions inherit. */
-  backends: readonly Backend[];
 }
 
 export interface SpawnOptions {
@@ -58,7 +55,6 @@ export interface SpawnOptions {
   effort: string | null;
   /** Device driver + progress servers to mount for this session only. Never touches the user's own config. */
   mcpServers: McpServerSpec[];
-  backend: Backend;
   /** Raw `config.runMaxTime` (e.g. `60m`) for harnesses that enforce the limit themselves (omp `--max-time`); null = none. */
   limits: { maxTime: string | null; maxTurns: number | null; maxBudgetUsd: number | null };
   /** Per-harness settings from `config.agent.harnesses[id]` (bin, permissions, sandbox…); adapters validate what they read. */
@@ -75,7 +71,7 @@ export interface SessionInfo {
   sessionId: string | null;
   /** Model as reported by the harness, when it says. */
   model: string | null;
-  /** Mount status per requested MCP server; the runner fails the run early when mobile-mcp/artemis or `tpc` is not ok. */
+  /** Mount status per requested MCP server; the runner fails the run early when mobile-mcp or `tpc` is not ok. */
   mcp: { name: string; ok: boolean; error?: string }[];
 }
 
@@ -143,7 +139,6 @@ export interface ProgressSink {
  * that dedupes repeated frames records the frame's `seq` in the entry and only skips a frame whose `seq` differs.
  */
 export interface ReplayContext {
-  backend: Backend;
   seq: number;
   starts: Map<string, { ts: number; tool: string; seq?: number }>;
 }

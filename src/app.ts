@@ -2,21 +2,23 @@ import path from "node:path";
 import { type BatchSummary, getBatchMeta, summarizeBatch } from "./batches";
 import { config } from "./config";
 import { type Device, listDevices } from "./devices/devices";
+import * as leases from "./devices/leases";
 import {
+  bootAndroid,
   bootedCount,
+  bootIos,
   isBootedByTapocalypse,
-  isBootingSerial,
   isBootingTarget,
   manualBootCount,
-  markAssigned,
-  markReleased,
+  type PoolView,
+  poolView,
   startIdleReaper,
 } from "./devices/pool";
 import { getProject, initProjects } from "./projects/registry";
 import { LEGACY_REPORTS_DIR, reportLocation, runArtefactDir, runImages } from "./runs/artefacts";
 import { startRetention } from "./retention";
 import { createRunner } from "./runs/runner";
-import { Scheduler } from "./runs/scheduler";
+import { type QueueHold, Scheduler } from "./runs/scheduler";
 import { runMatches } from "./runs/source";
 import { getRun, listRuns } from "./runs/store";
 import type { Run } from "./runs/types";
@@ -26,10 +28,19 @@ export const scheduler: Scheduler = new Scheduler({
   listDevices,
   bootedCount,
   manualBootCount,
-  isBootingSerial,
   isBootingTarget,
-  markAssigned,
-  markReleased,
+  leases: {
+    bus: leases.bus,
+    grantRun: leases.grantRun,
+    releaseRun: leases.releaseRun,
+    deviceOwner: leases.deviceOwner,
+    runLease: leases.runLease,
+    runLeaseCount: leases.runLeaseCount,
+    grantAgent: leases.grantAgent,
+    claim: leases.claim,
+    holdForClaim: leases.holdForClaim,
+  },
+  boot: (platform, target) => (platform === "android" ? bootAndroid(target) : bootIos(target)),
   startRun: (run, target) => runner.startRun(run, target),
   cancelActive: (id) => runner.cancelActive(id),
 });
@@ -40,12 +51,20 @@ export async function devicesView(): Promise<Device[]> {
   return scheduler.overlay(await listDevices(), isBootedByTapocalypse);
 }
 
+/** Pool state for the Devices page: run slots, boots, idle devices and who waits for any device of a platform. */
+export async function poolStateView(): Promise<PoolView> {
+  await listDevices();
+  return poolView(scheduler.activeCount(), scheduler.waitingView());
+}
+
 export type RunView = Run & {
   queuePosition: number | null;
   /** Elapsed time for active runs, total time for finished ones; null before the run started. */
   durationMs: number | null;
   /** Why a queued run is still waiting; null once it has a slot. */
   queueReason: string | null;
+  /** The agent lease a queued run waits behind (explicit serial: its holder; "any": the lease that ends first); null otherwise. */
+  queueHold: QueueHold | null;
   /** Absolute path where the run's report is stored (either storage), derived from the run record without touching the disk; null when it has none. */
   reportFile: string | null;
   /** Absolute path of the run's folder in Tapocalypse's data dir (events, and for data runs the report and screenshots). */
@@ -64,6 +83,7 @@ export function runView(run: Run): RunView {
     queuePosition: scheduler.queuePosition(run.id),
     durationMs: runDurationMs(run),
     queueReason: scheduler.queueReason(run.id),
+    queueHold: scheduler.queueHold(run.id),
     reportFile: reportLocation(run, getProject(run.projectId) ?? null),
     runDir: runArtefactDir(run.id),
   };
@@ -190,9 +210,17 @@ export function runScreenshots(run: Run): RunScreenshot[] {
 
 export function init(): void {
   initProjects();
+  leases.restore();
+  leases.setNextResolver((serial) => scheduler.nextFor(serial));
   scheduler.restore();
   startIdleReaper();
   setInterval(() => void scheduler.schedule(), 10_000);
+  // Expiry, vanished devices and unclaimed grants end leases here; ending one wakes the scheduler through the lease bus.
+  setInterval(() => {
+    listDevices()
+      .then((devices) => leases.sweep(devices))
+      .catch((e: unknown) => console.error("lease sweep failed:", e));
+  }, 15_000);
   void scheduler.schedule();
   startRetention((id) => scheduler.isHeld(id));
 }
