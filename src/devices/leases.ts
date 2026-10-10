@@ -7,7 +7,7 @@ import path from "node:path";
 import { z } from "zod";
 import { DATA_DIR, HttpError } from "../config";
 import type { Platform } from "../runs/types";
-import { type Device, lastDeviceSnapshot } from "./devices";
+import { type Device, lastDeviceSnapshot, mobileDeviceIdOf } from "./devices";
 import { isBootingSerial, markAssigned, markReleased } from "./pool";
 
 export type LeaseSource = "agent" | "run";
@@ -21,6 +21,8 @@ export interface Lease {
   platform: Platform;
   /** AVD name / simulator name at grant time; a serial that reappears as a different AVD ends the lease ("gone"). */
   avdName: string | null;
+  /** The id mobile-mcp addresses this device by (AVD name on emulators, else the serial); fixed at grant time. */
+  mobileDeviceId: string;
   holder: string;
   reason: string | null;
   source: LeaseSource;
@@ -34,10 +36,12 @@ export interface Lease {
   expiresAt: string | null;
   /** Set while a grant made to a waiting ticket is not yet picked up; `expiresAt` is the claim deadline meanwhile. */
   claimTicket?: string;
+  /** True once the lease has made a gated gateway call. */
+  gated?: boolean;
 }
 
 /** Public projection: what `GET /api/devices`, `qa_list_devices`, `/api/leases` and SSE carry. */
-export type LeaseView = Omit<Lease, "leaseId" | "cwd" | "claimTicket"> & { gated: boolean; claimPending: boolean };
+export type LeaseView = Omit<Lease, "leaseId" | "cwd" | "claimTicket" | "mobileDeviceId" | "gated"> & { gated: boolean; claimPending: boolean };
 
 export type DeviceOwner = { kind: "run"; lease: Lease } | { kind: "agent"; lease: Lease } | { kind: "booting" };
 
@@ -100,6 +104,12 @@ const WHY_TEXT: Record<EndWhy, string> = {
 
 const digest = (secret: string): Buffer => createHash("sha256").update(secret).digest();
 
+/** The gateway's key for an agent lease: the hex SHA-256 of its id (what tombstones use too); safe to pass around, reveals nothing of the secret. */
+export const leaseKey = (leaseId: string): string => digest(leaseId).toString("hex");
+
+/** A gated call renews the lease on every call, but only tells the UI and the disk about it this often (or when `gated` flips). */
+const TOUCH_PUBLISH_MS = 15_000;
+
 /** The server's local 24-hour HH:MM clock (the same machine as the browser), as lease texts and queue reasons print times. */
 export const formatClock = (at: string | number | null): string => new Date(at ?? 0).toTimeString().slice(0, 5);
 
@@ -117,7 +127,7 @@ export function leaseView(l: Lease): LeaseView {
     acquiredAt: l.acquiredAt,
     renewedAt: l.renewedAt,
     expiresAt: l.expiresAt,
-    gated: false,
+    gated: l.gated === true,
     claimPending: l.claimTicket !== undefined,
   };
 }
@@ -138,10 +148,14 @@ const PersistedLease = z.object({
   renewedAt: z.string(),
   expiresAt: z.string(),
   claimTicket: z.string().optional(),
+  mobileDeviceId: z.string().min(1).optional(),
+  gated: z.boolean().optional(),
 });
 
 export class LeaseStore {
   readonly bus = new EventEmitter<{ lease: [LeaseEvent] }>();
+  /** The `leaseKey` of every agent lease that ends, whatever the reason: the gateway stops that lease's child. Kept off `bus` so the digest never reaches SSE. */
+  readonly ends = new EventEmitter<{ end: [string] }>();
   /** At most one lease per serial. */
   private leases = new Map<string, Lease>();
   /** Ended agent leases by sha256(leaseId), newest last, so a late renew can say why the lease is gone. */
@@ -162,6 +176,7 @@ export class LeaseStore {
       ...deps,
     };
     this.bus.setMaxListeners(0);
+    this.ends.setMaxListeners(0);
   }
 
   private isLive(l: Lease, now: number): boolean {
@@ -207,6 +222,7 @@ export class LeaseStore {
         serial: req.serial,
         platform: req.platform,
         avdName: req.avdName,
+        mobileDeviceId: mobileDeviceIdOf({ serial: req.serial, platform: req.platform, avdName: req.avdName }),
         holder: req.holder,
         reason: req.reason || null,
         source: "agent",
@@ -251,7 +267,7 @@ export class LeaseStore {
       this.end(held, "gone", now);
     }
     this.newLease(
-      { serial, platform: run.platform, avdName: device.avdName, holder: run.id, reason: null, source: "run", runId: run.id, ttlMinutes: 0, expiresAt: null },
+      { serial, platform: run.platform, avdName: device.avdName, mobileDeviceId: mobileDeviceIdOf({ serial, platform: run.platform, avdName: device.avdName }), holder: run.id, reason: null, source: "run", runId: run.id, ttlMinutes: 0, expiresAt: null },
       now,
     );
   }
@@ -305,6 +321,27 @@ export class LeaseStore {
     lease.expiresAt = new Date(now + lease.ttlMinutes * 60_000).toISOString();
     this.persist();
     this.emit("renewed", lease, null);
+    return lease;
+  }
+
+  /**
+   * A gated gateway call: renews like `renew` (`expiresAt = now + ttl`, ttl unchanged), marks the lease `gated` and returns it.
+   * A busy agent calls this twice per tool call, so the lease is announced and saved only when `gated` flips or the last
+   * published renewal is older than `TOUCH_PUBLISH_MS`; the in-memory expiry is always current.
+   */
+  touch(leaseId: string): Lease {
+    const now = this.deps.now();
+    const lease = this.lookup(leaseId, now);
+    const flipped = lease.gated !== true;
+    const stale = now - Date.parse(lease.renewedAt) >= TOUCH_PUBLISH_MS;
+    lease.gated = true;
+    delete lease.claimTicket;
+    lease.expiresAt = new Date(now + lease.ttlMinutes * 60_000).toISOString();
+    if (flipped || stale) {
+      lease.renewedAt = new Date(now).toISOString();
+      this.persist();
+      this.emit("renewed", lease, null);
+    }
     return lease;
   }
 
@@ -375,11 +412,12 @@ export class LeaseStore {
     this.leases.delete(lease.serial);
     this.absentSince.delete(lease.serial);
     if (lease.source === "agent") {
-      this.tombstones.set(digest(lease.leaseId).toString("hex"), { serial: lease.serial, endedAt: now, why });
+      this.tombstones.set(leaseKey(lease.leaseId), { serial: lease.serial, endedAt: now, why });
       while (this.tombstones.size > TOMBSTONES) this.tombstones.delete(this.tombstones.keys().next().value!);
     }
     this.deps.markReleased(lease.serial);
     this.persist();
+    if (lease.source === "agent") this.ends.emit("end", leaseKey(lease.leaseId));
     return this.emit(why, lease, this.deps.nextFor(lease.serial));
   }
 
@@ -418,7 +456,10 @@ export class LeaseStore {
       const lease = PersistedLease.safeParse(entry);
       if (!lease.success || lease.data.claimTicket !== undefined || Date.parse(lease.data.expiresAt) <= now) continue;
       if (this.leases.has(lease.data.serial)) continue;
-      this.leases.set(lease.data.serial, lease.data);
+      this.leases.set(lease.data.serial, {
+        ...lease.data,
+        mobileDeviceId: lease.data.mobileDeviceId ?? mobileDeviceIdOf({ serial: lease.data.serial, platform: lease.data.platform, avdName: lease.data.avdName }),
+      });
       this.deps.markAssigned(lease.data.serial);
     }
     this.persist();
@@ -436,6 +477,7 @@ const defaultStore = new LeaseStore({
 
 /** Module-level API over the process-wide store (the scheduler, API and MCP use these; tests build their own `LeaseStore`). */
 export const bus = defaultStore.bus;
+export const ends = defaultStore.ends;
 export const deviceOwner = (serial: string, now?: number) => defaultStore.deviceOwner(serial, now);
 export const grantRun = (serial: string, run: { id: string; platform: Platform }, device: { avdName: string | null; booted?: boolean }) =>
   defaultStore.grantRun(serial, run, device);
@@ -444,6 +486,7 @@ export const runLease = (runId: string) => defaultStore.runLease(runId);
 export const runLeaseCount = () => defaultStore.runLeaseCount();
 export const grantAgent = (req: AgentGrant) => defaultStore.grantAgent(req);
 export const renew = (leaseId: string, ttlMinutes?: number) => defaultStore.renew(leaseId, ttlMinutes);
+export const touch = (leaseId: string) => defaultStore.touch(leaseId);
 export const release = (leaseId: string) => defaultStore.release(leaseId);
 export const revoke = (serial: string, ref: string) => defaultStore.revoke(serial, ref);
 export const claim = (ticket: string) => defaultStore.claim(ticket);

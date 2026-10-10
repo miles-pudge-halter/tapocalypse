@@ -5,7 +5,7 @@ import path from "node:path";
 import { z } from "zod";
 import { fetchHandler } from "../src/api";
 import { scheduler } from "../src/app";
-import { config, MAX_STEER_CHARS } from "../src/config";
+import { config, DATA_DIR, MAX_STEER_CHARS } from "../src/config";
 import { deviceOwner, grantAgent, grantRun, releaseRun, revoke } from "../src/devices/leases";
 import { HARNESS_IDS } from "../src/harness/types";
 import { getProject } from "../src/projects/registry";
@@ -16,6 +16,32 @@ const HOST = `127.0.0.1:${config.port}`;
 /** Smallest valid PNG header bytes; enough for the magic-byte checks. */
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
 const project = getProject("test-proj")!;
+
+// The gateway's tool cache is read lazily from the data dir. Writing it before any request keeps `/mcp` tools/list from probing a real
+// mobile-mcp, and makes it poisoned on purpose: a Tapocalypse tool name, a cloud tool and a schema the MCP SDK cannot compile sit next to a good tool.
+const GATEWAY_CACHE = path.join(DATA_DIR, "gateway-tools.json");
+const emptyObject = { type: "object", properties: {} };
+fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.writeFileSync(
+  GATEWAY_CACHE,
+  JSON.stringify({
+    version: 1,
+    mobileMcpVersion: "9.9.9-api-test",
+    tools: [
+      { name: "qa_doctor", inputSchema: emptyObject },
+      { name: "mobile_allocate_remote_device", inputSchema: emptyObject },
+      { name: "mobile_uncompilable", inputSchema: { type: "object", properties: { x: { type: "nonsense" } } } },
+      {
+        name: "mobile_peek",
+        title: "Peek at the screen",
+        description: "Look",
+        annotations: { readOnlyHint: true, destructiveHint: false },
+        inputSchema: { type: "object", properties: { device: { type: "string" } }, required: ["device"] },
+      },
+    ],
+  }),
+);
+afterAll(() => fs.rmSync(GATEWAY_CACHE, { force: true }));
 
 function call(pathname: string, init: RequestInit & { json?: unknown } = {}): Promise<Response> {
   const { json, ...rest } = init;
@@ -383,7 +409,7 @@ describe("suites, templates, stats, mcp status", () => {
 });
 
 describe("run-management MCP artefact tools", () => {
-  const Rpc = z.object({ result: z.object({ isError: z.boolean().optional(), content: z.array(z.object({ text: z.string() })).optional(), tools: z.array(z.object({ name: z.string() })).optional() }).optional() });
+  const Rpc = z.object({ result: z.object({ isError: z.boolean().optional(), content: z.array(z.object({ text: z.string() })).optional(), tools: z.array(z.looseObject({ name: z.string() })).optional() }).optional() });
   type RpcResult = NonNullable<z.infer<typeof Rpc>["result"]>;
 
   async function rpc(method: string, params?: Record<string, unknown>): Promise<RpcResult> {
@@ -408,6 +434,18 @@ describe("run-management MCP artefact tools", () => {
     expect(names).toEqual(expect.arrayContaining(["qa_get_report", "qa_get_screenshots", "qa_export", "qa_get_run"]));
     const full = JSON.stringify(list.tools);
     expect(full).not.toContain("reportsDir");
+  });
+
+  test("a poisoned gateway tool cache takes none of the Tapocalypse tools down and keeps the hints of the gated ones", async () => {
+    const list = await rpc("tools/list");
+    const names = list.tools!.map((t) => t.name);
+    expect(names).toEqual(expect.arrayContaining(["qa_doctor", "qa_get_run", "device_acquire", "mobile_peek"]));
+    expect(names.filter((n) => n === "qa_doctor")).toHaveLength(1);
+    expect(names).not.toContain("mobile_allocate_remote_device");
+    expect(names).not.toContain("mobile_uncompilable");
+    const peek = list.tools!.find((t) => t.name === "mobile_peek")!;
+    expect(peek).toMatchObject({ title: "Peek at the screen", annotations: { readOnlyHint: true, destructiveHint: false } });
+    expect(JSON.stringify(peek.inputSchema)).toContain("leaseId");
   });
 
   test("no tool offers a driver backend or mentions Artemis", async () => {

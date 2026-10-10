@@ -6,7 +6,10 @@ import path from "node:path";
 // The real scheduler decides grants, and the in-process one is stopped by other test files, so this file runs a second
 // instance (own port, config, data dir and a fake adb with one emulator) and talks to it over HTTP like an agent would.
 const SERIAL = "emulator-5591";
+const FAKE_MOBILE_MCP = path.join(import.meta.dir, "support", "fake-mobile-mcp.ts");
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "tapocalypse-leases-e2e-"));
+const PID_FILE = path.join(root, "fake-mobile-mcp.pids");
+const WORK_DIR = path.join(root, "work");
 let server: Bun.Subprocess | null = null;
 let base = "";
 
@@ -33,6 +36,7 @@ beforeAll(async () => {
     ].join("\n"),
     { mode: 0o755 },
   );
+  fs.mkdirSync(WORK_DIR);
   const port = await freePort();
   base = `http://127.0.0.1:${port}`;
   server = Bun.spawn(["bun", path.join(import.meta.dir, "..", "src", "server.ts")], {
@@ -45,6 +49,8 @@ beforeAll(async () => {
       ADB_BIN: adb,
       XCRUN_BIN: path.join(root, "no-xcrun"),
       EMULATOR_BIN: path.join(root, "no-emulator"),
+      MOBILE_MCP_BIN: `${process.execPath} ${FAKE_MOBILE_MCP}`,
+      FAKE_MOBILE_MCP_PIDFILE: PID_FILE,
     },
     stdout: "ignore",
     stderr: "ignore",
@@ -95,18 +101,18 @@ interface Waiting {
   heldBy: { kind: string; holder: string } | null;
 }
 
-describe("device leases against a running scheduler", () => {
-  // Tests share one device and run in any order: start each one with nothing held (a previous test's lease or claim window).
-  beforeEach(async () => {
-    const held = (await (await fetch(`${base}/api/leases`)).json()) as { serial: string; ref: string }[];
-    for (const l of held) await post(`/api/devices/${l.serial}/release`, { ref: l.ref });
-    for (let i = 0; i < 20; i++) {
-      const left = (await (await fetch(`${base}/api/leases`)).json()) as unknown[];
-      if (left.length === 0) return;
-      await Bun.sleep(50);
-    }
-  });
+// Tests share one device and run in any order: start each one with nothing held (a previous test's lease or claim window).
+beforeEach(async () => {
+  const held = (await (await fetch(`${base}/api/leases`)).json()) as { serial: string; ref: string }[];
+  for (const l of held) await post(`/api/devices/${l.serial}/release`, { ref: l.ref });
+  for (let i = 0; i < 20; i++) {
+    const left = (await (await fetch(`${base}/api/leases`)).json()) as unknown[];
+    if (left.length === 0) return;
+    await Bun.sleep(50);
+  }
+});
 
+describe("device leases against a running scheduler", () => {
   test("acquire grants the device and the list shows it without the secret; a busy device answers timedOut with its holder", async () => {
     const res = await post("/api/leases", { serial: SERIAL, holder: "first agent", reason: "e2e", ttlMinutes: 20 });
     expect(res.status).toBe(200);
@@ -186,5 +192,102 @@ describe("device leases against a running scheduler", () => {
     const spent = await rpc("device_renew", { leaseId: lease.leaseId });
     expect(spent.isError).toBe(true);
     expect(spent.text).toStartWith("lease_not_found: ");
+  });
+});
+
+interface ListedTool {
+  name: string;
+  description?: string;
+  inputSchema: { properties?: Record<string, unknown>; required?: string[] };
+}
+
+async function listTools(): Promise<ListedTool[]> {
+  const res = await fetch(`${base}/mcp`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+  });
+  const text = await res.text();
+  const raw = text.startsWith("event:") ? text.split("\n").find((l) => l.startsWith("data: "))!.slice("data: ".length) : text;
+  return (JSON.parse(raw) as { result: { tools: ListedTool[] } }).result.tools;
+}
+
+const alive = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+const childPids = () => (fs.existsSync(PID_FILE) ? fs.readFileSync(PID_FILE, "utf8").split("\n").filter(Boolean).map(Number) : []);
+
+describe("the device gateway: mobile tools gated by leaseId", () => {
+  const acquire = async () => {
+    const res = await post("/api/leases", { serial: SERIAL, holder: "gateway agent", cwd: WORK_DIR });
+    expect(res.status).toBe(200);
+    return (await res.json()) as Grant;
+  };
+
+  test("a gated call runs on the leased device, whatever device the arguments or batch steps name", async () => {
+    const lease = await acquire();
+    const shot = await rpc("mobile_take_screenshot", { leaseId: lease.leaseId });
+    expect(shot).toEqual({ isError: false, text: `shot:${lease.mobileDeviceId}` });
+
+    const batch = await rpc("mobile_batch_commands", {
+      leaseId: lease.leaseId,
+      steps: [
+        { name: "mobile_click_on_screen_at_coordinates", arguments: { device: "someone-elses-device", x: 1, y: 2 } },
+        { name: "mobile_click_on_screen_at_coordinates", arguments: { x: 3, y: 4 } },
+      ],
+    });
+    expect(batch.isError).toBe(false);
+    expect(JSON.parse(batch.text)).toEqual({
+      device: "E2E_AVD",
+      steps: [
+        { name: "mobile_click_on_screen_at_coordinates", device: "E2E_AVD" },
+        { name: "mobile_click_on_screen_at_coordinates", device: "E2E_AVD" },
+      ],
+    });
+    await post("/api/leases/release", { leaseId: lease.leaseId });
+  }, 20_000);
+
+  test("an unknown leaseId is lease_not_found and reaches no device", async () => {
+    const lease = await acquire();
+    const wrong = await rpc("mobile_take_screenshot", { leaseId: "not-the-lease-id" });
+    expect(wrong.isError).toBe(true);
+    expect(wrong.text).toStartWith("lease_not_found: ");
+    await post("/api/leases/release", { leaseId: lease.leaseId });
+  });
+
+  test("releasing the lease stops its child; the tools stay listed with leaseId instead of device, minus device listing", async () => {
+    const lease = await acquire();
+    expect((await rpc("mobile_take_screenshot", { leaseId: lease.leaseId })).isError).toBe(false);
+    const pids = childPids();
+    expect(pids.length).toBeGreaterThan(0);
+    expect(alive(pids.at(-1)!)).toBe(true);
+
+    await post("/api/leases/release", { leaseId: lease.leaseId });
+    for (let i = 0; i < 50 && pids.some(alive); i++) await Bun.sleep(100);
+    expect(pids.filter(alive)).toEqual([]);
+
+    const after = await rpc("mobile_take_screenshot", { leaseId: lease.leaseId });
+    expect(after.isError).toBe(true);
+    expect(after.text).toStartWith("lease_not_found: ");
+    expect(after.text).toContain("released");
+
+    const tools = await listTools();
+    const names = tools.map((t) => t.name);
+    expect(names).toEqual(expect.arrayContaining(["mobile_take_screenshot", "mobile_click_on_screen_at_coordinates", "mobile_batch_commands"]));
+    expect(names).not.toContain("mobile_list_available_devices");
+    const screenshot = tools.find((t) => t.name === "mobile_take_screenshot")!;
+    expect(Object.keys(screenshot.inputSchema.properties ?? {})).toEqual(["leaseId"]);
+    expect(screenshot.inputSchema.required).toEqual(["leaseId"]);
+  }, 20_000);
+
+  test("/api/mcp/status reports the gated tool count and the mobile-mcp version", async () => {
+    await listTools();
+    const status = (await (await fetch(`${base}/api/mcp/status`)).json()) as { gateway: { tools: number; mobileMcpVersion: string | null } };
+    expect(status.gateway).toEqual({ tools: 3, mobileMcpVersion: "9.9.9-fake" });
   });
 });

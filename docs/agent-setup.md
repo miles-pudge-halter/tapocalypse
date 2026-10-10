@@ -250,21 +250,21 @@ A `FAIL` or `BLOCKED` verdict with no `errorKind` means Tapocalypse works and th
 
 ## 8. Let your agents borrow devices (optional)
 
-Tapocalypse is also the device broker for your coding agents: with a lease, two agents (and QA runs) never drive the same emulator or simulator at once. This is cooperative; it works because every agent follows the same instructions. Ask the user whether to add the snippet below to the instructions the agents on this machine read (for example `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, the repo's `AGENTS.md`, a Cursor rule). Merge it as its own section and do not write it without their go-ahead. The Setup page of the UI has the same text as a copyable prompt and skill file.
+Tapocalypse is also the device broker for your coding agents: with a lease, two agents (and QA runs) never drive the same emulator or simulator at once. Tapocalypse's own `mobile_*` tools enforce it (they only drive the device you hold); everything else (raw `adb`, `xcrun simctl`, another mobile-mcp server) is cooperative and works because every agent follows the same instructions. Ask the user whether to add the snippet below to the instructions the agents on this machine read (for example `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, the repo's `AGENTS.md`, a Cursor rule). Merge it as its own section and do not write it without their go-ahead. The Setup page of the UI has the same text as a copyable prompt and skill file.
 
 ```md
 ## Using a device (Tapocalypse device broker)
 Devices on this machine are shared with other agents. Before your first device action (mobile tool, adb, simctl, flutter run/install):
 1. `device_acquire { platform | serial, holder: "<your client> · <task>", reason, ttlMinutes?, waitSeconds: 60, cwd: <your working dir> }`.
-   - Success → note `leaseId`, `serial` (adb/simctl) and `mobileDeviceId` (mobile tools). Keep the leaseId in your notes; it cannot be recovered.
+   - Success → note `leaseId` and `serial` (adb/simctl). Keep the leaseId in your notes; it cannot be recovered.
    - `timedOut: true` → it is busy (`heldBy`). Call again with the same args plus `ticket` to keep your place, or tell the user who holds it. Never use a device you do not hold.
-2. Use only that device: `serial` for adb/simctl/flutter, `mobileDeviceId` for mobile tools.
-3. Renew with `device_renew { leaseId }` when less than 10 minutes are left.
+2. Use only that device: `serial` for adb/simctl/flutter. With Tapocalypse's `mobile_*` tools pass `leaseId` instead of `device`; do not use another mobile-mcp server.
+3. Renew with `device_renew { leaseId }` when less than 10 minutes are left (`mobile_*` calls renew the lease automatically).
 4. Always `device_release { leaseId }` when done, also on failure or abort.
 If a call says the lease ended, stop touching the device and acquire again.
 ```
 
-Check that `qa_list_devices` is callable, and tell the user that leases are advisory: they do not stop a process that runs `adb` or `xcrun simctl` on its own. Details: [Sharing devices between agents](guide.md#sharing-devices-between-agents).
+Check that `qa_list_devices` is callable (the `mobile_*` tools appear in the tool list too, each taking a `leaseId`), and tell the user what is enforced and what is not: Tapocalypse's `mobile_*` tools only drive the leased device, but a process that runs `adb` or `xcrun simctl` on its own, or its own mobile-mcp server, is not stopped. Details: [Sharing devices between agents](guide.md#sharing-devices-between-agents).
 
 ## 9. Report back
 

@@ -2,6 +2,7 @@ import index from "../web/index.html";
 import { fetchHandler } from "./api";
 import { init, runner, scheduler } from "./app";
 import { config } from "./config";
+import { gateway } from "./devices/gateway";
 
 init();
 
@@ -30,6 +31,10 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     // Stop scheduling first so exiting omp processes cannot free a slot that starts the next queued run.
     scheduler.stop();
     runner.killAll();
+    // Then stop accepting requests (dropping open connections, SSE streams included): a gated call arriving while the
+    // gateway closes its children could otherwise spawn one that nothing stops.
+    await server.stop(true).catch(() => {});
+    await gateway.stopAll().catch(() => {});
     await Bun.sleep(500);
     process.exit(0);
   });

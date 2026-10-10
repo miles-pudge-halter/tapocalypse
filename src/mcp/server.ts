@@ -1,12 +1,13 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
-import { McpServer, WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/server";
+import { type CallToolResult, fromJsonSchema, McpServer, WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import pkg from "../../package.json";
 import { batchView, devicesView, findRun, runDurationMs, runner, runScreenshots, scheduler } from "../app";
 import { config, HttpError, MAX_STEER_CHARS } from "../config";
 import { runDoctor } from "../doctor";
-import { release as releaseLease, renew as renewLease, TTL } from "../devices/leases";
+import { gateway, gateSchema, type ToolDef } from "../devices/gateway";
+import { leaseKey, release as releaseLease, renew as renewLease, touch, TTL } from "../devices/leases";
 import { HARNESS_IDS, type HarnessId } from "../harness/types";
 import { detectProject } from "../projects/detect";
 import { createProject, deleteProject, getProject, listProjects, PACKAGE_RE, updateProject } from "../projects/registry";
@@ -142,20 +143,79 @@ const runUrl = (runId: string) => `http://127.0.0.1:${config.port}/#/runs/${runI
 
 type ToolResult = { content: { type: "text"; text: string }[]; isError?: true };
 
+function errorResult(err: unknown): ToolResult {
+  const message = err instanceof Error ? err.message : String(err);
+  // Errors with a stable code read "<code>: <message>" so agents can branch on the prefix.
+  const text = err instanceof HttpError && err.code ? `${err.code}: ${message}` : message;
+  return { isError: true, content: [{ type: "text", text }] };
+}
+
 async function respond(fn: () => unknown | Promise<unknown>): Promise<ToolResult> {
   try {
     const result = await fn();
     return { content: [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result, null, 2) }] };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    // Errors with a stable code read "<code>: <message>" so agents can branch on the prefix.
-    const text = err instanceof HttpError && err.code ? `${err.code}: ${message}` : message;
-    return { isError: true, content: [{ type: "text", text }] };
+    return errorResult(err);
+  }
+}
+
+/**
+ * One gated mobile tool call: the leaseId (the capability) names the device, never the caller's arguments. A bad,
+ * ended or unknown lease is `lease_not_found: <reason>`; the child's result comes back verbatim (images, isError).
+ */
+async function callGated(name: string, input: unknown): Promise<CallToolResult> {
+  const parsed = GatedArgs.safeParse(input);
+  if (!parsed.success) return errorResult(new HttpError(400, parsed.error.issues.map((i) => i.message).join("; "), "invalid_argument"));
+  const args = parsed.data;
+  try {
+    const lease = touch(args.leaseId);
+    const result = await gateway.call(leaseKey(args.leaseId), lease.mobileDeviceId, lease.cwd, name, args, () => {
+      try {
+        touch(args.leaseId);
+      } catch {
+        // The lease ended while the child was starting; the gateway reports that to the caller.
+      }
+    });
+    try {
+      touch(args.leaseId);
+    } catch {
+      // The lease ended while the call ran (released, revoked, expired): the child's result is still the answer.
+    }
+    // Reason: the gateway forwards the child's already-validated MCP CallToolResult; its content is typed loosely there.
+    const verbatim = result as CallToolResult;
+    return verbatim;
+  } catch (err) {
+    return errorResult(err);
+  }
+}
+
+/** Registers the child's device tools with `device` replaced by a required `leaseId`. Without a tool list (probe failed) there is nothing to register. */
+async function registerGatedTools(server: McpServer): Promise<void> {
+  let defs: ToolDef[];
+  try {
+    defs = await gateway.tools();
+  } catch (err) {
+    console.error(`tapocalypse: gated mobile tools unavailable: ${err instanceof Error ? err.message : String(err)}`);
+    return;
+  }
+  for (const def of defs) {
+    const gated = gateSchema(def);
+    try {
+      server.registerTool(
+        def.name,
+        { title: gated.title, description: gated.description, annotations: gated.annotations, inputSchema: fromJsonSchema(gated.inputSchema) },
+        (args) => callGated(def.name, args),
+      );
+    } catch (err) {
+      // One tool the SDK cannot register (a schema it cannot compile, a name that is taken) must not take `/mcp`'s other tools down with it.
+      console.error(`tapocalypse: skipped gated tool ${def.name}: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 }
 
 const Holder = z.string().trim().min(1).max(80);
 const LeaseIdArg = z.string().min(1).max(64);
+const GatedArgs = z.object({ leaseId: LeaseIdArg }).catchall(z.unknown());
 const TtlMinutes = z.number().int().min(TTL.min).max(TTL.max);
 
 const DeviceAcquireShape = {
@@ -289,7 +349,7 @@ function buildServer(): McpServer {
     {
       title: "List devices",
       description:
-        "List connected Android emulators/devices and iOS simulators, including busy (busyRunId), booting, the agent lease on each device (lease: holder, reason, expiresAt; null when free) and who is waiting for it (waiters). Call this before device_acquire to see what is free.",
+        "List connected Android emulators/devices and iOS simulators, including busy (busyRunId), booting, the agent lease on each device (lease: holder, reason, expiresAt; null when free) and who is waiting for it (waiters). Call this before device_acquire to see what is free. Tapocalypse's own mobile_* tools only drive a device you hold: pass the leaseId from device_acquire instead of a device.",
     },
     () => respond(() => devicesView()),
   );
@@ -299,7 +359,7 @@ function buildServer(): McpServer {
     {
       title: "Acquire a device",
       description:
-        "Reserve an emulator/simulator before you use it: devices are shared with other agents and QA runs. Give a serial (from qa_list_devices) or a platform (any free one, may boot one). Returns the leaseId (keep it: it cannot be recovered), serial (adb/simctl) and mobileDeviceId (mobile-mcp tools). If the device is busy the result has timedOut: true, ticket, position and heldBy: call again with the same arguments plus ticket to keep your place, or tell the user who holds it. Never touch a device you do not hold. Release it with device_release when done.",
+        "Reserve an emulator/simulator before you use it: devices are shared with other agents and QA runs. Give a serial (from qa_list_devices) or a platform (any free one, may boot one). Returns the leaseId (keep it: it cannot be recovered), serial (adb/simctl) and mobileDeviceId (the id other mobile-mcp servers call `device`). Tapocalypse's own mobile_* tools (mobile_take_screenshot, mobile_click_on_screen_at_coordinates, …) take this leaseId instead of a device and drive only the device you hold: use them, not another mobile-mcp server. If the device is busy the result has timedOut: true, ticket, position and heldBy: call again with the same arguments plus ticket to keep your place, or tell the user who holds it. Never touch a device you do not hold. Release it with device_release when done.",
       inputSchema: z.object(DeviceAcquireShape),
     },
     (args, ctx) => respond(() => acquireDevice(args, ctx.mcpReq.signal)),
@@ -659,22 +719,32 @@ export interface McpStatus {
   lastCallAt: string | null;
   lastTool: string | null;
   lastRequester: string | null;
+  /** The gated `mobile_*` tools: how many are known (0 until the first probe) and the mobile-mcp version they came from. */
+  gateway: { tools: number; mobileMcpVersion: string | null };
 }
 
-const status: McpStatus = { url: `http://127.0.0.1:${config.port}/mcp`, lastCallAt: null, lastTool: null, lastRequester: null };
+const status: Omit<McpStatus, "gateway"> = { url: `http://127.0.0.1:${config.port}/mcp`, lastCallAt: null, lastTool: null, lastRequester: null };
 
-export const mcpStatus = (): McpStatus => ({ ...status });
+export const mcpStatus = (): McpStatus => ({ ...status, gateway: gateway.status() });
 
-/** Records the newest `tools/call` in the request (it may be a JSON-RPC batch) for the Setup page's live status. */
-async function recordToolCalls(req: Request): Promise<void> {
+type RpcMessage = { method?: unknown; params?: { name?: unknown; arguments?: { requester?: unknown } } } | null;
+
+/** The JSON-RPC messages of the request body (a batch is several); an unreadable body has none. */
+async function readMessages(req: Request): Promise<RpcMessage[]> {
   let body: unknown;
   try {
     body = await req.clone().json();
   } catch {
-    return;
+    return [];
   }
-  for (const message of Array.isArray(body) ? body : [body]) {
-    const m = message as { method?: unknown; params?: { name?: unknown; arguments?: { requester?: unknown } } } | null;
+  // Reason: untrusted JSON; every member is read through optional chaining and typeof checks below.
+  const messages = (Array.isArray(body) ? body : [body]) as RpcMessage[];
+  return messages;
+}
+
+/** Records the newest `tools/call` in the request for the Setup page's live status. */
+function recordToolCalls(messages: RpcMessage[]): void {
+  for (const m of messages) {
     if (m?.method !== "tools/call" || typeof m.params?.name !== "string") continue;
     const requester = m.params.arguments?.requester;
     status.lastCallAt = new Date().toISOString();
@@ -683,10 +753,16 @@ async function recordToolCalls(req: Request): Promise<void> {
   }
 }
 
+/** Only a tool listing or a `mobile_*` call needs the gated tools; everything else must not wait for the first-ever probe of mobile-mcp. */
+const needsGatedTools = (messages: RpcMessage[]): boolean =>
+  messages.some((m) => m?.method === "tools/list" || (m?.method === "tools/call" && typeof m.params?.name === "string" && m.params.name.startsWith("mobile_")));
+
 /** Stateless: a fresh server + transport per request keeps parallel agent clients independent. */
 export async function handleMcp(req: Request): Promise<Response> {
-  await recordToolCalls(req);
+  const messages = await readMessages(req);
+  recordToolCalls(messages);
   const server = buildServer();
+  if (needsGatedTools(messages)) await registerGatedTools(server);
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
     enableJsonResponse: true,

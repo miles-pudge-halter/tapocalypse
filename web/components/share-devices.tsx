@@ -98,6 +98,15 @@ export function ShareDevices() {
         </TabsContent>
         <TabsContent value="tools" className="space-y-2">
           <ToolList only={DEVICE_TOOLS} />
+          <dl className="grid gap-x-4 gap-y-1.5 text-sm sm:grid-cols-[max-content_1fr]">
+            <dt>
+              <code className="font-mono text-xs">mobile_* (gated)</code>
+            </dt>
+            <dd className="text-muted-foreground">
+              Tapocalypse&apos;s own copies of mobile-mcp&apos;s device tools. Pass the <code className="rounded bg-muted px-1 text-xs">leaseId</code>{" "}
+              instead of a device: they only drive the device the lease holds.
+            </dd>
+          </dl>
         </TabsContent>
       </Tabs>
     </section>

@@ -93,6 +93,7 @@ A *harness* is the headless coding-agent CLI that plays the QA agent: `omp`, `cl
 | `TAPOCALYPSE_URL` | Server URL for `tapocalypse run` / `status` / `report` (default `http://127.0.0.1:<port>`); `--url` wins |
 | `XDG_CONFIG_HOME`, `XDG_DATA_HOME` | Base directories for the default config and data locations |
 | `OMP_BIN`, `CLAUDE_BIN`, `CODEX_BIN`, `ADB_BIN`, `XCRUN_BIN`, `GIT_BIN`, `GH_BIN` | Binaries to use instead of `omp`, `claude`, `codex`, `adb`, `xcrun`, `git`, `gh` from `PATH`. The harness variables override `agent.harnesses.<id>.bin` |
+| `MOBILE_MCP_BIN` | Command line that starts the mobile-mcp children of the `/mcp` device gateway instead of `npx -y @mobilenext/mobile-mcp@latest` (a pinned install, or a stand-in in tests). It is split on spaces, so a path that contains spaces cannot be used |
 | `EMULATOR_BIN` | Android emulator binary. Otherwise looked up (not on `PATH`) at `$ANDROID_HOME/emulator/emulator`, `$ANDROID_SDK_ROOT/emulator/emulator`, `~/Library/Android/sdk/emulator/emulator` (macOS), then `~/Android/Sdk/emulator/emulator` (Linux) |
 | `ANDROID_HOME`, `ANDROID_SDK_ROOT` | Android SDK location used for the emulator lookup |
 | `OMP_PROFILE` / `PI_PROFILE` | omp only: if you run omp with a profile, set it here too so Tapocalypse reads that profile's MCP config |

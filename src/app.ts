@@ -2,6 +2,7 @@ import path from "node:path";
 import { type BatchSummary, getBatchMeta, summarizeBatch } from "./batches";
 import { config } from "./config";
 import { type Device, listDevices } from "./devices/devices";
+import { gateway, stopOnLeaseEnd } from "./devices/gateway";
 import * as leases from "./devices/leases";
 import {
   bootAndroid,
@@ -211,6 +212,7 @@ export function runScreenshots(run: Run): RunScreenshot[] {
 export function init(): void {
   initProjects();
   leases.restore();
+  stopOnLeaseEnd(leases.ends, gateway);
   leases.setNextResolver((serial) => scheduler.nextFor(serial));
   scheduler.restore();
   startIdleReaper();

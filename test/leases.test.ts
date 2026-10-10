@@ -5,7 +5,7 @@ import path from "node:path";
 import { z } from "zod";
 import { HttpError } from "../src/config";
 import { emulator } from "./support/scheduler-env";
-import { CLAIM_WINDOW_MS, grantAgent, LeaseStore, release, TTL, type LeaseEvent, type LeaseStoreDeps } from "../src/devices/leases";
+import { CLAIM_WINDOW_MS, grantAgent, leaseKey, LeaseStore, release, TTL, type LeaseEvent, type LeaseStoreDeps } from "../src/devices/leases";
 import { shutdownDevice } from "../src/devices/pool";
 
 /** The error a callback throws (the tests assert on its status/code/message). */
@@ -374,6 +374,95 @@ describe("persistence", () => {
     const partial = setup({ file: source.file });
     partial.store.restore();
     expect(partial.store.listLeases().map((l) => l.ref)).toEqual([lease.ref]);
+  });
+});
+
+describe("gated calls: touch, gated flag, device id, end keys", () => {
+  test("touch renews to now + ttl without changing the ttl, returns the lease with its device id, and marks it gated", () => {
+    const { store, grant, clock } = setup();
+    const lease = grant("emulator-5554", { ttlMinutes: 45 });
+    expect(store.listLeases()[0]).toMatchObject({ gated: false });
+    clock.t = T0 + 10 * MIN;
+    const touched = store.touch(lease.leaseId);
+    expect(touched).toMatchObject({ serial: "emulator-5554", mobileDeviceId: "Pixel_8", cwd: "/work/app", ttlMinutes: 45 });
+    expect(touched.renewedAt).toBe(new Date(T0 + 10 * MIN).toISOString());
+    expect(touched.expiresAt).toBe(new Date(T0 + 55 * MIN).toISOString());
+    expect(store.listLeases()[0]).toMatchObject({ gated: true });
+    expect(Object.keys(store.listLeases()[0]!)).not.toContain("mobileDeviceId");
+  });
+
+  test("the device id mobile tools use is the AVD name on emulators and the serial on simulators and devices", () => {
+    const { grant } = setup();
+    expect(grant("emulator-5554", { avdName: "Pixel_8" }).mobileDeviceId).toBe("Pixel_8");
+    expect(grant("0A1B2C3D-0000-1111-2222-333344445555", { platform: "ios", avdName: null }).mobileDeviceId).toBe("0A1B2C3D-0000-1111-2222-333344445555");
+    expect(grant("R5CT123ABC", { avdName: null }).mobileDeviceId).toBe("R5CT123ABC");
+  });
+
+  test("a lease that ended is rejected with its end reason, an unknown id with the plain not-found", () => {
+    const { store, grant } = setup();
+    const lease = grant();
+    store.release(lease.leaseId);
+    expect(thrown(() => store.touch(lease.leaseId))).toMatchObject({ status: 404, code: "lease_not_found", message: expect.stringContaining("released") });
+    expect(thrown(() => store.touch("not-a-lease-id-at-all"))).toMatchObject({ status: 404, code: "lease_not_found" });
+  });
+
+  test("a lease whose ttl ran out is rejected even before the sweep ends it", () => {
+    const { store, grant, clock } = setup();
+    const lease = grant("emulator-5554", { ttlMinutes: 5 });
+    clock.t = T0 + 6 * MIN;
+    expect(thrown(() => store.touch(lease.leaseId))).toMatchObject({ code: "lease_not_found" });
+  });
+
+  test("touching often keeps the lease alive but announces and saves only when something visible changed", () => {
+    const { store, grant, clock, events, file } = setup();
+    const lease = grant();
+    events.length = 0;
+    store.touch(lease.leaseId);
+    expect(events.map((e) => [e.change, e.lease?.gated])).toEqual([["renewed", true]]);
+    clock.t += 5_000;
+    store.touch(lease.leaseId);
+    store.touch(lease.leaseId);
+    expect(events).toHaveLength(1);
+    expect(store.touch(lease.leaseId).expiresAt).toBe(new Date(clock.t + 30 * MIN).toISOString());
+    clock.t += 30_000;
+    store.touch(lease.leaseId);
+    expect(events).toHaveLength(2);
+    expect(saved(file).leases[0]!.expiresAt).toBe(new Date(clock.t + 30 * MIN).toISOString());
+  });
+
+  test("gated and the device id survive a restart", () => {
+    const first = setup();
+    const lease = first.grant("emulator-5554");
+    first.store.touch(lease.leaseId);
+    const second = setup({ file: first.file });
+    second.store.restore();
+    expect(second.store.listLeases()[0]).toMatchObject({ gated: true });
+    expect(second.store.touch(lease.leaseId).mobileDeviceId).toBe("Pixel_8");
+  });
+
+  test("every way an agent lease ends announces its gateway key, which is the digest of the lease id and not the id", () => {
+    const { store, grant } = setup();
+    const keys: string[] = [];
+    store.ends.on("end", (key) => keys.push(key));
+    const a = grant("emulator-5554");
+    const b = grant("emulator-5556");
+    const c = grant("emulator-5558", { ttlMinutes: 5 });
+    store.release(a.leaseId);
+    store.revoke("emulator-5556", b.ref);
+    store.sweep([emulator("emulator-5558", { avdName: "Pixel_8" })], T0 + 10 * MIN);
+    expect(keys).toEqual([a, b, c].map((l) => leaseKey(l.leaseId)));
+    expect(keys.join()).not.toContain(a.leaseId);
+    expect(new Set(keys).size).toBe(3);
+    expect(keys[0]).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test("a run lease ending announces no gateway key", () => {
+    const { store } = setup();
+    const keys: string[] = [];
+    store.ends.on("end", (key) => keys.push(key));
+    store.grantRun("emulator-5554", { id: "r1", platform: "android" }, { avdName: "Pixel_8" });
+    store.releaseRun("r1");
+    expect(keys).toEqual([]);
   });
 });
 
