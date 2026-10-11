@@ -92,6 +92,11 @@ export function gateSchema(def: ToolDef): ToolDef {
   };
 }
 
+/** The tool as a QA run's agent sees it on `/mcp/runs/<id>`: `device` is gone and nothing replaces it, the run's own device is implied. */
+export function pinSchema(def: ToolDef): ToolDef {
+  return { ...def, inputSchema: withoutDevice(def.inputSchema) };
+}
+
 /** The only names the gateway serves: mobile-mcp's device tools. Anything else (a Tapocalypse tool name, a cloud tool) would collide with `/mcp`'s own tools or bypass the lease gate. */
 export const isGatedToolName = (name: string): boolean => name.startsWith("mobile_") && !DROPPED_TOOLS.has(name);
 
@@ -192,6 +197,7 @@ export class Gateway {
   /** Probe children that are starting; `stopAll` closes them. */
   private probeSpawns = new Set<Promise<GatewayClient>>();
   private probeFailedAt = Number.NEGATIVE_INFINITY;
+  private lastProbeError: string | null = null;
   private closing = false;
 
   constructor(private deps: GatewayDeps) {}
@@ -200,6 +206,18 @@ export class Gateway {
   status(): { tools: number; mobileMcpVersion: string | null } {
     const known = this.known();
     return { tools: known?.tools.length ?? 0, mobileMcpVersion: known?.mobileMcpVersion ?? null };
+  }
+
+  /** Why the device tools are unavailable: the last failed cold-start probe's reason; null while tools are known or no probe failed. */
+  probeError(): string | null {
+    return this.known() ? null : this.lastProbeError;
+  }
+
+  /** Forgets the in-memory tool set and any remembered probe failure, so the next `tools()` re-reads the cache file or probes again. */
+  reload(): void {
+    this.cache = null;
+    this.cacheLoaded = false;
+    this.probeFailedAt = 0;
   }
 
   private known(): ToolSet | null {
@@ -279,14 +297,19 @@ export class Gateway {
         work.catch(() => {});
         console.error("gateway: mobile-mcp did not list its tools in time");
         this.probeFailedAt = Date.now();
+        this.lastProbeError = "mobile-mcp did not list its tools in time";
         return [];
       }
       const tools = this.remember(result.version, result.tools);
-      if (tools.length === 0) this.probeFailedAt = Date.now();
+      if (tools.length === 0) {
+        this.probeFailedAt = Date.now();
+        this.lastProbeError = "mobile-mcp listed no tools the gateway can serve";
+      }
       return tools;
     } catch (e) {
       if (!this.closing) console.error("gateway: could not list mobile-mcp tools:", messageOf(e));
       this.probeFailedAt = Date.now();
+      this.lastProbeError = `could not list mobile-mcp tools: ${messageOf(e)}`;
       return [];
     } finally {
       this.probeSpawns.delete(spawned);

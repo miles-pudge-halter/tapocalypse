@@ -566,7 +566,7 @@ class Feed {
       case "claude": {
         const [name, input] =
           call.kind === "mcp"
-            ? [`mcp__mobile-mcp__${call.name}`, call.args]
+            ? [`mcp__tpc__${call.name}`, call.args]
             : call.kind === "bash"
               ? ["Bash", { command: call.command }]
               : ["Write", { file_path: call.path, content: "(report)" }];
@@ -581,7 +581,7 @@ class Feed {
       case "codex": {
         const item =
           call.kind === "mcp"
-            ? { id, type: "mcp_tool_call", server: "mobile-mcp", tool: call.name, arguments: call.args }
+            ? { id, type: "mcp_tool_call", server: "tpc", tool: call.name, arguments: call.args }
             : call.kind === "bash"
               ? { id, type: "command_execution", command: call.command, aggregated_output: "", exit_code: null }
               : { id, type: "file_change", changes: [{ path: call.path, kind: "add" }] };

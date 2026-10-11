@@ -1,9 +1,9 @@
 /** One `codex exec --json` process: argv/config building, stdout JSONL → normalized events, prompt via stdin, escalating abort. */
-import { chmodSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import type { RunUsage } from "../../runs/types";
 import { failedSession } from "../failed";
+import { STDIO_BRIDGE, writeBridgeCredentials } from "../bridge";
 import type { HarnessExit, HarnessSession, McpServerSpec, SessionInfo, SpawnOptions } from "../types";
 import { CodexTranslator, codexToolName } from "./events";
 
@@ -69,19 +69,7 @@ function tomlInlineTable(entries: Record<string, string>): string {
 
 // ---- argv -----------------------------------------------------------------------------------------------------------
 
-/** Codex versions differ on HTTP MCP servers (`url` is newer, some need an experimental flag), and every one speaks stdio, so http servers go through this bridge. */
-const STDIO_BRIDGE = path.resolve(import.meta.dir, "../../mcp/stdio-bridge.ts");
-
-/** Writes `<runDir>/<name>-mcp.json` (`{url, token}`, owner-only) for the stdio bridge and returns its path. The token never reaches argv or env. */
-function writeBridgeCredentials(runDir: string, spec: Extract<McpServerSpec, { transport: "http" }>): string {
-  const authorization = Object.entries(spec.headers).find(([name]) => name.toLowerCase() === "authorization")?.[1];
-  const token = authorization === undefined ? undefined : /^Bearer\s+(.+)$/i.exec(authorization)?.[1];
-  if (token === undefined) throw new Error(`MCP server ${spec.name} needs an "Authorization: Bearer <token>" header`);
-  const file = path.join(runDir, `${spec.name}-mcp.json`);
-  writeFileSync(file, JSON.stringify({ url: spec.url, token }), { mode: 0o600 });
-  chmodSync(file, 0o600);
-  return file;
-}
+// Codex versions differ on HTTP MCP servers (`url` is newer, some need an experimental flag), and every one speaks stdio, so http servers go through the stdio bridge.
 
 /** `-c mcp_servers.<name>.…` pairs for one server. */
 function mcpServerConfig(spec: McpServerSpec, runDir: string): string[] {

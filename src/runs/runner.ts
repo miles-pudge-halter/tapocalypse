@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { config, HttpError, MAX_STEER_CHARS, XCRUN_BIN } from "../config";
 import { adb, appVersion, type Device, exec, listDevices, mobileMcpDeviceId } from "../devices/devices";
+import { type Gateway, gateway as defaultGateway } from "../devices/gateway";
 import { bootAndroid, bootIos } from "../devices/pool";
 import { getHarness as registryHarness, harnessBin } from "../harness";
 import {
@@ -11,8 +12,6 @@ import {
   type HarnessExit,
   type HarnessId,
   type HarnessSession,
-  MOBILE_MCP_PACKAGE,
-  MOBILE_MCP_SERVER,
   type McpServerSpec,
   PROGRESS_SERVER,
   type ProgressSink,
@@ -35,7 +34,7 @@ export interface Runner {
   /** Synchronously SIGTERMs (then SIGKILLs) every live agent process; used on server shutdown. */
   killAll(): void;
   /** Bearer token and progress sink of a live run's `POST /mcp/runs/<id>` endpoint; null once the run is over or unknown. */
-  progressLookup(runId: string): { token: string; sink: ProgressSink } | null;
+  progressLookup(runId: string): { token: string; sink: ProgressSink; nativeProgress: boolean } | null;
 }
 
 /** The scheduler surface the runner uses. */
@@ -45,6 +44,8 @@ export type RunnerScheduler = Pick<Scheduler, "activity" | "update" | "release" 
 export interface RunnerDeps {
   getHarness?: (id: HarnessId) => Harness;
   listDevices?: () => Promise<Device[]>;
+  /** The device gateway whose tool list the runner checks before prompting. */
+  gateway?: Pick<Gateway, "tools" | "probeError">;
 }
 
 interface RunContext {
@@ -109,6 +110,7 @@ function formatVersion(v: { versionName: string | null; versionCode: string | nu
 
 export function createRunner(scheduler: RunnerScheduler, deps: RunnerDeps = {}): Runner {
   const harnessFor = deps.getHarness ?? registryHarness;
+  const gateway = deps.gateway ?? defaultGateway;
   const contexts = new Map<string, RunContext>();
   let shuttingDown = false;
 
@@ -247,7 +249,7 @@ export function createRunner(scheduler: RunnerScheduler, deps: RunnerDeps = {}):
   function onRaw(ctx: RunContext, frame: object): void {
     const { run } = ctx;
     const seq = appendEvent(run.id, frame);
-    const activity = ctx.harness.toActivity(frame, { seq, starts: ctx.starts });
+    const activity = ctx.harness.toActivity(frame, { seq, gated: run.gated, starts: ctx.starts });
     if (activity) scheduler.activity(run.id, activity);
   }
 
@@ -432,19 +434,16 @@ export function createRunner(scheduler: RunnerScheduler, deps: RunnerDeps = {}):
     return { model, effort };
   }
 
-  /** Device driver and progress servers mounted for this session only. */
+  /** The one server mounted for this session: the run endpoint, which serves the progress tools and the device tools pinned to the run's device. */
   function buildMcpServers(ctx: RunContext, token: string): McpServerSpec[] {
-    const { run, harness } = ctx;
-    const servers: McpServerSpec[] = [{ name: MOBILE_MCP_SERVER, transport: "stdio", command: "npx", args: ["-y", `${MOBILE_MCP_PACKAGE}@latest`] }];
-    if (!harness.capabilities.nativeProgressTools) {
-      servers.push({
+    return [
+      {
         name: PROGRESS_SERVER,
         transport: "http",
-        url: `http://127.0.0.1:${config.port}/mcp/runs/${run.id}`,
+        url: `http://127.0.0.1:${config.port}/mcp/runs/${ctx.run.id}`,
         headers: { Authorization: `Bearer ${token}` },
-      });
-    }
-    return servers;
+      },
+    ];
   }
 
   async function execute(ctx: RunContext, target: StartTarget): Promise<void> {
@@ -465,6 +464,12 @@ export function createRunner(scheduler: RunnerScheduler, deps: RunnerDeps = {}):
     const personaFile = path.join(dir, "persona.md");
     writeFileSync(personaFile, persona.body);
 
+    // The device tools must be ready before the agent starts, not only before the prompt: an agent's first tools/list on the run
+    // endpoint is answered from the gateway's cache, and omp drops an MCP server whose first listing takes a few seconds (a cold
+    // mobile-mcp probe) without retrying in that session. An empty list (probe failed, npx offline) would pay for a run that cannot
+    // drive the device: fail it as retriable infra before anything is spawned.
+    const deviceTools = await gateway.tools();
+
     if (ctx.cancelRequested) {
       finalize(ctx, failure("cancelled", "cancelled"));
       return;
@@ -474,8 +479,13 @@ export function createRunner(scheduler: RunnerScheduler, deps: RunnerDeps = {}):
       finalize(ctx, failure("shutting down"));
       return;
     }
+    if (deviceTools.length === 0) {
+      finalize(ctx, failure(`device tools unavailable: ${gateway.probeError() ?? "the gateway serves none"}`));
+      return;
+    }
 
     run.status = "running";
+    run.gated = true;
     run.startedAt = new Date().toISOString();
     scheduler.update(run);
 
@@ -509,14 +519,11 @@ export function createRunner(scheduler: RunnerScheduler, deps: RunnerDeps = {}):
     const info = await session.ready();
     if (info.model) run.model = info.model;
     scheduler.update(run);
-    const required = [MOBILE_MCP_SERVER, ...(harness.capabilities.nativeProgressTools ? [] : [PROGRESS_SERVER])];
-    for (const name of required) {
-      const server = info.mcp.find((m) => m.name === name);
-      if (!server?.ok) {
-        finalize(ctx, failure(`MCP server ${name} failed: ${server?.error ?? "it was not mounted by the agent"}`));
-        session.kill();
-        return;
-      }
+    const server = info.mcp.find((m) => m.name === PROGRESS_SERVER);
+    if (!server?.ok) {
+      finalize(ctx, failure(`MCP server ${PROGRESS_SERVER} failed: ${server?.error ?? "it was not mounted by the agent"}`));
+      session.kill();
+      return;
     }
     // The detached `gh pr view` may still be running; give it a bounded chance so the prompt carries the PR.
     if (!ctx.cancelRequested && !shuttingDown) {
@@ -630,10 +637,10 @@ export function createRunner(scheduler: RunnerScheduler, deps: RunnerDeps = {}):
     for (const ctx of contexts.values()) ctx.session?.kill();
   }
 
-  function progressLookup(runId: string): { token: string; sink: ProgressSink } | null {
+  function progressLookup(runId: string): { token: string; sink: ProgressSink; nativeProgress: boolean } | null {
     const ctx = contexts.get(runId);
     if (!ctx || ctx.finalized || ctx.token === null) return null;
-    return { token: ctx.token, sink: ctx.recorder };
+    return { token: ctx.token, sink: ctx.recorder, nativeProgress: ctx.harness.capabilities.nativeProgressTools };
   }
 
   return { startRun, cancelActive, steerRun, isLive: (id) => contexts.get(id)?.session != null, killAll, progressLookup };

@@ -9,14 +9,13 @@ import {
   type HarnessEvent,
   type HarnessExit,
   type HarnessSession,
-  MOBILE_MCP_SERVER,
   PROGRESS_SERVER,
   type SessionInfo,
   type SpawnOptions,
 } from "../types";
 import { PROGRESS_TOOL_NAMES, PROGRESS_TOOLS, type ProgressToolName } from "../../runs/progress";
 import { resolveCall, resultText, serverOf, toActivity } from "./activity";
-import { type LaunchPlan, mcpLaunchArgs, missingToolsMessage, resolveToolPrefixes, type ToolPrefixes } from "./provision";
+import { type LaunchPlan, missingToolsMessage, PLUGIN_TOOL_PREFIX, resolveToolPrefixes, type ToolPrefixes, writePlugin } from "./provision";
 import { type Frame, OmpRpc } from "./rpc";
 import { normalizeUsage, UsageAccumulator } from "./usage";
 
@@ -73,7 +72,7 @@ class OmpSession implements HarnessSession {
 
   private async start(): Promise<OmpRpc> {
     const { opts } = this;
-    const launch = await mcpLaunchArgs({ repoPath: opts.cwd });
+    const launch = writePlugin(opts.runDir, opts.mcpServers);
     if (this.killed) throw new Error("killed before omp started");
     this.launch = launch;
     const sessionDir = path.join(opts.runDir, "session");
@@ -185,21 +184,21 @@ class OmpSession implements HarnessSession {
     const launch = this.launch!;
     await rpc.ready();
     // MCP servers connect in the background; prompting before they are up makes the agent fail with "No such tool".
-    this.prefixes = await resolveToolPrefixes(rpc, { expectedMobileMcp: launch.expectedMobileMcp });
-    const prefix = this.prefixes.mobileMcp;
-    const mcp: SessionInfo["mcp"] = [
-      prefix ? { name: MOBILE_MCP_SERVER, ok: true } : { name: MOBILE_MCP_SERVER, ok: false, error: missingToolsMessage(launch) },
-    ];
+    const state = await resolveToolPrefixes(rpc);
+    this.prefixes = { mobileMcp: state.mobileMcp };
+    const prefix = state.mobileMcp;
+    const mcp: SessionInfo["mcp"] = [prefix ? { name: PROGRESS_SERVER, ok: true } : { name: PROGRESS_SERVER, ok: false, error: missingToolsMessage(launch, state.routesOmitted) }];
     if (prefix) {
-      this.emit({ type: "notice", level: "info", text: `mobile-mcp tools: ${prefix}*${launch.pluginDir ? " (provisioned by Tapocalypse)" : ""}` });
+      this.emit({ type: "notice", level: "info", text: `device tools: ${prefix}*` });
       await rpc.send({ type: "set_host_tools", tools: PROGRESS_TOOLS });
     }
     return { sessionId: null, model: this.model, mcp };
   }
 
   toolName(server: string, tool: string): string {
-    if (server === PROGRESS_SERVER) return tool;
-    return `${this.prefixes.mobileMcp ?? "mcp__mobile_mcp_"}${tool}`;
+    // `qa_*` are omp host tools (bare names); everything else on `tpc` is a gateway device tool behind the stdio bridge.
+    if (PROGRESS_TOOL_NAMES.includes(tool as ProgressToolName)) return tool;
+    return `${this.prefixes.mobileMcp ?? PLUGIN_TOOL_PREFIX}${tool}`;
   }
 
   async send(prompt: string): Promise<void> {

@@ -4,8 +4,16 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
+import { Gateway } from "../src/devices/gateway";
 import type { ProgressSink } from "../src/harness/types";
-import { handleRunMcp } from "../src/mcp/run-server";
+import { handleRunMcp, type RunGatewayDeps } from "../src/mcp/run-server";
+
+// This file is about the bridge transport, not device tools: the upstream endpoint gets a gateway that offers none.
+const NO_DEVICES: RunGatewayDeps = {
+  gateway: new Gateway({ cacheFile: null, spawnClient: async () => { throw new Error("no child"); } }),
+  deviceOf: () => null,
+  cwdOf: () => tmpdir(),
+};
 
 const BRIDGE = path.resolve(import.meta.dir, "../src/mcp/stdio-bridge.ts");
 const RUN_ID = "bridge-run";
@@ -31,7 +39,7 @@ function startUpstream() {
     fetch: (req) => {
       const m = /^\/mcp\/runs\/([^/]+)$/.exec(new URL(req.url).pathname);
       if (!m || req.method !== "POST") return new Response("not found", { status: 404 });
-      return handleRunMcp(req, m[1]!, (id) => (id === RUN_ID ? { token: TOKEN, sink } : null));
+      return handleRunMcp(req, m[1]!, (id) => (id === RUN_ID ? { token: TOKEN, sink } : null), NO_DEVICES);
     },
   });
   cleanups.push(() => server.stop(true));

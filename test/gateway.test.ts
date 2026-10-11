@@ -581,6 +581,33 @@ describe("Gateway.tools", () => {
     expect(await gw.tools()).toEqual([]);
   });
 
+  test("probeError says why a failed or timed-out probe left no tools, and clears once tools are known", async () => {
+    let attempts = 0;
+    const gw = new Gateway({
+      probeTimeoutMs: 20,
+      probeRetryMs: 0,
+      spawnClient: async (cwd) => {
+        attempts++;
+        if (attempts === 1) throw new Error("no npx");
+        if (attempts === 2) {
+          return new (class extends FakeClient {
+            override async listTools(): Promise<ToolDef[]> {
+              return Promise.withResolvers<ToolDef[]>().promise;
+            }
+          })(cwd);
+        }
+        return new FakeClient(cwd);
+      },
+    });
+    expect(gw.probeError()).toBeNull();
+    expect(await gw.tools()).toEqual([]);
+    expect(gw.probeError()).toContain("no npx");
+    expect(await gw.tools()).toEqual([]);
+    expect(gw.probeError()).toContain("in time");
+    expect(await gw.tools()).toHaveLength(2);
+    expect(gw.probeError()).toBeNull();
+  });
+
   test("a child started for a call with another mobile-mcp version replaces the cached tool list", async () => {
     const file = cacheFile();
     writeFileSync(file, JSON.stringify({ version: 1, mobileMcpVersion: "1.0.8", tools: [tap] }));

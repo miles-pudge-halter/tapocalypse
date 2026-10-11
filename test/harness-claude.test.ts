@@ -624,8 +624,8 @@ describe("claude ready", () => {
 const BASE_TS = Date.parse("2026-10-09T10:00:00.000Z");
 
 /** Replays frames the way `store.readActivity` does: one shared ReplayContext, seq = line index, `_ts` stamped by the runner. */
-function replay(frames: Record<string, unknown>[]): (Activity | null)[] {
-  const ctx: ReplayContext = { seq: 0, starts: new Map() };
+function replay(frames: Record<string, unknown>[], gated = true): (Activity | null)[] {
+  const ctx: ReplayContext = { seq: 0, gated, starts: new Map() };
   return frames.map((f, i) => {
     ctx.seq = i;
     return createClaudeHarness().toActivity({ ...f, _ts: new Date(BASE_TS + i * 1000).toISOString() }, ctx);
@@ -686,8 +686,8 @@ describe("claude canonical tool names", () => {
       toolUse("t5", "WebSearch", { query: "flutter semantics" }),
       toolUse("t6", "Bash", { command: "adb devices", timeout: 5000 }),
       toolUse("t7", "Glob", { pattern: "**/*.md" }),
-      toolUse("t8", "mcp__mobile-mcp__mobile_list_apps", { device: "x" }),
-      toolUse("t9", "mcp__plugin_tpc_mobile-mcp__mobile_click", { x: 1 }),
+      toolUse("t8", "mcp__tpc__mobile_list_apps", { device: "x" }),
+      toolUse("t9", "mcp__plugin_tpc_tpc__mobile_click", { x: 1 }),
       toolUse("t10", "mcp__tpc__qa_check", { id: "C1", status: "pass" }),
       resultFrame({}),
     ]);
@@ -712,11 +712,33 @@ describe("claude toActivity details", () => {
     message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, is_error: isError, content }] },
   });
 
-  test("the user's own Tapocalypse MCP is flagged as a violation, device tools are plain tool lines", () => {
-    const frames = [toolUse("a", "mcp__tapocalypse__qa_start_run", {}), toolUse("b", "mcp__mobile_mcp__mobile_click", {})];
+  test("the user's own Tapocalypse MCP is flagged as a violation; gateway device tools are plain tool lines", () => {
+    const frames = [toolUse("a", "mcp__tapocalypse__qa_start_run", {}), toolUse("b", "mcp__tpc__mobile_click", {})];
     expect(replay(frames).map((x) => x && [x.kind, x.text])).toEqual([
       ["warn", "backend violation: mcp__tapocalypse_qa_start_run"],
       ["tool", "mcp__mobile_mcp_mobile_click {}"],
+    ]);
+  });
+
+  test("on a gated run a mobile-mcp the agent mounted itself keeps its raw name and is flagged", () => {
+    const frames = [toolUse("a", "mcp__mobile_mcp__mobile_click", {}), toolUse("b", "mcp__mobile-mcp__mobile_list_apps", {})];
+    expect(replay(frames).map((x) => x && [x.kind, x.text])).toEqual([
+      ["warn", "backend violation: mcp__mobile_mcp__mobile_click"],
+      ["warn", "backend violation: mcp__mobile-mcp__mobile_list_apps"],
+    ]);
+  });
+
+  test("a run from before the gateway replays its own mobile-mcp calls as plain tool lines under the canonical name", () => {
+    const frames = [toolUse("a", "mcp__mobile_mcp__mobile_click", { x: 1 }), toolUse("b", "mcp__tapocalypse__qa_start_run", {})];
+    expect(replay(frames, false).map((x) => x && [x.kind, x.text])).toEqual([
+      ["tool", 'mcp__mobile_mcp_mobile_click {"x":1}'],
+      ["warn", "backend violation: mcp__tapocalypse_qa_start_run"],
+    ]);
+  });
+
+  test("a plugin-namespaced Tapocalypse MCP is flagged like the plain one", () => {
+    expect(replay([toolUse("a", "mcp__plugin_x_tapocalypse__qa_start_run", {})]).map((x) => x && [x.kind, x.text])).toEqual([
+      ["warn", "backend violation: mcp__tapocalypse_qa_start_run"],
     ]);
   });
 
@@ -759,7 +781,7 @@ describe("claude toActivity details", () => {
   test("raw non-JSON lines, control frames and garbage are ignored", () => {
     const a = replay([{ type: "_raw", line: "oops" }, { type: "stream_event" }, { type: "system", subtype: "status" }, {}]);
     expect(a).toEqual([null, null, null, null]);
-    expect(createClaudeHarness().toActivity("nope", { seq: 0, starts: new Map() })).toBeNull();
+    expect(createClaudeHarness().toActivity("nope", { seq: 0, gated: true, starts: new Map() })).toBeNull();
   });
 });
 

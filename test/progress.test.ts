@@ -4,7 +4,9 @@ import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import type { ProgressSink } from "../src/harness/types";
-import { handleRunMcp } from "../src/mcp/run-server";
+import { Gateway, type GatewayClient, stopOnLeaseEnd, type ToolDef, type ToolResult } from "../src/devices/gateway";
+import { LeaseStore } from "../src/devices/leases";
+import { handleRunMcp, type RunGatewayDeps, type RunLookup } from "../src/mcp/run-server";
 import { PROGRESS_TOOLS, type ProgressRecorderOptions, type ProgressRun, ProgressRecorder, QaCheckArgs, QaFinishArgs, QaPlanArgs } from "../src/runs/progress";
 import type { CheckStatus } from "../src/runs/types";
 
@@ -240,9 +242,9 @@ function rpc(body: unknown, token: string | null = TOKEN): Request {
 
 const ToolResult = z.object({ isError: z.boolean().optional(), content: z.array(z.object({ text: z.string() })) });
 const ToolsList = z.object({
-  tools: z.array(z.object({ name: z.string(), inputSchema: z.object({ required: z.array(z.string()).optional() }) })),
+  tools: z.array(z.object({ name: z.string(), inputSchema: z.object({ required: z.array(z.string()).optional(), properties: z.record(z.string(), z.unknown()).optional() }) })),
 });
-const Init = z.object({ serverInfo: z.object({ name: z.string() }) });
+const Init = z.object({ serverInfo: z.object({ name: z.string() }), capabilities: z.record(z.string(), z.unknown()) });
 const rpcResult = async <S extends z.ZodType>(res: Response, schema: S): Promise<z.infer<S>> =>
   schema.parse(z.object({ result: z.unknown() }).parse(await res.json()).result);
 
@@ -281,7 +283,9 @@ describe("handleRunMcp", () => {
     expect(init.status).toBe(200);
     expect((await rpcResult(init, Init)).serverInfo.name).toBe("tpc");
 
-    const list = await handleRunMcp(rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" }), "run-1", lookup);
+    // A gateway with nothing to offer: this test is about the qa_* protocol, not the device tools.
+    const noDevices: RunGatewayDeps = { gateway: new Gateway({ cacheFile: null, spawnClient: async () => { throw new Error("no child"); } }), deviceOf: () => null, cwdOf: () => os.tmpdir() };
+    const list = await handleRunMcp(rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" }), "run-1", lookup, noDevices);
     const { tools } = await rpcResult(list, ToolsList);
     expect(tools.map((t) => t.name).sort()).toEqual(["qa_check", "qa_finish", "qa_plan"]);
     expect(tools.find((t) => t.name === "qa_finish")!.inputSchema.required).toEqual(["verdict", "summary"]);
@@ -320,6 +324,148 @@ describe("handleRunMcp", () => {
     expect(dup.isError).toBe(true);
     expect(dup.content[0]!.text).toBe("qa_finish already recorded");
     expect(run.checks).toEqual([]);
+  });
+});
+
+const SHOT_TOOL: ToolDef = {
+  name: "mobile_take_screenshot",
+  description: "Take a screenshot",
+  inputSchema: { type: "object", properties: { device: { type: "string" } }, required: ["device"] },
+};
+const TAP_TOOL: ToolDef = {
+  name: "mobile_click_on_screen_at_coordinates",
+  description: "Click",
+  inputSchema: { type: "object", properties: { device: { type: "string" }, x: { type: "number" }, y: { type: "number" } }, required: ["device", "x", "y"] },
+};
+
+class FakeChild implements GatewayClient {
+  readonly calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+  closed = false;
+  private exit = Promise.withResolvers<void>();
+  readonly exited = this.exit.promise;
+  constructor(readonly cwd: string) {}
+  async listTools(): Promise<ToolDef[]> {
+    return [SHOT_TOOL, TAP_TOOL];
+  }
+  async callTool(name: string, args: Record<string, unknown>): Promise<ToolResult> {
+    this.calls.push({ name, args });
+    return { content: [{ type: "text", text: `did ${name}` }] };
+  }
+  async close(): Promise<void> {
+    this.closed = true;
+    this.exit.resolve();
+  }
+}
+
+describe("handleRunMcp device tools", () => {
+  function gatewayFixture(device: string | null = "Pixel_8") {
+    const children: FakeChild[] = [];
+    // Memory-only cache: the data dir is shared across test files and api.test.ts plants its own gateway-tools.json there.
+    const gateway = new Gateway({
+      cacheFile: null,
+      spawnClient: async (cwd) => {
+        const child = new FakeChild(cwd);
+        children.push(child);
+        return child;
+      },
+    });
+    const deps = { gateway, deviceOf: (id: string) => (id === "run-1" ? device : null), cwdOf: () => os.tmpdir() };
+    return { gateway, children, deps };
+  }
+  const listTools = async (lookup: RunLookup, deps: RunGatewayDeps) => {
+    const res = await handleRunMcp(rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" }), "run-1", lookup, deps);
+    return rpcResult(res, ToolsList);
+  };
+  const callTool = async (lookup: RunLookup, deps: RunGatewayDeps, name: string, args: unknown) => {
+    const res = await handleRunMcp(rpc({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name, arguments: args } }), "run-1", lookup, deps);
+    return rpcResult(res, ToolResult);
+  };
+
+  test("lists the device tools next to qa_*, without a device or leaseId argument", async () => {
+    const { gateway, deps } = gatewayFixture();
+    const { tools } = await listTools(lookupFor(fixture().recorder), deps);
+    expect(tools.map((t) => t.name).sort()).toEqual(["mobile_click_on_screen_at_coordinates", "mobile_take_screenshot", "qa_check", "qa_finish", "qa_plan"]);
+    const tap = tools.find((t) => t.name === "mobile_click_on_screen_at_coordinates")!;
+    expect(tap.inputSchema.required).toEqual(["x", "y"]);
+    expect(Object.keys(tap.inputSchema.properties ?? {})).toEqual(["x", "y"]);
+    await gateway.stopAll();
+  });
+
+  test("initialize advertises the tools capability even for a native-progress harness, so a client lists tools instead of assuming none", async () => {
+    // The stdio bridge (and any SDK client) skips tools/list when initialize says the server has no tools; omp then drops the server.
+    const { gateway, deps } = gatewayFixture();
+    const lookup = (id: string) => (id === "run-1" ? { token: TOKEN, sink: fixture().recorder, nativeProgress: true } : null);
+    const res = await handleRunMcp(rpc(INIT), "run-1", lookup, deps);
+    const init = await rpcResult(res, Init);
+    expect(init.capabilities).toMatchObject({ tools: {} });
+    await gateway.stopAll();
+  });
+
+  test("a harness with native progress tools gets the device tools only", async () => {
+    const { gateway, deps } = gatewayFixture();
+    const lookup = (id: string) => (id === "run-1" ? { token: TOKEN, sink: fixture().recorder, nativeProgress: true } : null);
+    const { tools } = await listTools(lookup, deps);
+    expect(tools.map((t) => t.name).sort()).toEqual(["mobile_click_on_screen_at_coordinates", "mobile_take_screenshot"]);
+    await gateway.stopAll();
+  });
+
+  test("a call runs on the run's own device whatever the agent passes, in one child per run that survives between calls", async () => {
+    const { gateway, children, deps } = gatewayFixture("Pixel_8");
+    const lookup = lookupFor(fixture().recorder);
+    const first = await callTool(lookup, deps, "mobile_click_on_screen_at_coordinates", { x: 1, y: 2, device: "someone-elses", leaseId: "x" });
+    expect(first).toEqual({ content: [{ text: "did mobile_click_on_screen_at_coordinates" }] });
+    await callTool(lookup, deps, "mobile_take_screenshot", {});
+    const worker = children.filter((c) => c.calls.length > 0);
+    expect(worker).toHaveLength(1);
+    expect(worker[0]!.cwd).toBe(os.tmpdir());
+    expect(worker[0]!.calls).toEqual([
+      { name: "mobile_click_on_screen_at_coordinates", args: { x: 1, y: 2, device: "Pixel_8" } },
+      { name: "mobile_take_screenshot", args: { device: "Pixel_8" } },
+    ]);
+    // the run lease ending stops the run's child through the key the lease store announces
+    await gateway.stop("run-1");
+    expect(worker[0]!.closed).toBe(true);
+    await gateway.stopAll();
+  });
+
+  test("a run whose device lease is gone gets an error and nothing is sent to a child", async () => {
+    const { gateway, children, deps } = gatewayFixture(null);
+    const result = await callTool(lookupFor(fixture().recorder), deps, "mobile_take_screenshot", {});
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toContain("device");
+    expect(children.every((c) => c.calls.length === 0)).toBe(true);
+    await gateway.stopAll();
+  });
+
+  test("the run's child is stopped when its run lease ends, and the run's tools then refuse", async () => {
+    const { gateway, children } = gatewayFixture();
+    const store = new LeaseStore({ now: () => Date.parse("2026-01-01T12:00:00.000Z") });
+    stopOnLeaseEnd(store.ends, gateway);
+    store.grantRun("emulator-5554", { id: "run-1", platform: "android" }, { avdName: "Pixel_8" });
+    const deps: RunGatewayDeps = { gateway, deviceOf: (id) => store.runLease(id)?.mobileDeviceId ?? null, cwdOf: () => os.tmpdir() };
+    const lookup = lookupFor(fixture().recorder);
+
+    expect((await callTool(lookup, deps, "mobile_take_screenshot", {})).isError).toBeUndefined();
+    const worker = children.find((c) => c.calls.length > 0)!;
+    expect(worker.calls[0]!.args).toEqual({ device: "Pixel_8" });
+    expect(worker.closed).toBe(false);
+
+    store.releaseRun("run-1");
+    await Bun.sleep(5);
+    expect(worker.closed).toBe(true);
+    const after = await callTool(lookup, deps, "mobile_take_screenshot", {});
+    expect(after.isError).toBe(true);
+    expect(worker.calls).toHaveLength(1);
+    await gateway.stopAll();
+  });
+
+  test("qa_* keep working when the device tools are listed", async () => {
+    const { run, recorder } = fixture();
+    const { gateway, deps } = gatewayFixture();
+    const result = await callTool(lookupFor(recorder), deps, "qa_plan", { checks: [{ id: "C1", title: "Login" }] });
+    expect(result.content[0]!.text).toBe("recorded");
+    expect(run.checks.map((c) => c.id)).toEqual(["C1"]);
+    await gateway.stopAll();
   });
 });
 

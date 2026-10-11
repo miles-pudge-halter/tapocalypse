@@ -9,8 +9,8 @@ import type { Activity } from "../src/runs/types";
 type ToolStarts = ReplayContext["starts"];
 
 /** One frame through the omp adapter's replay mapping; pass the same `starts` across a session. */
-function frameToActivity(frame: unknown, seq: number, starts: ToolStarts = new Map()): Activity | null {
-  return harness.toActivity(frame, { seq, starts });
+function frameToActivity(frame: unknown, seq: number, starts: ToolStarts = new Map(), gated = true): Activity | null {
+  return harness.toActivity(frame, { seq, gated, starts });
 }
 
 function parseChunks(data: Uint8Array, size: number): Frame[] {
@@ -96,18 +96,31 @@ describe("frameToActivity on the captured session", () => {
 describe("frameToActivity backend rules", () => {
   const start = (toolName: string): Frame => ({ type: "tool_execution_start", toolName, args: {} });
 
-  test("mobile-mcp tools are plain tool lines", () => {
-    expect(frameToActivity(start("mcp__mobile_mcp_mobile_click"), 0)?.kind).toBe("tool");
+  test("the bridge's device tools (mcp__tpc_qa_*) show under the canonical name and are plain tool lines", () => {
+    expect(frameToActivity(start("mcp__tpc_qa_mobile_click"), 0)).toMatchObject({ kind: "tool", tool: "mcp__mobile_mcp_mobile_click" });
   });
 
-  test("Tapocalypse's plugin-namespaced mobile-mcp tools show under the canonical name", () => {
+  test("runs recorded with Tapocalypse's old plugin-namespaced mobile-mcp tools replay under the canonical name", () => {
     const namespaced = "mcp__tpc_mobile_mcp_mobile_click_on_screen_at_coordinates";
     const canonical = "mcp__mobile_mcp_mobile_click_on_screen_at_coordinates";
     expect(frameToActivity(start(namespaced), 0)).toMatchObject({ kind: "tool", tool: canonical });
   });
 
-  test("a user-configured server under another name still canonicalizes to its device server", () => {
-    expect(frameToActivity(start("mcp__my_phone_mobile_mcp_mobile_click"), 0)).toMatchObject({ tool: "mcp__mobile_mcp_mobile_click" });
+  test("on a gated run a mobile-mcp the agent mounted itself keeps its raw name and is a backend violation", () => {
+    expect(frameToActivity(start("mcp__mobile_mcp_mobile_click"), 0)).toMatchObject({
+      kind: "warn",
+      text: "backend violation: mcp__mobile_mcp_mobile_click",
+    });
+  });
+
+  test("a run from before the gateway replays its own mobile-mcp calls as plain tool lines", () => {
+    expect(frameToActivity(start("mcp__mobile_mcp_mobile_click"), 0, new Map(), false)).toMatchObject({
+      kind: "tool",
+      tool: "mcp__mobile_mcp_mobile_click",
+    });
+    const xd: Frame = { type: "tool_execution_start", toolName: "write", args: { path: "xd://mcp__mobile_mcp_mobile_click", content: "{}" } };
+    expect(frameToActivity(xd, 0, new Map(), false)).toMatchObject({ kind: "tool", tool: "mcp__mobile_mcp_mobile_click" });
+    expect(frameToActivity(start("mcp__tapocalypse_qa_start_run"), 0, new Map(), false)).toMatchObject({ kind: "warn" });
   });
 
   test("tapocalypse MCP tools are violations", () => {
@@ -127,7 +140,7 @@ describe("frameToActivity backend rules", () => {
       toolName,
       args: { path, content: '{"device":"emulator-5556"}' },
     });
-    expect(frameToActivity(xd("write", "xd://mcp__mobile_mcp_mobile_click_on_screen_at_coordinates"), 0)).toMatchObject({
+    expect(frameToActivity(xd("write", "xd://mcp__tpc_qa_mobile_click_on_screen_at_coordinates"), 0)).toMatchObject({
       kind: "tool",
       tool: "mcp__mobile_mcp_mobile_click_on_screen_at_coordinates",
     });
@@ -136,7 +149,7 @@ describe("frameToActivity backend rules", () => {
       text: "backend violation: mcp__tapocalypse_qa_start_run",
     });
     // Reading a device's docs is not a call.
-    expect(frameToActivity(xd("read", "xd://mcp__mobile_mcp_mobile_click_on_screen_at_coordinates"), 0)?.kind).toBe("tool");
+    expect(frameToActivity(xd("read", "xd://mcp__tpc_qa_mobile_click_on_screen_at_coordinates"), 0)?.kind).toBe("tool");
   });
 });
 

@@ -6,6 +6,7 @@ import { z } from "zod";
 import { fetchHandler } from "../src/api";
 import { scheduler } from "../src/app";
 import { config, DATA_DIR, MAX_STEER_CHARS } from "../src/config";
+import { gateway } from "../src/devices/gateway";
 import { deviceOwner, grantAgent, grantRun, releaseRun, revoke } from "../src/devices/leases";
 import { HARNESS_IDS } from "../src/harness/types";
 import { getProject } from "../src/projects/registry";
@@ -437,6 +438,8 @@ describe("run-management MCP artefact tools", () => {
   });
 
   test("a poisoned gateway tool cache takes none of the Tapocalypse tools down and keeps the hints of the gated ones", async () => {
+    // Other test files share this process's gateway and may have read (or failed to probe) before our file was planted.
+    gateway.reload();
     const list = await rpc("tools/list");
     const names = list.tools!.map((t) => t.name);
     expect(names).toEqual(expect.arrayContaining(["qa_doctor", "qa_get_run", "device_acquire", "mobile_peek"]));
@@ -571,29 +574,30 @@ describe("run-scoped MCP endpoint", () => {
   });
 });
 
-describe("device leases", () => {
-  const SERIAL = "emulator-5590";
-  const HOLDER = "api-test · leases";
-  const adbBin = process.env.ADB_BIN!;
+// The preload points ADB_BIN at a path that does not exist. A fake adb there, installed for the whole process (every test file
+// shares the path, so it must not appear and vanish mid-run), lists one ready emulator for the lease tests below.
+const LEASE_SERIAL = "emulator-5590";
+const adbBin = process.env.ADB_BIN!;
+fs.writeFileSync(
+  adbBin,
+  [
+    "#!/bin/sh",
+    'case "$*" in',
+    `  "devices -l") printf 'List of devices attached\\n${LEASE_SERIAL} device product:sdk model:sdk_test transport_id:1\\n\\n';;`,
+    '  *"emu avd name"*) printf "LEASE_AVD\\nOK\\n";;',
+    '  *"wm size"*) printf "Physical size: 1080x2400\\n";;',
+    '  *getprop*) printf "14\\nemulator,nosdcard\\n\\n";;',
+    "esac",
+    "",
+  ].join("\n"),
+  { mode: 0o755 },
+);
+afterAll(() => fs.rmSync(adbBin, { force: true }));
 
-  beforeAll(() => {
-    // The preload points ADB_BIN at a path that does not exist; a fake adb there gives the device list one ready emulator.
-    fs.writeFileSync(
-      adbBin,
-      [
-        "#!/bin/sh",
-        'case "$*" in',
-        `  "devices -l") printf 'List of devices attached\\n${SERIAL} device product:sdk model:sdk_test transport_id:1\\n\\n';;`,
-        '  *"emu avd name"*) printf "LEASE_AVD\\nOK\\n";;',
-        '  *"wm size"*) printf "Physical size: 1080x2400\\n";;',
-        '  *getprop*) printf "14\\nemulator,nosdcard\\n\\n";;',
-        "esac",
-        "",
-      ].join("\n"),
-      { mode: 0o755 },
-    );
-  });
-  afterAll(() => fs.rmSync(adbBin, { force: true }));
+describe("device leases", () => {
+  const SERIAL = LEASE_SERIAL;
+  const HOLDER = "api-test · leases";
+
   afterEach(() => {
     const owner = deviceOwner(SERIAL);
     if (owner?.kind === "run") releaseRun(owner.lease.runId!);

@@ -6,13 +6,12 @@
 import { z } from "zod";
 import { backendViolation } from "../../runs/prompt";
 import type { Activity, RunUsage } from "../../runs/types";
-import { CANONICAL_TOOL_PREFIX, type HarnessEvent, type ReplayContext } from "../types";
+import { CANONICAL_TOOL_PREFIX, type HarnessEvent, MOBILE_MCP_SERVER, PROGRESS_SERVER, type ReplayContext } from "../types";
 
 /** The one place that knows how Codex names an MCP tool for the model (`mcp__<server>__<tool>`). [INFERENCE: not observed on a live run] */
 export const codexToolName = (server: string, tool: string): string => `mcp__${server}__${tool}`;
 
 const PROGRESS_TOOLS: readonly string[] = ["qa_plan", "qa_check", "qa_finish"];
-const PROGRESS_SERVER_NAME = "tpc";
 
 const nonNegative = z.number().nullish();
 
@@ -76,35 +75,45 @@ export function parseFrame(raw: unknown): CodexFrame | null {
 interface ToolDescription {
   /** Canonical tool name (see `CANONICAL_TOOL_PREFIX` in types.ts). */
   tool: string;
+  /** The name as Codex reported it (`mcp__<server>__<tool>` for MCP calls), what `backendViolation` must see. */
+  raw: string;
   server: string | null;
   args: unknown;
 }
 
 /** Tool-like items (the ones that become `tool_call` / `tool_result`); null for messages, reasoning, todo lists, errors. */
-function describeTool(item: Item): ToolDescription | null {
+function describeTool(item: Item, gated: boolean): ToolDescription | null {
   switch (item.type) {
     case "command_execution": {
       const c = commandItem.safeParse(item);
-      return c.success ? { tool: "bash", server: null, args: { command: c.data.command } } : null;
+      return c.success ? { tool: "bash", raw: "bash", server: null, args: { command: c.data.command } } : null;
     }
     case "file_change": {
       const c = fileChangeItem.safeParse(item);
       if (!c.success) return null;
       const paths = (c.data.changes ?? []).map((ch) => ch.path);
-      return { tool: "edit", server: null, args: { path: paths[0] ?? "", paths } };
+      return { tool: "edit", raw: "edit", server: null, args: { path: paths[0] ?? "", paths } };
     }
     case "mcp_tool_call": {
       const c = mcpItem.safeParse(item);
       if (!c.success) return null;
+      const raw = `mcp__${c.data.server}__${c.data.tool}`;
+      const args = c.data.arguments ?? {};
       // Hyphens and underscores are interchangeable in server keys; the canonical form uses underscores.
       const server = c.data.server.replace(/-/g, "_");
-      const progress = server === PROGRESS_SERVER_NAME && PROGRESS_TOOLS.includes(c.data.tool);
-      const tool = progress ? c.data.tool : `${CANONICAL_TOOL_PREFIX}${server}_${c.data.tool}`;
-      return { tool, server, args: c.data.arguments ?? {} };
+      if (server === PROGRESS_SERVER) {
+        if (PROGRESS_TOOLS.includes(c.data.tool)) return { tool: c.data.tool, raw, server, args };
+        // The gateway's device tools are served by the run's own endpoint; they read like the mobile-mcp tools they proxy.
+        if (c.data.tool.startsWith("mobile_")) return { tool: `${CANONICAL_TOOL_PREFIX}${MOBILE_MCP_SERVER}_${c.data.tool}`, raw, server: MOBILE_MCP_SERVER, args };
+      }
+      // On a gated run an agent's own mobile-mcp keeps its raw name: it would be indistinguishable from the gateway's canonical names.
+      // A run from before the gateway mounted mobile-mcp itself, so its calls take the canonical name they were shown under.
+      if (server === MOBILE_MCP_SERVER && gated) return { tool: raw, raw, server: null, args };
+      return { tool: `${CANONICAL_TOOL_PREFIX}${server}_${c.data.tool}`, raw, server, args };
     }
     case "web_search": {
       const c = searchItem.safeParse(item);
-      return c.success ? { tool: "search", server: null, args: { query: c.data.query ?? "" } } : null;
+      return c.success ? { tool: "search", raw: "search", server: null, args: { query: c.data.query ?? "" } } : null;
     }
     default:
       return null;
@@ -222,7 +231,7 @@ export class CodexTranslator {
   }
 
   private ensureCall(item: Item): HarnessEvent[] {
-    const d = describeTool(item);
+    const d = describeTool(item, true);
     const id = "id" in item ? item.id : undefined;
     if (!d || !id || this.started.has(id)) return [];
     this.started.add(id);
@@ -241,7 +250,7 @@ export class CodexTranslator {
     }
     const events = this.ensureCall(item);
     const id = "id" in item ? item.id : undefined;
-    if (!describeTool(item) || !id) return events;
+    if (!describeTool(item, true) || !id) return events;
     return [...events, { type: "tool_result", callId: id, ...describeOutcome(item) }];
   }
 
@@ -307,13 +316,13 @@ export function frameToActivity(frame: unknown, ctx: ReplayContext): Activity | 
   switch (parsed.type) {
     case "item.started":
     case "item.updated": {
-      const d = describeTool(parsed.item);
+      const d = describeTool(parsed.item, ctx.gated);
       const id = "id" in parsed.item ? parsed.item.id : undefined;
       const prev = id ? ctx.starts.get(id) : undefined;
       // The store maps a frame twice (scan, then page): only a different frame repeating the id is a duplicate.
       if (!d || !id || (prev && prev.seq !== seq)) return null;
       ctx.starts.set(id, { ts: Date.parse(ts), tool: d.tool, seq });
-      return toolLine(d, id, ts, seq);
+      return toolLine(d, id, ts, seq, ctx.gated);
     }
     case "item.completed": {
       const item = parsed.item;
@@ -322,11 +331,11 @@ export function frameToActivity(frame: unknown, ctx: ReplayContext): Activity | 
         return text ? { ts, seq, kind: "say", text: text.slice(0, 500) } : null;
       }
       if (item.type === "error") return null;
-      const d = describeTool(item);
+      const d = describeTool(item, ctx.gated);
       const id = "id" in item ? item.id : undefined;
       if (!d || !id) return null;
       const start = ctx.starts.get(id);
-      if (!start) return toolLine(d, id, ts, seq);
+      if (!start) return toolLine(d, id, ts, seq, ctx.gated);
       const outcome = describeOutcome(item);
       if (isProgressTool(d.tool) && outcome.ok) return null;
       const durationMs = Math.max(0, Date.parse(ts) - start.ts);
@@ -350,10 +359,10 @@ export function frameToActivity(frame: unknown, ctx: ReplayContext): Activity | 
   }
 }
 
-function toolLine(d: ToolDescription, callId: string, ts: string, seq: number): Activity | null {
+function toolLine(d: ToolDescription, callId: string, ts: string, seq: number, gated: boolean): Activity | null {
   if (isProgressTool(d.tool)) return null;
   const base = { ts, seq, callId, tool: d.tool, args: truncateArgs(d.args) };
-  if (backendViolation(d.tool)) return { ...base, kind: "warn", text: `backend violation: ${d.tool}` };
+  if (backendViolation(d.raw, gated)) return { ...base, kind: "warn", text: `backend violation: ${d.tool}` };
   const shown = JSON.stringify(d.args) ?? "";
   return { ...base, kind: "tool", text: `${d.tool} ${shown.slice(0, 200)}` };
 }

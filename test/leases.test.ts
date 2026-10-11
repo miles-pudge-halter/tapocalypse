@@ -456,13 +456,13 @@ describe("gated calls: touch, gated flag, device id, end keys", () => {
     expect(keys[0]).toMatch(/^[0-9a-f]{64}$/);
   });
 
-  test("a run lease ending announces no gateway key", () => {
+  test("a run lease ending announces its run id as the gateway key, so the run's child stops with the run", () => {
     const { store } = setup();
     const keys: string[] = [];
     store.ends.on("end", (key) => keys.push(key));
     store.grantRun("emulator-5554", { id: "r1", platform: "android" }, { avdName: "Pixel_8" });
     store.releaseRun("r1");
-    expect(keys).toEqual([]);
+    expect(keys).toEqual(["r1"]);
   });
 });
 

@@ -559,7 +559,7 @@ describe("codex toActivity", () => {
   async function replay(name: string) {
     const frames = lines(await fixture(name)).map((l, i) => ({ ...JSON.parse(l), _ts: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString() }));
     const starts: ReplayContext["starts"] = new Map();
-    return frames.map((f, seq) => realHarness.toActivity(f, { seq, starts }));
+    return frames.map((f, seq) => realHarness.toActivity(f, { seq, gated: true, starts }));
   }
 
   test("shows device, shell, edit and search calls with durations, and hides progress calls", async () => {
@@ -593,19 +593,40 @@ describe("codex toActivity", () => {
     expect(out[0]?.text).toContain("stream disconnected");
   });
 
-  test("tapocalypse's own MCP tools are flagged as violations, device tools are plain tool lines", () => {
+  test("tapocalypse's own MCP tools are flagged as violations, gateway device tools are plain tool lines under the canonical name", () => {
     const starts: ReplayContext["starts"] = new Map();
     const call = (id: string, server: string, tool: string) =>
       realHarness.toActivity(
         { type: "item.started", item: { id, type: "mcp_tool_call", server, tool, arguments: {}, status: "in_progress" } },
-        { seq: 0, starts },
+        { seq: 0, gated: true, starts },
       );
     expect(call("a", "tapocalypse", "qa_start_run")?.kind).toBe("warn");
-    expect(call("d", "mobile_mcp", "mobile_list_apps")?.kind).toBe("tool");
+    expect(call("d", "tpc", "mobile_list_apps")).toMatchObject({ kind: "tool", tool: "mcp__mobile_mcp_mobile_list_apps" });
+  });
+
+  const ownMobileMcp = (gated: boolean) => {
+    const starts: ReplayContext["starts"] = new Map();
+    return (id: string, server: string) =>
+      realHarness.toActivity(
+        { type: "item.started", item: { id, type: "mcp_tool_call", server, tool: "mobile_list_apps", arguments: {}, status: "in_progress" } },
+        { seq: 0, gated, starts },
+      );
+  };
+
+  test("on a gated run a mobile-mcp the agent mounted itself keeps its raw name and is flagged", () => {
+    const call = ownMobileMcp(true);
+    expect(call("a", "mobile_mcp")).toMatchObject({ kind: "warn", text: "backend violation: mcp__mobile_mcp__mobile_list_apps" });
+    expect(call("b", "mobile-mcp")).toMatchObject({ kind: "warn", text: "backend violation: mcp__mobile-mcp__mobile_list_apps" });
+  });
+
+  test("a run from before the gateway replays its own mobile-mcp calls as plain tool lines under the canonical name", () => {
+    const call = ownMobileMcp(false);
+    expect(call("a", "mobile_mcp")).toMatchObject({ kind: "tool", tool: "mcp__mobile_mcp_mobile_list_apps" });
+    expect(call("b", "mobile-mcp")).toMatchObject({ kind: "tool", tool: "mcp__mobile_mcp_mobile_list_apps" });
   });
 
   test("Tapocalypse's own _activity lines and unknown frames replay sanely", () => {
-    const ctx = { seq: 3, starts: new Map() } as const;
+    const ctx = { seq: 3, gated: true, starts: new Map() } as const;
     expect(realHarness.toActivity({ type: "_activity", kind: "info", text: "hello", _ts: "2026-01-01T00:00:00.000Z" }, ctx)).toEqual({
       ts: "2026-01-01T00:00:00.000Z",
       seq: 3,

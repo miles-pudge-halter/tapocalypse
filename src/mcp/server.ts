@@ -261,7 +261,7 @@ export function releaseDevice(input: unknown): { released: true; serial: string 
 }
 
 function buildServer(): McpServer {
-  const server = new McpServer({ name: "tapocalypse", version: pkg.version });
+  const server = new McpServer({ name: "tapocalypse", version: pkg.version }, { capabilities: { tools: {} } });
 
   server.registerTool(
     "qa_list_projects",

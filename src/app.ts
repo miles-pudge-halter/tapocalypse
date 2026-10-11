@@ -213,6 +213,8 @@ export function init(): void {
   initProjects();
   leases.restore();
   stopOnLeaseEnd(leases.ends, gateway);
+  // Warm the device tool list in the background so the first run (and the first agent tools/list) never waits on a cold probe.
+  void gateway.tools();
   leases.setNextResolver((serial) => scheduler.nextFor(serial));
   scheduler.restore();
   startIdleReaper();

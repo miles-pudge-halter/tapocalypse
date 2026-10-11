@@ -154,7 +154,7 @@ const PersistedLease = z.object({
 
 export class LeaseStore {
   readonly bus = new EventEmitter<{ lease: [LeaseEvent] }>();
-  /** The `leaseKey` of every agent lease that ends, whatever the reason: the gateway stops that lease's child. Kept off `bus` so the digest never reaches SSE. */
+  /** The gateway key of every lease that ends, whatever the reason (an agent lease's `leaseKey`, a run lease's run id): the gateway stops that lease's child. Kept off `bus` so the digest never reaches SSE. */
   readonly ends = new EventEmitter<{ end: [string] }>();
   /** At most one lease per serial. */
   private leases = new Map<string, Lease>();
@@ -417,7 +417,7 @@ export class LeaseStore {
     }
     this.deps.markReleased(lease.serial);
     this.persist();
-    if (lease.source === "agent") this.ends.emit("end", leaseKey(lease.leaseId));
+    this.ends.emit("end", lease.source === "run" && lease.runId ? lease.runId : leaseKey(lease.leaseId));
     return this.emit(why, lease, this.deps.nextFor(lease.serial));
   }
 

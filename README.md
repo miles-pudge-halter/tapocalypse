@@ -34,7 +34,7 @@ flowchart LR
   brief["Brief<br/>UI · CLI · MCP"] --> scheduler["Scheduler<br/>queue + device pool"]
   scheduler --> device["Device<br/>emulator · simulator"]
   scheduler --> agent["Harness agent<br/>omp · Claude Code · Codex"]
-  agent --> mcp["mobile-mcp<br/>tap · type · screenshot"]
+  agent --> mcp["Tapocalypse gateway → mobile-mcp<br/>tap · type · screenshot"]
   mcp --> device
   agent --> progress["Checks<br/>pass · fail · evidence"]
   progress --> result["Verdict + markdown report<br/>in Tapocalypse's data folder"]
@@ -42,7 +42,7 @@ flowchart LR
 
 1. **Brief.** Pick a project (your app's repo), write what to test and what counts as a failure, and pick a platform or a specific device.
 2. **Device.** The scheduler assigns a free emulator or simulator, or boots one from your configured AVDs and simulators. If everything is busy, the run waits in a queue and says why.
-3. **Agent.** A headless QA agent starts inside your repo (reading only: it is told never to write there) and drives the app through [mobile-mcp](https://github.com/mobile-next/mobile-mcp): taps, typing, screenshots, `adb` and `simctl`.
+3. **Agent.** A headless QA agent starts inside your repo (reading only: it is told never to write there) and drives the app through [mobile-mcp](https://github.com/mobile-next/mobile-mcp), served by Tapocalypse and pinned to the run's device: taps, typing, screenshots, `adb` and `simctl`.
 4. **Checks.** The agent declares its checks up front and reports each one as it goes. You watch them turn pending → running → pass/fail next to a live device screen and the agent's activity feed. Cancel at any time; steer it on omp and Claude Code.
 5. **Verdict.** The agent hands in a markdown report; with its screenshots it is stored in `<data dir>/runs/<run-id>/` (`report.md`, `screenshots/`), and the run ends with `PASS`, `PASS WITH ISSUES`, `FAIL`, `BLOCKED` or `PARTIAL`, plus a summary and what it cost. Read it in the UI, with `qa_get_report` / `qa_get_screenshots`, or `tapocalypse report <run-id>`; copy it anywhere with `qa_export` or `tapocalypse report <run-id> --export <dir>`.
 
@@ -71,7 +71,7 @@ You need:
 
 - [ ] [Bun](https://bun.sh) ≥ 1.3
 - [ ] **One** agent runtime, installed and signed in: [omp](https://github.com/can1357/oh-my-pi), [Claude Code](https://code.claude.com) or [Codex CLI](https://github.com/openai/codex) ([details](#runtimes))
-- [ ] Node.js 18+ with `npx` (runs mobile-mcp, mounted into each run for you)
+- [ ] Node.js 18+ with `npx` (runs mobile-mcp, which Tapocalypse starts for each run)
 - [ ] Android `adb` with an emulator, and/or Xcode with iOS simulators (macOS). Linux runs Android only; Windows is not supported
 - [ ] Your app installed on that emulator or simulator
 

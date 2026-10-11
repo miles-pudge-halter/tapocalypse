@@ -54,6 +54,8 @@ process.env.XCRUN_BIN = path.join(root, "no-xcrun");
 process.env.OMP_BIN = path.join(root, "no-omp");
 process.env.CLAUDE_BIN = path.join(root, "no-claude");
 process.env.CODEX_BIN = path.join(root, "no-codex");
+// And for the device gateway: a test that lists tools or calls a device tool without a fake client must fail fast, never `npx` the real mobile-mcp.
+process.env.MOBILE_MCP_BIN = path.join(root, "no-mobile-mcp");
 
 process.env.TAPOCALYPSE_CONFIG = configFile;
 process.env.TAPOCALYPSE_DATA_DIR = path.join(root, "data");

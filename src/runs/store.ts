@@ -48,6 +48,7 @@ const RUN_DEFAULTS = {
   rerunOf: null,
   install: null,
   storage: "repo",
+  gated: false,
 } satisfies Partial<Run>;
 
 type RunDefaultKey = keyof typeof RUN_DEFAULTS;
@@ -226,6 +227,7 @@ export function readActivity(id: string, opts: { before?: number; limit: number 
   const run = getRun(id);
   const harnessId = run?.harness ?? "omp";
   const harness = getHarness(harnessId);
+  const gated = run?.gated ?? false;
   // Runs recorded before progress calls were logged server-side have no `check` lines of their own (omp only).
   const legacyChecks = harnessId === "omp" && !text.includes('"kind":"check"');
 
@@ -238,7 +240,7 @@ export function readActivity(id: string, opts: { before?: number; limit: number 
   const complete = lines.length - 1;
   for (let seq = cached.lines; seq < complete; seq++) {
     const line = lines[seq]!;
-    if (line && !line.startsWith('{"type":"_activity"')) harness.toActivity(parseLine(line), { seq, starts: cached.starts });
+    if (line && !line.startsWith('{"type":"_activity"')) harness.toActivity(parseLine(line), { seq, gated, starts: cached.starts });
   }
   cached.lines = Math.max(cached.lines, complete);
   const starts = cached.starts;
@@ -250,7 +252,7 @@ export function readActivity(id: string, opts: { before?: number; limit: number 
     if (!line) continue;
     const frame = parseLine(line);
     const activity =
-      activityFrame(frame, seq) ?? (legacyChecks ? legacyProgressActivity(frame, seq) : null) ?? harness.toActivity(frame, { seq, starts });
+      activityFrame(frame, seq) ?? (legacyChecks ? legacyProgressActivity(frame, seq) : null) ?? harness.toActivity(frame, { seq, gated, starts });
     if (activity) items.push(activity);
   }
   const hasMore = items.length === need;

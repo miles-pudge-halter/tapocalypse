@@ -140,6 +140,8 @@ export interface ProgressSink {
  */
 export interface ReplayContext {
   seq: number;
+  /** `Run.gated` of the run being replayed: only a gated run's own `mobile_mcp` calls are backend violations. */
+  gated: boolean;
   starts: Map<string, { ts: number; tool: string; seq?: number }>;
 }
 

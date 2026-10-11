@@ -274,4 +274,33 @@ describe("readActivity per harness", () => {
     deleteRun("20260101-000001-abcd-statsomp");
     deleteRun("20260101-000002-abcd-statsclaude");
   });
+
+  describe("replay of mobile-mcp calls", () => {
+    const ts = "2026-01-01T00:00:00.000Z";
+    const codexCall = { type: "item.started", item: { id: "i1", type: "mcp_tool_call", server: "mobile_mcp", tool: "mobile_list_apps", arguments: {}, status: "in_progress" }, _ts: ts };
+    const claudeCall = { type: "assistant", message: { content: [{ type: "tool_use", id: "c1", name: "mcp__mobile_mcp__mobile_list_apps", input: {} }] }, _ts: ts };
+    const ompCall = { type: "tool_execution_start", toolCallId: "o1", toolName: "write", args: { path: "xd://mcp__mobile_mcp_mobile_list_apps", content: "{}" }, _ts: ts };
+    const FRAMES = { codex: codexCall, claude: claudeCall, omp: ompCall };
+
+    test("a run from before the gateway (no `gated` in run.json) replays them as plain tool rows", () => {
+      for (const [harness, frame] of Object.entries(FRAMES)) {
+        const id = `20260101-000010-abcd-pre2b-${harness}`;
+        fs.mkdirSync(runDir(id), { recursive: true });
+        fs.writeFileSync(path.join(runDir(id), "run.json"), JSON.stringify({ ...OLD_RUN, id, harness }));
+        fs.writeFileSync(path.join(runDir(id), "events.jsonl"), `${JSON.stringify(frame)}\n`);
+        expect(getRun(id)?.gated).toBe(false);
+        expect(readActivity(id, { limit: 5 }).items).toMatchObject([{ kind: "tool", tool: "mcp__mobile_mcp_mobile_list_apps" }]);
+        deleteRun(id);
+      }
+    });
+
+    test("a gated run replays an agent's own mobile-mcp as a backend violation", () => {
+      for (const [harness, frame] of Object.entries(FRAMES)) {
+        const r = createRun(newRun(`gated ${harness}`, { harness: harness as NewRun["harness"], gated: true }));
+        writeEvents(r.id, [frame]);
+        expect(readActivity(r.id, { limit: 5 }).items).toMatchObject([{ kind: "warn" }]);
+        deleteRun(r.id);
+      }
+    });
+  });
 });

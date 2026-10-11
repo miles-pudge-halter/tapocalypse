@@ -13,7 +13,7 @@ import type {
 } from "../src/harness/types";
 import { HttpError } from "../src/config";
 import type { Device } from "../src/devices/devices";
-import { createRunner, type Runner, type RunnerScheduler } from "../src/runs/runner";
+import { createRunner, type Runner, type RunnerDeps, type RunnerScheduler } from "../src/runs/runner";
 import { getProject } from "../src/projects/registry";
 import { screenshotsDir } from "../src/runs/artefacts";
 import { createRun, deleteRun, getRun, readEvents, runDir, saveRun } from "../src/runs/store";
@@ -29,10 +29,12 @@ const CAPS: HarnessCapabilities = {
   transcriptExport: false,
 };
 
-const MCP_OK: SessionInfo["mcp"] = [
-  { name: "mobile_mcp", ok: true },
-  { name: "tpc", ok: true },
-];
+const MCP_OK: SessionInfo["mcp"] = [{ name: "tpc", ok: true }];
+
+const GATEWAY_WITH_TOOLS: NonNullable<RunnerDeps["gateway"]> = {
+  tools: async () => [{ name: "mobile_take_screenshot", inputSchema: { type: "object" } }],
+  probeError: () => null,
+};
 
 interface Controls {
   opts: SpawnOptions;
@@ -61,6 +63,8 @@ interface FakeOptions {
   readyError?: string;
   /** Runs right after `spawn` created the session (e.g. to end it immediately). */
   onSpawn?: (c: Controls) => void;
+  /** The device gateway the runner probes before prompting; default serves one device tool. */
+  gateway?: NonNullable<RunnerDeps["gateway"]>;
 }
 
 function fakeHarness(id: HarnessId, o: FakeOptions, onSent: (c: Controls) => void) {
@@ -213,7 +217,7 @@ function setup(harnessId: HarnessId, o: FakeOptions = {}, runOver: Partial<Run> 
     getLive: () => undefined,
     waitForPrLookup: async () => {},
   };
-  const runner = createRunner(scheduler, { getHarness: () => harness, listDevices: async () => [device] });
+  const runner = createRunner(scheduler, { getHarness: () => harness, listDevices: async () => [device], gateway: o.gateway ?? GATEWAY_WITH_TOOLS });
   return { runner, run, activities, updates, retried, done, spawned, sent };
 }
 
@@ -254,7 +258,8 @@ describe("runner with a fake harness", () => {
     const [c] = env.spawned;
 
     expect(c!.calls.slice(0, 2)).toEqual(["ready", "send"]);
-    expect(c!.prompts[0]).toContain("fake:mobile_mcp:mobile_list_elements_on_screen");
+    expect(c!.prompts[0]).toContain("fake:tpc:mobile_list_elements_on_screen");
+    expect(c!.prompts[0]).not.toContain("fake:mobile_mcp:"); // device tools are named through tpc, never through a mobile_mcp server
     expect(c!.prompts[0]).toContain("fake:tpc:qa_plan");
     expect(c!.prompts[0]).not.toContain("You are a QA agent."); // persona is appended as system prompt, not duplicated
 
@@ -339,33 +344,67 @@ describe("runner with a fake harness", () => {
     expect(env.retried).toEqual([]);
   });
 
-  test("a required MCP server that did not mount fails the run early as infra, without prompting", async () => {
-    const env = setup("claude", {
-      mcp: [
-        { name: "mobile_mcp", ok: false, error: "spawn npx ENOENT" },
-        { name: "tpc", ok: true },
-      ],
-    });
+  test("a tpc server that did not mount fails the run early as infra, without prompting", async () => {
+    const env = setup("claude", { mcp: [{ name: "tpc", ok: false, error: "spawn bun ENOENT" }] });
     start(env);
     await env.done;
     const [c] = env.spawned;
     expect(c!.prompts).toEqual([]);
     expect(env.run).toMatchObject({ status: "error", errorKind: "infra" });
-    expect(env.run.error).toContain("mobile_mcp");
-    expect(env.run.error).toContain("spawn npx ENOENT");
+    expect(env.run.error).toContain("tpc");
+    expect(env.run.error).toContain("spawn bun ENOENT");
     expect(c!.calls).toEqual(expect.arrayContaining(["kill"]));
   });
 
-  test("a missing progress server fails a non-native harness early; a native-progress harness needs none", async () => {
-    const missing = setup("claude", { mcp: [{ name: "mobile_mcp", ok: true }, { name: "tpc", ok: false, error: "401" }] });
-    start(missing);
-    await missing.done;
-    expect(missing.run.error).toContain("tpc");
-    expect(missing.spawned[0]!.prompts).toEqual([]);
+  test("a gateway with no device tools fails the run as retriable infra with the probe's error, before any agent is started", async () => {
+    const env = setup("claude", { gateway: { tools: async () => [], probeError: () => "mobile-mcp did not list its tools in time" } });
+    start(env);
+    await env.done;
+    expect(env.spawned).toEqual([]);
+    expect(env.run).toMatchObject({ status: "error", errorKind: "infra" });
+    expect(env.run.error).toContain("device tools unavailable");
+    expect(env.run.error).toContain("mobile-mcp did not list its tools in time");
+    expect(env.retried).toEqual([env.run.id]);
+  });
+
+  test("the gateway's tool list is ready before the harness starts, so the agent's first tools/list is served from memory", async () => {
+    // omp drops an MCP server whose first tools/list takes a few seconds and never retries within the session.
+    const order: string[] = [];
+    const env = setup("claude", {
+      gateway: {
+        tools: async () => {
+          order.push("gateway.tools");
+          return [{ name: "mobile_take_screenshot", inputSchema: { type: "object" } }];
+        },
+        probeError: () => null,
+      },
+      onSpawn: () => order.push("spawn"),
+    });
+    start(env);
+    const c = await env.sent;
+    expect(order.slice(0, 2)).toEqual(["gateway.tools", "spawn"]);
+    c.exit();
+    await env.done;
+  });
+
+  test("a run is marked gated from spawn on, so replay can tell it from runs of older versions", async () => {
+    const env = setup("claude");
+    expect(getRun(env.run.id)?.gated).toBe(false);
+    start(env);
+    const c = await env.sent;
+    expect(getRun(env.run.id)?.gated).toBe(true);
+    c.exit();
+    await env.done;
+  });
+
+  test("the run's tpc server is the only one mounted, for every harness, and native-progress harnesses need it too", async () => {
+    const claude = setup("claude");
+    start(claude);
+    await claude.sent;
+    expect(claude.spawned[0]!.opts.mcpServers.map((s) => s.name)).toEqual(["tpc"]);
 
     const native = setup("omp", {
       caps: { nativeProgressTools: true },
-      mcp: [{ name: "mobile_mcp", ok: true }],
       script: (c) => {
         c.emit({ type: "turn_end", ok: true, error: null, limit: null });
         c.exit();
@@ -375,7 +414,28 @@ describe("runner with a fake harness", () => {
     await native.done;
     expect(native.spawned[0]!.prompts).toHaveLength(1);
     expect(native.spawned[0]!.opts.onProgress).toBeDefined();
-    expect(native.spawned[0]!.opts.mcpServers.map((s) => s.name)).toEqual(["mobile_mcp"]);
+    expect(native.spawned[0]!.opts.mcpServers.map((s) => s.name)).toEqual(["tpc"]);
+
+    const unmounted = setup("omp", { caps: { nativeProgressTools: true }, mcp: [] });
+    start(unmounted);
+    await unmounted.done;
+    expect(unmounted.run.error).toContain("tpc");
+    expect(unmounted.spawned[0]!.prompts).toEqual([]);
+  });
+
+  test("the progress lookup tells the run endpoint whether the harness already has qa_* natively", async () => {
+    const claude = setup("claude");
+    start(claude);
+    await claude.sent;
+    expect(claude.runner.progressLookup(claude.run.id)).toMatchObject({ nativeProgress: false });
+
+    const native = setup("omp", { caps: { nativeProgressTools: true } });
+    start(native);
+    await native.sent;
+    expect(native.runner.progressLookup(native.run.id)).toMatchObject({ nativeProgress: true });
+    native.spawned[0]!.exit();
+    claude.spawned[0]!.exit();
+    await Promise.all([native.done, claude.done]);
   });
 
   test("the run-scoped progress server carries a per-run bearer token and is dropped once the run ends", async () => {
@@ -438,7 +498,7 @@ describe("runner with a fake harness", () => {
       c.emit({ type: "turn_end", ok: true, error: null, limit: null });
       c.exit();
     };
-    const omp = setup("omp", { caps: { nativeProgressTools: true }, mcp: [{ name: "mobile_mcp", ok: true }], script: finish });
+    const omp = setup("omp", { caps: { nativeProgressTools: true }, mcp: [{ name: "tpc", ok: true }], script: finish });
     start(omp);
     await omp.done;
     expect(omp.spawned[0]!.opts.model).toBe("anthropic/claude-haiku-4-5");
@@ -473,7 +533,7 @@ describe("runner with a fake harness", () => {
   test("exports the transcript when the harness can", async () => {
     const env = setup("omp", {
       caps: { nativeProgressTools: true, transcriptExport: true },
-      mcp: [{ name: "mobile_mcp", ok: true }],
+      mcp: [{ name: "tpc", ok: true }],
       transcript: true,
       script: (c) => {
         c.emit({ type: "turn_end", ok: true, error: null, limit: null });
@@ -503,7 +563,7 @@ describe("runner with a fake harness", () => {
     const stats = { tokens: { input: 5, output: 6 }, cost: 0.25 };
     const env = setup("omp", {
       caps: { nativeProgressTools: true },
-      mcp: [{ name: "mobile_mcp", ok: true }],
+      mcp: [{ name: "tpc", ok: true }],
       stats,
       usage: { cost: 0.25, tokensIn: 5, tokensOut: 6, cacheRead: 0, cacheWrite: 0, toolCalls: 0, model: "m" },
       script: (c) => {
@@ -572,7 +632,7 @@ describe("runner with a fake harness", () => {
 
       const self = setup("omp", {
         caps: { nativeProgressTools: true, limits: { maxTime: true, maxTurns: false, maxBudgetUsd: false } },
-        mcp: [{ name: "mobile_mcp", ok: true }],
+        mcp: [{ name: "tpc", ok: true }],
       });
       start(self);
       const o = await self.sent;

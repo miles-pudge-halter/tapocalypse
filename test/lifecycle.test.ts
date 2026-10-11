@@ -3,7 +3,7 @@ import { normalizeUsage, UsageAccumulator } from "../src/harness/omp/usage";
 import type { HarnessExit } from "../src/harness/types";
 import { classifyExit, deriveVerdict, type ExitInput, parseDurationMs, UsageTotals } from "../src/runs/outcome";
 import { screenshotsDir } from "../src/runs/artefacts";
-import { buildPrompt } from "../src/runs/prompt";
+import { backendViolation, buildPrompt } from "../src/runs/prompt";
 import type { Check, CheckStatus, Run, Verdict } from "../src/runs/types";
 
 const check = (status: CheckStatus, id = "C"): Check => ({ id, title: id, status, updatedAt: "2026-01-01T00:00:00.000Z" });
@@ -255,6 +255,26 @@ describe("buildPrompt", () => {
     expect(prompt).not.toContain("qa/screenshots");
   });
 
+  test("names the gated tools by their exact prefix so a second mobile-mcp mounted alongside is never picked", () => {
+    // The omp bridge exposes the device tools as mcp__tpc_qa_mobile_*; a user's own mobile-mcp shows up as mcp__mobile_mcp_mobile_*.
+    const prefixed = (server: string, tool: string) => (server === "tpc" ? `mcp__tpc_qa_${tool}` : `mcp__${server}_${tool}`);
+    const prompt = buildPrompt(run({ deviceName: "Pixel 8" }), prefixed, { runMaxTime: "60m" });
+    expect(prompt).toContain("The mcp__tpc_qa_mobile_* tools are already bound to your device Pixel 8 (emulator-5554); call them without a device argument.");
+    expect(prompt).toContain("Use ONLY those: any other mobile_* tool (for example one named mcp__mobile_mcp_mobile_…) belongs to a different server and must not be called.");
+    expect(prompt).toContain("Use emulator-5554 for every adb / simctl call.");
+    expect(prompt).toMatch(/NEVER mount or call another mobile-mcp server/);
+    expect(prompt).not.toContain("device id");
+  });
+
+  test("with bare tool names the device line still reads naturally", () => {
+    const prompt = buildPrompt(run({ deviceName: "Pixel 8" }), toolName, { runMaxTime: "60m" });
+    expect(prompt).toContain("The mobile_* tools are already bound to your device Pixel 8 (emulator-5554); call them without a device argument.");
+  });
+
+  test("a run without a device name binds to the serial alone", () => {
+    expect(buildPrompt(run({ deviceName: null }), toolName, { runMaxTime: "60m" })).toContain("bound to your device emulator-5554;");
+  });
+
   test("suite runs pin check ids and titles; ad-hoc runs do not", () => {
     const suite = buildPrompt(run({ suiteId: "smoke", suiteChecks: [{ id: "C1", title: "Launch" }, { id: "C2", title: 'Say "hi"' }] }), toolName, { runMaxTime: "60m" });
     expect(suite).toContain('Use exactly these check ids and titles in qa_plan: C1 "Launch", C2 "Say \\"hi\\""');
@@ -267,7 +287,8 @@ describe("buildPrompt harness neutrality", () => {
 
   test("names every tool through the harness's own tool names", () => {
     const prompt = buildPrompt(run, (server, tool) => `<${server}.${tool}>`, { runMaxTime: "60m" });
-    expect(prompt).toContain("<mobile_mcp.mobile_list_elements_on_screen>");
+    expect(prompt).toContain("<tpc.mobile_list_elements_on_screen>");
+    expect(prompt).not.toContain("<mobile_mcp.");
     expect(prompt).toContain("<tpc.qa_plan>");
     expect(prompt).toContain("<tpc.qa_finish>");
     expect(prompt).not.toContain("ask tool");
@@ -280,5 +301,26 @@ describe("buildPrompt harness neutrality", () => {
     const withPersona = buildPrompt(run, names, { runMaxTime: "60m", prependPersona: "Be thorough.\n" });
     expect(withPersona.startsWith("Your system instructions")).toBe(true);
     expect(withPersona).toContain("Be thorough.");
+  });
+});
+
+describe("backendViolation", () => {
+  test("flags Tapocalypse's own run-management server whether or not the run was gated", () => {
+    expect(backendViolation("mcp__tapocalypse_qa_start_run", true)).toBe(true);
+    expect(backendViolation("mcp__tapocalypse_qa_start_run", false)).toBe(true);
+  });
+
+  test("on a gated run flags a mobile-mcp server the agent mounted itself, but not the run's own tools or other servers", () => {
+    expect(backendViolation("mcp__mobile_mcp_mobile_click_on_screen_at_coordinates", true)).toBe(true);
+    expect(backendViolation("mcp__mobile-mcp_mobile_take_screenshot", true)).toBe(true);
+    expect(backendViolation("mcp__tpc_qa_mobile_take_screenshot", true)).toBe(false);
+    expect(backendViolation("mcp__tpc_mobile_take_screenshot", true)).toBe(false);
+    expect(backendViolation("mcp__atlassian_search", true)).toBe(false);
+    expect(backendViolation("bash", true)).toBe(false);
+  });
+
+  test("a run from before the gateway mounted mobile-mcp itself, so its mobile-mcp calls are not violations", () => {
+    expect(backendViolation("mcp__mobile_mcp_mobile_click_on_screen_at_coordinates", false)).toBe(false);
+    expect(backendViolation("mcp__mobile-mcp_mobile_take_screenshot", false)).toBe(false);
   });
 });

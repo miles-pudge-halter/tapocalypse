@@ -7,13 +7,17 @@ const ARGS_LIMIT = 2048;
 const CHECK_STATUSES: readonly CheckStatus[] = ["pending", "running", "pass", "fail", "blocked", "skipped"];
 const PROGRESS_TOOL_NAMES: readonly string[] = ["qa_plan", "qa_check", "qa_finish"];
 
-/** `mcp__mobile_mcp_x`, `mcp__<plugin>_mobile_mcp_x` (Tapocalypse's plugin) and user-config forms all canonicalize to `mcp__<server>_x`. */
-const DEVICE_TOOL = new RegExp(`^mcp__\\w*?(${MOBILE_MCP_SERVER})_(.+)$`);
+/**
+ * Device tools reach the agent through Tapocalypse's stdio bridge: `mcp__tpc_qa_mobile_x` (plugin `tpc`, server `qa`), and
+ * `mcp__tpc_mobile_mcp_mobile_x` for runs recorded when the plugin still wrapped mobile-mcp itself. Both canonicalize to
+ * `mcp__mobile_mcp_mobile_x`. Any other MCP name (an agent's own mobile-mcp included) stays raw so `backendViolation` can see it.
+ */
+const DEVICE_TOOL = /^mcp__tpc_(?:qa_|mobile_mcp_)(mobile_.+)$/;
 
 /** Canonical form of an omp tool name (see `CANONICAL_TOOL_PREFIX` in `harness/types`); built-ins and unknown MCP servers pass through. */
 export function canonicalToolName(name: string): string {
   const m = DEVICE_TOOL.exec(name);
-  return m ? `mcp__${m[1]}_${m[2]}` : name;
+  return m ? `mcp__${MOBILE_MCP_SERVER}_${m[1]}` : name;
 }
 
 /** The MCP server (`mobile_mcp`) a canonical tool name belongs to; null otherwise. */
@@ -25,6 +29,8 @@ export interface ResolvedCall {
   tool: string;
   /** The call's arguments as the agent wrote them (an xd:// write's `content`, JSON-parsed when it is a string). */
   args: unknown;
+  /** The tool name as the harness reported it, before canonicalisation: what tells Tapocalypse's gateway from an agent's own mobile-mcp. */
+  raw: string;
 }
 
 /**
@@ -41,7 +47,7 @@ export function resolveCall(toolName: string, rawArgsIn: unknown): ResolvedCall 
       args = JSON.parse(detail);
     } catch {}
   }
-  return { tool: canonicalToolName(tool), args };
+  return { tool: canonicalToolName(tool), args, raw: tool };
 }
 
 /** Keeps the value as-is when its JSON fits `ARGS_LIMIT`, else a truncated JSON string. */
@@ -110,12 +116,12 @@ export function toActivity(frame: unknown, ctx: ReplayContext): Activity | null 
   switch (f.type) {
     case "tool_execution_start": {
       if (typeof f.toolName !== "string") return { ts, seq, kind: "tool", text: JSON.stringify(frame).slice(0, 300) };
-      const { tool, args } = resolveCall(f.toolName, f.args);
+      const { tool, args, raw } = resolveCall(f.toolName, f.args);
       const callId = typeof f.toolCallId === "string" ? f.toolCallId : undefined;
       if (callId) starts.set(callId, { ts: Date.parse(ts), tool });
       if (PROGRESS_TOOL_NAMES.includes(tool)) return null;
       const base = { ts, seq, callId, tool, args: truncateArgs(args) };
-      if (backendViolation(tool)) return { ...base, kind: "warn", text: `backend violation: ${tool}` };
+      if (backendViolation(raw, ctx.gated)) return { ...base, kind: "warn", text: `backend violation: ${tool}` };
       const shown = typeof args === "string" ? args : JSON.stringify(args);
       return { ...base, kind: "tool", text: `${tool} ${shown.slice(0, 200)}` };
     }

@@ -145,6 +145,11 @@ export interface Run {
   install: InstallRequest | null;
   /** Where this run's report and screenshots live: Tapocalypse's data dir (`runs/<id>/`) or, for runs from before that, the project repo. */
   storage: "data" | "repo";
+  /**
+   * True for runs whose agent was given its device tools through Tapocalypse's gateway (the run's `tpc` server), set when the agent is spawned.
+   * Older runs mounted mobile-mcp themselves, so their recorded `mobile_mcp` tool calls are legitimate and must not replay as backend violations.
+   */
+  gated: boolean;
 }
 
 export interface Activity {

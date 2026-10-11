@@ -5,7 +5,7 @@
 import { z } from "zod";
 import type { Activity, RunUsage } from "../../runs/types";
 import { backendViolation } from "../../runs/prompt";
-import { PROGRESS_SERVER, type HarnessEvent, type HarnessExit, type ReplayContext } from "../types";
+import { MOBILE_MCP_SERVER, PROGRESS_SERVER, type HarnessEvent, type HarnessExit, type ReplayContext } from "../types";
 
 const PROGRESS_TOOLS = ["qa_plan", "qa_check", "qa_finish"] as const;
 
@@ -57,6 +57,8 @@ const initSchema = z
 export interface CanonicalTool {
   /** Canonical name (`types.ts` § canonical tool names). */
   tool: string;
+  /** The name as Claude reported it, normalised (plugin namespace stripped, hyphens as `_`): what `backendViolation` must see. */
+  raw: string;
   /** Canonical MCP server (`tpc`, `mobile_mcp`, …), null for built-in tools. */
   server: string | null;
   args: unknown;
@@ -70,24 +72,36 @@ function field(input: unknown, key: string): unknown {
 const MCP_NAME = /^mcp__(.+?)__(.+)$/;
 const PLUGIN_SERVER = /^plugin_[^_]+_(.+)$/;
 
-const BUILTIN: Record<string, (input: unknown) => CanonicalTool> = {
-  Bash: (i) => ({ tool: "bash", server: null, args: { command: field(i, "command") } }),
-  Read: (i) => ({ tool: "read", server: null, args: { path: field(i, "file_path") ?? field(i, "path") } }),
-  Write: (i) => ({ tool: "write", server: null, args: { path: field(i, "file_path") ?? field(i, "path") } }),
-  Edit: (i) => ({ tool: "edit", server: null, args: { path: field(i, "file_path") ?? field(i, "path") } }),
-  MultiEdit: (i) => ({ tool: "edit", server: null, args: { path: field(i, "file_path") ?? field(i, "path") } }),
-  WebSearch: (i) => ({ tool: "search", server: null, args: { query: field(i, "query") } }),
+const BUILTIN: Record<string, (input: unknown, name: string) => CanonicalTool> = {
+  Bash: (i, raw) => ({ tool: "bash", raw, server: null, args: { command: field(i, "command") } }),
+  Read: (i, raw) => ({ tool: "read", raw, server: null, args: { path: field(i, "file_path") ?? field(i, "path") } }),
+  Write: (i, raw) => ({ tool: "write", raw, server: null, args: { path: field(i, "file_path") ?? field(i, "path") } }),
+  Edit: (i, raw) => ({ tool: "edit", raw, server: null, args: { path: field(i, "file_path") ?? field(i, "path") } }),
+  MultiEdit: (i, raw) => ({ tool: "edit", raw, server: null, args: { path: field(i, "file_path") ?? field(i, "path") } }),
+  WebSearch: (i, raw) => ({ tool: "search", raw, server: null, args: { query: field(i, "query") } }),
 };
 
-/** Maps a Claude tool name + input to the canonical tool name, server and args. */
-export function canonicalTool(name: string, input: unknown): CanonicalTool {
+/**
+ * Maps a Claude tool name + input to the canonical tool name, server and args. `gated` is `Run.gated`: only a run whose
+ * device tools came from the gateway keeps an agent's own `mobile_mcp` calls under their raw name (to be flagged); an older
+ * run mounted mobile-mcp itself, so its calls take the canonical name they were recorded and shown under.
+ */
+export function canonicalTool(name: string, input: unknown, gated: boolean): CanonicalTool {
   const mcp = MCP_NAME.exec(name);
   if (mcp) {
     const server = (PLUGIN_SERVER.exec(mcp[1])?.[1] ?? mcp[1]).replaceAll("-", "_");
-    const tool = server === PROGRESS_SERVER && PROGRESS_TOOLS.some((t) => t === mcp[2]) ? mcp[2] : `mcp__${server}_${mcp[2]}`;
-    return { tool, server, args: input ?? {} };
+    const raw = `mcp__${server}__${mcp[2]}`;
+    const args = input ?? {};
+    if (server === PROGRESS_SERVER) {
+      if (PROGRESS_TOOLS.some((t) => t === mcp[2])) return { tool: mcp[2], raw, server, args };
+      // The gateway's device tools are served by the run's own endpoint; they read like the mobile-mcp tools they proxy.
+      if (mcp[2].startsWith("mobile_")) return { tool: `mcp__${MOBILE_MCP_SERVER}_${mcp[2]}`, raw, server: MOBILE_MCP_SERVER, args };
+    }
+    // On a gated run an agent's own mobile-mcp keeps its raw name: it would be indistinguishable from the gateway's canonical names.
+    if (server === MOBILE_MCP_SERVER && gated) return { tool: name, raw, server: null, args };
+    return { tool: `mcp__${server}_${mcp[2]}`, raw, server, args };
   }
-  return BUILTIN[name]?.(input) ?? { tool: name.toLowerCase(), server: null, args: input ?? {} };
+  return BUILTIN[name]?.(input, name) ?? { tool: name.toLowerCase(), raw: name, server: null, args: input ?? {} };
 }
 
 /** True for the progress tools reported through the run MCP endpoint (recorded server-side, so not shown twice). */
@@ -234,7 +248,7 @@ export class StreamMapper {
         const events = blocks.flatMap((b): HarnessEvent[] => {
           if (b.type === "text") return b.text.trim() ? [{ type: "text", text: b.text.trim() }] : [];
           if (b.type !== "tool_use") return [];
-          const c = canonicalTool(b.name, b.input);
+          const c = canonicalTool(b.name, b.input, true);
           return [{ type: "tool_call", callId: b.id, tool: c.tool, server: c.server, args: c.args }];
         });
         return [...events, ...this.assistantUsage(frame, blocks.filter((b) => b.type === "tool_use").length)];
@@ -310,11 +324,11 @@ export function toActivity(raw: unknown, ctx: ReplayContext): Activity | null {
       let activity: Activity | null = null;
       for (const b of blocks) {
         if (b.type !== "tool_use") continue;
-        const c = canonicalTool(b.name, b.input);
+        const c = canonicalTool(b.name, b.input, ctx.gated);
         ctx.starts.set(b.id, { ts: Date.parse(ts), tool: c.tool });
         if (activity || isProgressTool(c)) continue;
         const base = { ts, seq, callId: b.id, tool: c.tool, args: truncateArgs(c.args) };
-        activity = backendViolation(c.tool)
+        activity = backendViolation(c.raw, ctx.gated)
           ? { ...base, kind: "warn", text: `backend violation: ${c.tool}` }
           : { ...base, kind: "tool", text: `${c.tool} ${(JSON.stringify(c.args) ?? "").slice(0, 200)}` };
       }

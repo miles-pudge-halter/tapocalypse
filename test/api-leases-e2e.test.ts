@@ -55,18 +55,22 @@ beforeAll(async () => {
     stdout: "ignore",
     stderr: "ignore",
   });
-  for (let i = 0; i < 100; i++) {
-    if ((await fetch(`${base}/api/leases`).catch(() => null))?.ok) return;
+  const started = Date.now();
+  for (let i = 0; i < 300; i++) {
+    if ((await fetch(`${base}/api/leases`).catch(() => null))?.ok) {
+      if (Date.now() - started > 5_000) console.warn(`lease e2e server took ${Date.now() - started} ms to start`);
+      return;
+    }
     await Bun.sleep(100);
   }
   throw new Error("lease test server did not start");
-});
+}, 40_000); // the poll above allows 30 s: under a full randomized suite a cold start can take well over Bun's 5 s hook default
 
 afterAll(async () => {
   server?.kill("SIGTERM");
   await server?.exited;
   fs.rmSync(root, { recursive: true, force: true });
-});
+}, 15_000); // SIGTERM makes the server drain the gateway's children before exiting
 
 const post = (pathname: string, body: unknown, signal?: AbortSignal) =>
   fetch(`${base}${pathname}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal });

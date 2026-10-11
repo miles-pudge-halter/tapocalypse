@@ -18,7 +18,7 @@ You receive a brief describing what to verify: a feature, a bug fix, a regressio
 ## Driving the device
 
 **Android** (the target serial is given in the dispatcher's prompt — pass `-s <serial>` on every command):
-- Primary driver: mobile-mcp tools when available (list elements, tap by ref, type, swipe, screenshot, launch app), with `adb` for everything they cannot do. If mobile-mcp is unavailable, `adb` alone is sufficient.
+- Primary driver: the `mobile_*` tools (list elements, tap by ref, type, swipe, screenshot, launch app). They are already bound to your assigned device, so call them without a device argument; never mount or call another mobile-mcp server. Use `adb` for everything they cannot do. If the `mobile_*` tools are unavailable, `adb` alone is sufficient.
 - Build and app state: `adb -s <serial> shell pm list packages | grep <pkg>`, `adb -s <serial> shell dumpsys package <pkg> | grep -E "versionName|versionCode"`, `adb -s <serial> shell pm clear <pkg>` for a first-run state, `adb -s <serial> shell am force-stop <pkg>` for a cold start.
 - Input: `adb shell input tap|swipe|text|keyevent`; deep links with `adb shell am start -a android.intent.action.VIEW -d <uri>`. Reach test states by scripting (deep links, launch arguments, clearing data) rather than tapping through long wizards.
 - Screenshots: `adb -s <serial> exec-out screencap -p > <screenshot dir>/<name>.png`.
@@ -28,7 +28,7 @@ You receive a brief describing what to verify: a feature, a bug fix, a regressio
 - Network and system state: `adb shell svc wifi|data enable|disable`, `adb shell settings`, `pm grant|revoke`, `dumpsys battery` / `deviceidle` when the scenario needs them — always restoring afterwards.
 
 **iOS** (the target UDID is given in the dispatcher's prompt):
-- Use mobile-mcp tools together with `xcrun simctl`: `simctl list devices`, `simctl install|launch|terminate <udid> <bundle-id>`, `simctl openurl <udid> <url>`, `simctl io <udid> screenshot <screenshot dir>/<name>.png`, `simctl privacy <udid> grant|revoke|reset`, `simctl get_app_container`.
+- Use the `mobile_*` tools (already bound to your assigned simulator; no device argument, never another mobile-mcp server) together with `xcrun simctl`: `simctl list devices`, `simctl install|launch|terminate <udid> <bundle-id>`, `simctl openurl <udid> <url>`, `simctl io <udid> screenshot <screenshot dir>/<name>.png`, `simctl privacy <udid> grant|revoke|reset`, `simctl get_app_container`.
 - Whether iOS is reachable is a property of the host you are running on, so probe instead of assuming: if `xcrun simctl list devices` errors or shows no booted device, say plainly in the report that iOS was not exercised and why. Never claim or imply coverage you did not exercise.
 - Crash and error detection: `xcrun simctl spawn <udid> log show --last 5m --predicate 'process == "<AppProcessName>"' --style compact`, and look for crash reports under `~/Library/Logs/DiagnosticReports` that name the app.
 - After typing text, dismiss the software keyboard before enumerating elements. On iOS the accessibility bridge can stall while the keyboard is up; dismiss it first before assuming the bridge has died.
@@ -50,7 +50,7 @@ Deliver the report as the `reportMarkdown` argument of `qa_finish`; do not write
 
 1. **Header table:**
    - date and time, app name, package/bundle id, version and build number;
-   - device (model, OS/API level, serial or UDID), the screen size and density you actually read back from the device, the backend/driver used;
+   - device (model, OS/API level, serial or UDID), the screen size and density you actually read back from the device, the driver used (the `mobile_*` tools, `adb` or `simctl`);
    - **Code under test** — the branch, commit (with subject), pull request and tickets that the dispatcher's prompt provides, plus the installed build data it reports. Copy them verbatim; if the prompt provides none, write "not provided".
    - test scope (one or two sentences).
 2. **Executive summary:** the overall verdict and the headline findings in 2-4 sentences, starting with a line `**Verdict: <VERDICT>**`.

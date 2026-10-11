@@ -1,161 +1,75 @@
-// How Tapocalypse makes mobile-mcp available to the omp agent without the user editing any omp config.
+// How Tapocalypse gives the omp agent its device tools without the user editing any omp config.
 //
-// Findings, measured 2026-10-08 with omp 18.4.0 (throwaway RPC scripts, haiku, cwd without .omp/mcp.json):
-// - omp has no per-session MCP flag/env var/RPC command. The only no-edit mechanism is `--plugin-dir <dir>`
-//   containing a `.mcp.json`; the plugin name is the dir basename and its servers are namespaced `<plugin>:<server>`.
-// - `--profile <name>` isolates the user-level `~/.omp/agent/mcp.json` (fresh profile = no MCP servers at all),
-//   so it was used to simulate a machine that has never configured mobile-mcp:
-//     fresh profile                      -> 0 MCP tools
-//     fresh profile + plugin dir `tpc`   -> 33 mobile-mcp tools
-//     user config with mobile-mcp + the same plugin dir -> only the user's 33 appear: omp drops a differently-named
-//       server whose command/args equal a higher-priority one (no duplicates), so adding the plugin is harmless
-//       when it is byte-for-byte equivalent; we still skip it when mobile-mcp is already configured.
+// Findings (omp 18.4.0, throwaway RPC scripts):
+// - omp has no per-session MCP flag/env var/RPC command. The only no-edit mechanism is `--plugin-dir <dir>` containing a
+//   `.mcp.json`; the plugin name is the dir basename and its servers are namespaced `mcp__<plugin>_<server>_<tool>`.
+// - Since the device gateway, every run reaches its device through the run endpoint `POST /mcp/runs/<id>`, which serves the
+//   gated `mobile_*` tools pinned to the run's device. omp cannot speak to that endpoint directly, so the plugin's server is
+//   the stdio bridge (`src/mcp/stdio-bridge.ts`, credentials in an owner-only file under the run dir): plugin `tpc` + server
+//   `qa` give `mcp__tpc_qa_mobile_take_screenshot`. The plugin dir lives under the run dir, so nothing is shared between runs.
 // - MCP tools are NOT in RPC `get_state.dumpTools` (13 built-ins only). They are mounted as `xd://mcp__<server>_<tool>`
 //   devices and listed in `get_state.systemPrompt` under "MCP Tool Routes"; the model calls them with
-//   `write xd://mcp__… <json args>` (verified end to end: mobile_list_available_devices returned the emulator,
-//   whose mobile-mcp device id was the AVD name `Pixel_7_Pro_API_34_2`).
-// - Naming: user config entry `mobile-mcp` -> `mcp__mobile_mcp_mobile_list_elements_on_screen`; plugin `tpc` +
-//   server `mobile-mcp` -> `mcp__tpc_mobile_mcp_mobile_list_elements_on_screen`. Tool names are capped at ~64 chars and
-//   longer ones get a hash suffix (plugin `tapocalypse-mobile` + server `mobile` produced `…_click_on_screen_a_s2dijuvz`),
-//   hence the deliberately short plugin name `tpc` (longest name is 62 chars, nothing truncated).
-// - Startup: ready frame ~0.6 s; tools appear in `systemPrompt` ~1 s after ready with a warm npx cache, ~3.5 s when
-//   npx has to resolve the package, and a prompt sent earlier than that fails with "No such tool: xd://mcp__…"
-//   (observed with a cold `@1.0.8` install). So prefixes must be resolved before prompting.
-// - The route list in the system prompt can be bounded ("Additional mounted MCP tool mappings omitted"); when that marker
-//   is present and the tools are not listed, we fall back to the prefix derived from the config we provisioned.
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import os from "node:os";
+//   `write xd://mcp__… <json args>`.
+// - Tool names are capped at ~64 chars and longer ones get a hash suffix, hence the deliberately short plugin name `tpc`.
+// - Startup: ready frame ~0.6 s; the bridge's tools appear in `systemPrompt` ~1-3.5 s later (it waits for the gateway's tool
+//   list), and a prompt sent earlier fails with "No such tool: xd://mcp__…". So the prefix must be resolved before prompting.
+// - The route list in the system prompt can be bounded ("Additional mounted MCP tool mappings omitted"). omp RPC has no
+//   host-initiated tool call to probe with, so when the bridge is not listed the run counts it as not connected (infra, retried)
+//   instead of trusting the plan: a dead bridge must never become a paid prompt with no device tools.
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { DATA_DIR } from "../../config";
-import type { Project } from "../../projects/registry";
-import { MOBILE_MCP_PACKAGE } from "../types";
+import { STDIO_BRIDGE, writeBridgeCredentials } from "../bridge";
+import { PROGRESS_SERVER, type McpServerSpec } from "../types";
 import type { OmpRpc } from "./rpc";
 
 export interface ToolPrefixes {
+  /** Prefix of the bridge's `mobile_*` tools (`mcp__tpc_qa_`), null when they never appeared. */
   mobileMcp: string | null;
 }
 
 export interface LaunchPlan {
   args: string[];
-  /** Prefix the mobile-mcp tools will have according to the config we found or wrote. */
-  expectedMobileMcp: string | null;
-  /** Plugin dir passed to omp, when Tapocalypse had to provision mobile-mcp itself. */
-  pluginDir: string | null;
-  /** Config files that were inspected, for error messages. */
-  checked: string[];
-}
-
-export interface ProvisionOptions {
-  /** Defaults to `os.homedir()`; injectable so tests never read the real user config. */
-  home?: string;
-  /** Defaults to `OMP_PROFILE` / `PI_PROFILE`: named profiles move the user-level MCP config. */
-  profile?: string | null;
-  /** Defaults to `DATA_DIR/omp-plugins`. */
-  pluginRoot?: string;
+  /** Per-run plugin dir passed to omp. */
+  pluginDir: string;
 }
 
 /** Short on purpose: the plugin name is part of every tool name and omp truncates names near 64 chars. */
 export const PLUGIN_NAME = "tpc";
-const PLUGIN_SERVER = "mobile-mcp";
+const PLUGIN_SERVER = "qa";
+/** The bridge's tool calls can take a while (element lists on large trees); matches the gateway's own call timeout. */
+const PLUGIN_TIMEOUT_MS = 300_000;
 
-const PLUGIN_MCP_JSON = `${JSON.stringify(
-  {
-    mcpServers: {
-      [PLUGIN_SERVER]: {
-        type: "stdio",
-        command: "npx",
-        args: ["-y", `${MOBILE_MCP_PACKAGE}@latest`],
-        timeout: 120_000,
-      },
-    },
-  },
-  null,
-  2,
-)}\n`;
-
-/** omp's tool-name rule as observed: `mcp__<server>_` where `<server>` (or `<plugin>:<server>`) has every non-alphanumeric char as `_`. */
-const PLUGIN_TOOL_PREFIX = `mcp__${PLUGIN_NAME}_${PLUGIN_SERVER.replace(/[^A-Za-z0-9]/g, "_")}_`;
-
-interface McpFile {
-  mcpServers?: Record<string, { command?: unknown; args?: unknown; enabled?: unknown } | null>;
-  disabledServers?: unknown;
-}
-
-function readJson(file: string): McpFile | null {
-  try {
-    const v: unknown = JSON.parse(readFileSync(file, "utf8"));
-    return v && typeof v === "object" ? (v as McpFile) : null;
-  } catch {
-    return null;
-  }
-}
-
-/** Config files omp reads MCP servers from that are tied to this machine/project (user scope first, as omp resolves it). */
-function configFiles(repoPath: string, home: string, profile: string | null): string[] {
-  const userDir = profile ? path.join(home, ".omp", "profiles", profile, "agent") : path.join(home, ".omp", "agent");
-  return [
-    path.join(userDir, "mcp.json"),
-    path.join(userDir, ".mcp.json"),
-    path.join(repoPath, ".omp", "mcp.json"),
-    path.join(repoPath, ".omp", ".mcp.json"),
-    path.join(repoPath, "mcp.json"),
-    path.join(repoPath, ".mcp.json"),
-  ];
-}
-
-/** Name of the first enabled server in `files` whose command/args run mobile-mcp, or null. */
-function findConfiguredMobileMcp(files: string[], userFile: string): string | null {
-  const disabled = new Set<string>();
-  const userDisabled = readJson(userFile)?.disabledServers;
-  if (Array.isArray(userDisabled)) for (const n of userDisabled) if (typeof n === "string") disabled.add(n);
-  for (const file of files) {
-    const servers = readJson(file)?.mcpServers;
-    if (!servers) continue;
-    for (const [name, entry] of Object.entries(servers)) {
-      if (!entry || entry.enabled === false || disabled.has(name)) continue;
-      const cmdline = [entry.command, ...(Array.isArray(entry.args) ? entry.args : [])].join(" ");
-      if (cmdline.includes(MOBILE_MCP_PACKAGE)) return name;
-    }
-  }
-  return null;
-}
-
-/** (Re)writes the plugin dir only when its content differs, so concurrent runs never see a half-written file. */
-function ensurePluginDir(pluginRoot: string): string {
-  const dir = path.join(pluginRoot, PLUGIN_NAME);
-  const file = path.join(dir, ".mcp.json");
-  if (!existsSync(file) || readFileSync(file, "utf8") !== PLUGIN_MCP_JSON) {
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(file, PLUGIN_MCP_JSON);
-  }
-  return dir;
-}
+/** omp's tool-name rule as observed: `mcp__<plugin>_<server>_` with every non-alphanumeric char as `_`. */
+export const PLUGIN_TOOL_PREFIX = `mcp__${PLUGIN_NAME}_${PLUGIN_SERVER}_`;
 
 /**
- * Extra omp CLI args needed so the agent has mobile-mcp. Adds Tapocalypse's plugin dir only when no enabled
- * mobile-mcp server is configured in the user's or the project's omp config.
+ * Writes `<runDir>/plugin/tpc/.mcp.json` (stdio bridge to the run's `tpc` endpoint) plus the owner-only bridge credentials
+ * `<runDir>/tpc-mcp.json`, and returns the omp args that mount it.
  */
-export async function mcpLaunchArgs(project: Pick<Project, "repoPath">, opts: ProvisionOptions = {}): Promise<LaunchPlan> {
-  const home = opts.home ?? os.homedir();
-  const profile = opts.profile === undefined ? (process.env.OMP_PROFILE ?? process.env.PI_PROFILE ?? null) : opts.profile;
-  const files = configFiles(project.repoPath, home, profile || null);
-  const configured = findConfiguredMobileMcp(files, files[0]!);
-  if (configured) return { args: [], expectedMobileMcp: `mcp__${configured.replace(/[^A-Za-z0-9]/g, "_")}_`, pluginDir: null, checked: files };
-  const pluginDir = ensurePluginDir(opts.pluginRoot ?? path.join(DATA_DIR, "omp-plugins"));
-  return {
-    args: ["--plugin-dir", pluginDir],
-    expectedMobileMcp: PLUGIN_TOOL_PREFIX,
-    pluginDir,
-    checked: files,
+export function writePlugin(runDir: string, servers: McpServerSpec[]): LaunchPlan {
+  const spec = servers.find((s): s is Extract<McpServerSpec, { transport: "http" }> => s.name === PROGRESS_SERVER && s.transport === "http");
+  if (!spec) throw new Error(`the run's "${PROGRESS_SERVER}" MCP endpoint is missing from the spawn options`);
+  mkdirSync(runDir, { recursive: true });
+  const credentials = writeBridgeCredentials(runDir, spec);
+  const pluginDir = path.join(runDir, "plugin", PLUGIN_NAME);
+  mkdirSync(pluginDir, { recursive: true });
+  const config = {
+    mcpServers: { [PLUGIN_SERVER]: { type: "stdio", command: process.execPath, args: [STDIO_BRIDGE, credentials], timeout: PLUGIN_TIMEOUT_MS } },
   };
+  const file = path.join(pluginDir, ".mcp.json");
+  writeFileSync(file, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+  chmodSync(file, 0o600);
+  return { args: ["--plugin-dir", pluginDir], pluginDir };
 }
 
-const MOBILE_MCP_MARKER = "mobile_list_elements_on_screen";
+const MOBILE_MARKER = "mobile_list_elements_on_screen";
 const ROUTE_RE = /xd:\/\/(mcp__[A-Za-z0-9_:.-]+)/g;
 const ROUTES_OMITTED_RE = /mappings omitted/i;
 
+/** Only Tapocalypse's own plugin counts: a `mobile-mcp` the user configured themselves must never be adopted. */
 function prefixOf(names: string[], marker: string): string | null {
-  const hit = names.find((n) => n.startsWith("mcp__") && n.endsWith(`_${marker}`));
+  const own = `mcp__${PLUGIN_NAME}_`;
+  const hit = names.find((n) => n.startsWith(own) && n.endsWith(`_${marker}`));
   return hit ? hit.slice(0, hit.length - marker.length) : null;
 }
 
@@ -164,7 +78,7 @@ export interface StatePrefixes extends ToolPrefixes {
   routesOmitted: boolean;
 }
 
-/** Derives the mobile-mcp tool prefix from an RPC `get_state` payload (plain tools and `xd://` routes). */
+/** Derives the bridge's tool prefix from an RPC `get_state` payload (plain tools and `xd://` routes). */
 export function prefixesFromState(state: unknown): StatePrefixes {
   const data = (state && typeof state === "object" ? state : {}) as { dumpTools?: unknown; systemPrompt?: unknown };
   const names: string[] = [];
@@ -177,40 +91,32 @@ export function prefixesFromState(state: unknown): StatePrefixes {
   const prompt = Array.isArray(data.systemPrompt) ? data.systemPrompt.join("\n") : typeof data.systemPrompt === "string" ? data.systemPrompt : "";
   for (const m of prompt.matchAll(ROUTE_RE)) names.push(m[1]!);
   return {
-    mobileMcp: prefixOf(names, MOBILE_MCP_MARKER),
+    mobileMcp: prefixOf(names, MOBILE_MARKER),
     routesOmitted: ROUTES_OMITTED_RE.test(prompt),
   };
 }
 
+// The runner warms the gateway before spawning, so the bridge lists its tools from memory; 20 s covers a slow omp start.
 const MCP_WAIT_MS = 20_000;
 const MCP_POLL_MS = 500;
 
 /**
- * Discovers the real tool-name prefixes after `ready`. MCP servers connect in the background, so this polls
- * `get_state` until the mobile-mcp prefix shows up (or `timeoutMs` passes). A null prefix in the result means
- * the mobile-mcp tools are not available to the agent.
+ * Discovers the real tool-name prefix after `ready`. MCP servers connect in the background, so this polls `get_state`
+ * until the bridge's prefix shows up (or `timeoutMs` passes). A null prefix in the result means the device tools are not
+ * confirmed: omp has no host-initiated tool call to probe with, so even when its prompt bounds the route list the bridge
+ * counts as not connected rather than trusting the plan.
  */
-export async function resolveToolPrefixes(
-  rpc: OmpRpc,
-  opts: { expectedMobileMcp?: string | null; timeoutMs?: number } = {},
-): Promise<ToolPrefixes> {
+export async function resolveToolPrefixes(rpc: OmpRpc, opts: { timeoutMs?: number } = {}): Promise<StatePrefixes> {
   const deadline = Date.now() + (opts.timeoutMs ?? MCP_WAIT_MS);
-  let latest: StatePrefixes;
   for (;;) {
-    latest = prefixesFromState(await rpc.send({ type: "get_state" }));
-    if (latest.mobileMcp || Date.now() >= deadline) break;
+    const state = prefixesFromState(await rpc.send({ type: "get_state" }));
+    if (state.mobileMcp || Date.now() >= deadline) return state;
     await Bun.sleep(MCP_POLL_MS);
   }
-  const { routesOmitted, ...prefixes } = latest;
-  // The route list is bounded in the system prompt; absence then proves nothing, so trust what we provisioned.
-  if (!prefixes.mobileMcp && routesOmitted && opts.expectedMobileMcp) prefixes.mobileMcp = opts.expectedMobileMcp;
-  return prefixes;
 }
 
-/** The actionable error for a run whose mobile-mcp tools never appeared. */
-export function missingToolsMessage(plan: LaunchPlan): string {
-  const how = plan.pluginDir
-    ? `no mobile-mcp server in ${plan.checked.join(", ")}; tried Tapocalypse's bundled plugin ${plan.pluginDir} but its server did not connect within ${MCP_WAIT_MS / 1000}s (is \`npx\` on PATH and the network reachable?)`
-    : `mobile-mcp is configured in omp (${plan.checked.join(", ")}) but its server did not connect within ${MCP_WAIT_MS / 1000}s`;
-  return `mobile-mcp tools are not available to the agent: ${how}; see README §Prerequisites`;
+/** The actionable error for a run whose device tools never appeared. */
+export function missingToolsMessage(plan: LaunchPlan, routesOmitted: boolean): string {
+  const bounded = routesOmitted ? "; omp bounds the MCP route list in its prompt, so the bridge could not be confirmed, and an unconfirmed bridge counts as not connected" : "";
+  return `the device tools are not available to the agent: Tapocalypse's plugin ${plan.pluginDir} (stdio bridge to the run's MCP endpoint) did not connect within ${MCP_WAIT_MS / 1000}s${bounded}; see the run's stderr and README §Prerequisites`;
 }

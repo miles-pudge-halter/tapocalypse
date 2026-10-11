@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { HARNESS_IDS, type HarnessId, MOBILE_MCP_SERVER, PROGRESS_SERVER } from "../harness/types";
+import { HARNESS_IDS, type HarnessId, PROGRESS_SERVER } from "../harness/types";
 import { screenshotsDir } from "./artefacts";
 import type { Run } from "./types";
 
@@ -43,19 +43,23 @@ export function loadPersona(file: string): Persona {
 /** The callable name the harness gives `tool` of the MCP server `server` (see `HarnessSession.toolName`). */
 export type ToolNamer = (server: string, tool: string) => string;
 
-/** Driving guidance, naming the mobile-mcp tools exactly as this harness mounted them for this run. */
+/** Driving guidance, naming the mobile tools exactly as this harness mounted them for this run (they come from the run's own `tpc` server). */
 function driverRules(toolName: ToolNamer): string {
-  const mobile = (tool: string) => toolName(MOBILE_MCP_SERVER, tool);
-  return `Driver: mobile-mcp. Use the ${mobile("")}* tools plus adb/simctl.
-mobile-mcp: call ${mobile("mobile_list_elements_on_screen")} once per screen and tap by its @ref; re-list only after navigation or a visible change.
+  const mobile = (tool: string) => toolName(PROGRESS_SERVER, tool);
+  return `Driver: the ${mobile("")}* tools plus adb/simctl.
+Call ${mobile("mobile_list_elements_on_screen")} once per screen and tap by its @ref; re-list only after navigation or a visible change.
 Group known sequences (tap, type, tap) in ${mobile("mobile_batch_commands")}. Use ${mobile("mobile_take_screenshot")} only for what the element list cannot show.`;
 }
 
-function deviceLine(run: Run): string {
+function deviceLine(run: Run, toolName: ToolNamer): string {
   const target = `Target device: ${run.deviceSerial} (${run.deviceRequest.platform})`;
+  const label = run.deviceName ? `${run.deviceName} (${run.deviceSerial})` : run.deviceSerial;
+  // The exact prefix matters: an agent whose harness also mounts a mobile-mcp of its own sees two `mobile_*` sets.
+  const prefix = toolName(PROGRESS_SERVER, "mobile_");
+  const only = prefix === "mobile_" ? "" : " Use ONLY those: any other mobile_* tool (for example one named mcp__mobile_mcp_mobile_…) belongs to a different server and must not be called.";
+  const bound = `The ${prefix}* tools are already bound to your device ${label}; call them without a device argument.${only} Use ${run.deviceSerial} for every adb / simctl call. NEVER mount or call another mobile-mcp server.`;
   const rules = "NEVER touch, boot, shut down or reconfigure any other device, NEVER run `adb kill-server`, and do not boot your own emulator — this device was assigned to you.";
-  const id = run.deviceLabel ?? run.deviceSerial;
-  return `${target}; mobile-mcp device id: "${id}". Use the serial for every adb / simctl call and the device id as the device argument of every mobile-mcp tool (never the adb serial for an emulator). ${rules}`;
+  return `${target}. ${bound} ${rules}`;
 }
 
 /** The "Code under test" block; empty string when the run has neither source nor build data worth reporting. */
@@ -100,7 +104,7 @@ export function buildPrompt(run: Run, toolName: ToolNamer, opts: PromptOptions):
   const persona = opts.prependPersona ? `Your system instructions (follow them for the whole session):\n${opts.prependPersona.trim()}\n\n---\n\n` : "";
   return `${persona}You are the QA agent described in your system instructions, running headless inside Tapocalypse. Other QA agents are running in parallel on other devices. You are the top-level agent: do NOT spawn subagents, do NOT ask the user questions or wait for replies, and NEVER call a tool of any MCP server named "tapocalypse". If you are blocked, record why in the report and call ${finish} with verdict BLOCKED.
 
-${deviceLine(run)}
+${deviceLine(run, toolName)}
 App package: ${run.packageId}. Use the build that is already installed unless the brief says otherwise.
 Run id: ${runId}.
 Time budget: ${opts.runMaxTime}. If you are running out of time, stop testing, write the report with what you have and call ${finish}.
@@ -117,7 +121,13 @@ Brief:
 ${run.brief}`;
 }
 
-/** True when `tool` (canonical name) reaches Tapocalypse's own MCP server (run management), which a run's agent must never use. */
-export function backendViolation(tool: string): boolean {
-  return tool.startsWith("mcp__tapocalypse_");
+/**
+ * True when `tool` reaches something a run's agent must never use: Tapocalypse's own run-management MCP server, or (on a `gated`
+ * run only) a mobile-mcp server it mounted itself: a gated run gets its device tools from the run's `tpc` server, pinned to the
+ * assigned device. Runs from before the gateway mounted mobile-mcp themselves, so their `mobile_mcp` calls are legitimate.
+ * Pass the name as the agent's harness reported it, before the adapter maps tpc's `mobile_*` tools to their canonical
+ * `mcp__mobile_mcp_mobile_*` form: only a tool that did not come through `tpc` still carries a `mobile_mcp` server name.
+ */
+export function backendViolation(tool: string, gated: boolean): boolean {
+  return tool.startsWith("mcp__tapocalypse_") || (gated && (tool.startsWith("mcp__mobile_mcp_") || tool.startsWith("mcp__mobile-mcp_")));
 }

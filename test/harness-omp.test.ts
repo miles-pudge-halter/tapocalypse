@@ -35,7 +35,7 @@ process.stdin.on("end", () => setTimeout(() => process.exit(0), fake.exitDelayMs
 let failing = false;
 function respond(cmd, data) { out({ type: "response", id: cmd.id, success: true, data }); }
 function handle(cmd) {
-  if (cmd.type === "get_state") return respond(cmd, { systemPrompt: "MCP Tool Routes: xd://mcp__tpc_mobile_mcp_mobile_list_elements_on_screen" });
+  if (cmd.type === "get_state") return respond(cmd, { systemPrompt: "MCP Tool Routes: xd://mcp__tpc_qa_mobile_list_elements_on_screen" });
   if (cmd.type === "set_host_tools") return respond(cmd, {});
   if (cmd.type === "get_session_stats") return respond(cmd, { tokens: { input: 5, output: 6 }, cost: 0.25, toolCalls: 2 });
   if (cmd.type === "export_html") { fs.writeFileSync(cmd.outputPath, "<html></html>"); return respond(cmd, {}); }
@@ -94,7 +94,7 @@ function spawn(over: Partial<SpawnOptions> = {}, timing: Partial<OmpTiming> = {}
     personaFile: path.join(runDir, "persona.md"),
     model: null,
     effort: null,
-    mcpServers: [],
+    mcpServers: [{ name: "tpc", transport: "http", url: "http://127.0.0.1:4310/mcp/runs/r1", headers: { Authorization: "Bearer SECRET-RUN-TOKEN" } }],
     limits: { maxTime: "60s", maxTurns: null, maxBudgetUsd: null },
     settings: { bin: fakeBin },
     onEvent: (e) => {
@@ -114,9 +114,9 @@ describe("omp adapter against a fake omp process", () => {
   test("mounts the device tools, routes host-tool calls to the progress sink, reports usage and releases the session", async () => {
     const { session, state } = spawn();
     const info = await session.ready();
-    expect(info.mcp).toEqual([{ name: "mobile_mcp", ok: true }]);
+    expect(info.mcp).toEqual([{ name: "tpc", ok: true }]);
     expect(state.events).toContainEqual(expect.objectContaining({ type: "notice", level: "info" }));
-    expect(session.toolName("mobile_mcp", "mobile_click")).toBe("mcp__tpc_mobile_mcp_mobile_click");
+    expect(session.toolName("tpc", "mobile_click")).toBe("mcp__tpc_qa_mobile_click");
     expect(session.toolName(PROGRESS_SERVER, "qa_plan")).toBe("qa_plan");
 
     await session.send("go");
@@ -151,6 +151,24 @@ describe("omp adapter against a fake omp process", () => {
     const { session } = spawn();
     session.kill();
     expect(await session.exited).toMatchObject({ settled: false });
+  });
+
+  test("the run's tpc endpoint is mounted through a per-run plugin dir and the stdio bridge", async () => {
+    const { session, state } = spawn();
+    await session.ready();
+    const argv = JSON.parse(fs.readFileSync(path.join(state.opts.runDir, "argv.json"), "utf8")) as string[];
+    const pluginDir = path.join(state.opts.runDir, "plugin", "tpc");
+    expect(argv[argv.indexOf("--plugin-dir") + 1]).toBe(pluginDir);
+    expect(fs.existsSync(path.join(pluginDir, ".mcp.json"))).toBe(true);
+    expect(JSON.stringify(argv)).not.toContain("SECRET-RUN-TOKEN");
+    session.kill();
+    await session.exited;
+  });
+
+  test("a run without a tpc endpoint never starts omp", async () => {
+    const { session } = spawn({ mcpServers: [] });
+    await expect(session.ready()).rejects.toThrow(/tpc/);
+    expect(await session.exited).toMatchObject({ started: false, settled: false });
   });
 
   test("a binary that cannot be spawned is a session that never ran, reported through exited and ready", async () => {
