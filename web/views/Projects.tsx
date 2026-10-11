@@ -100,7 +100,7 @@ const STRIP_RUNS = 12;
 const CUSTOM = ":custom";
 const BUILTIN = ":builtin";
 const SAVE_ERROR = /^(\w+): (.+)$/s;
-const PROJECT_FIELDS: (keyof Project)[] = ["id", "name", "repoPath", "personaFile", "defaultPackage", "defaultPlatform"];
+const PROJECT_FIELDS: (keyof Project)[] = ["id", "name", "repoPath", "personaFile", "defaultPackage", "defaultPlatform", "defaultBranch"];
 
 type FieldErrors = Partial<Record<keyof Project, string>>;
 
@@ -707,6 +707,8 @@ interface FormState {
   /** BUILTIN, CUSTOM, or a detected / current repo-relative persona path. */
   persona: string;
   customPersona: string;
+  /** Branch regression baselines fall back to; empty = the repository's default branch. */
+  defaultBranch: string;
 }
 
 type Fields = Omit<ProjectInput, "id">;
@@ -722,6 +724,7 @@ function formFromProject(p: Project): FormState {
     packageCustom: false,
     persona: p.personaFile ?? BUILTIN,
     customPersona: "",
+    defaultBranch: p.defaultBranch ?? "",
   };
 }
 
@@ -737,6 +740,7 @@ function formFromDetection(d: Detection): FormState {
     packageCustom: false,
     persona: suggestion.personaFile ?? BUILTIN,
     customPersona: "",
+    defaultBranch: "",
   };
 }
 
@@ -779,6 +783,7 @@ function buildFields(form: FormState, options: string[]): Built {
       personaFile,
       defaultPackage: form.packageId.trim(),
       defaultPlatform: form.platform,
+      defaultBranch: form.defaultBranch.trim(),
     },
   };
 }
@@ -1176,6 +1181,25 @@ function ProjectForm({
           )}
         </div>
       </Field>
+
+      <Field
+        id="pj-branch"
+        label="Default branch"
+        hint="Runs on other branches are compared with the latest run here. Leave empty to use the repository's default branch, then main or master."
+        error={errors.defaultBranch}
+      >
+        <Input
+          id="pj-branch"
+          className="font-mono"
+          placeholder="develop"
+          value={form.defaultBranch}
+          onChange={(e) => patch({ defaultBranch: e.target.value })}
+          autoComplete="off"
+          spellCheck={false}
+          aria-invalid={errors.defaultBranch ? true : undefined}
+          aria-describedby="pj-branch-hint"
+        />
+      </Field>
       </section>
 
       <Collapsible
@@ -1279,6 +1303,7 @@ function emptyForm(): FormState {
     packageCustom: false,
     persona: BUILTIN,
     customPersona: "",
+    defaultBranch: "",
   };
 }
 

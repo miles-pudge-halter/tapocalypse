@@ -5,6 +5,8 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Lightbox } from "@/components/lightbox";
+import { CompareStrip } from "@/components/regression/compare-strip";
+import { useLinkActions } from "@/components/regression/match-badge";
 import { ChecksRail } from "@/components/run/checks-rail";
 import { DevicePane } from "@/components/run/device-pane";
 import { buildGallery, type GalleryItem } from "@/components/run/evidence";
@@ -15,8 +17,8 @@ import { ScreenshotsGallery } from "@/components/run/screenshots-gallery";
 import { Timeline } from "@/components/run/timeline";
 import { useRunActions } from "@/components/run/use-run-actions";
 import { useFillHeight, useMinWidth, useScreenshots } from "@/components/run/use-workbench";
-import { isActive, runHash, type Activity, type RunView } from "@/lib/api";
-import { keyboardClaimed, useDevices, useProjects, useRunEvents } from "@/lib/hooks";
+import { compareHash, isActive, runHash, type Activity, type RunView } from "@/lib/api";
+import { keyboardClaimed, navigate, useCheckHistorySheet, useComparison, useDevices, useNow, useProjects, useRunEvents, useShortcut } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 
 const WIDE_BREAKPOINT_PX = 1280;
@@ -26,7 +28,7 @@ type TabId = "workbench" | "checks" | "timeline" | "device" | "screenshots";
 
 const PANE = "min-h-0 overflow-hidden rounded-lg border bg-card";
 
-export function RunDetail({ id, check }: { id: string; check?: string }) {
+export function RunDetail({ id, check, baseline }: { id: string; check?: string; baseline?: string }) {
   const { run, activity, hasMoreActivity, loadEarlier, error, connected } = useRunEvents(id);
 
   if (!run && error) {
@@ -58,6 +60,7 @@ export function RunDetail({ id, check }: { id: string; check?: string }) {
         loadEarlier={loadEarlier}
         connected={connected}
         initialCheck={check ?? null}
+        baseline={baseline ?? null}
       />
     </div>
   );
@@ -85,6 +88,7 @@ function Workbench({
   loadEarlier,
   connected,
   initialCheck,
+  baseline,
 }: {
   run: RunView;
   activity: Activity[];
@@ -92,6 +96,8 @@ function Workbench({
   loadEarlier: () => Promise<void>;
   connected: boolean;
   initialCheck: string | null;
+  /** `?baseline=` of the page: a manually picked baseline run, null = automatic. */
+  baseline: string | null;
 }) {
   const wide = useMinWidth(WIDE_BREAKPOINT_PX);
   const { projects } = useProjects();
@@ -100,6 +106,12 @@ function Workbench({
   const [selected, setSelected] = useState<string | null>(initialCheck);
   const [tab, setTab] = useState<TabId>("workbench");
   const [lightbox, setLightbox] = useState<number | null>(null);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const comparisonState = useComparison(run.id, baseline);
+  const { comparison } = comparisonState;
+  const linkActions = useLinkActions(comparison, comparisonState.refresh);
+  const { openHistory } = useCheckHistorySheet();
+  const now = useNow(60_000);
   const fillRef = useRef<HTMLDivElement>(null);
   const height = useFillHeight(fillRef, MIN_WORKBENCH_HEIGHT_PX);
 
@@ -126,11 +138,24 @@ function Workbench({
     (checkId: string | null) => {
       setSelected(checkId);
       // replace, not push: stepping through checks must not fill the history.
-      window.location.replace(runHash(run.id, checkId ?? undefined));
+      window.location.replace(runHash(run.id, checkId ?? undefined, baseline ?? undefined));
       if (checkId && !wide) setTab("timeline");
     },
-    [run.id, wide],
+    [run.id, wide, baseline],
   );
+
+  const openCheckHistory = useCallback(
+    (checkId: string) => {
+      const found = run.checks.find((c) => c.id === checkId);
+      if (!found) return;
+      const pair = comparison?.pairs.find((p) => p.current?.checkId === checkId);
+      openHistory({ projectId: run.projectId, checkKey: pair?.checkKey ?? null, runId: run.id, checkId, title: found.title });
+    },
+    [run.checks, run.id, run.projectId, comparison, openHistory],
+  );
+
+  useShortcut("c", () => comparison && navigate(compareHash(run.id, baseline ?? "auto")), [comparison, run.id, baseline]);
+  useShortcut("h", () => selected && openCheckHistory(selected), [selected, openCheckHistory]);
 
   const openImage = useCallback(
     (item: GalleryItem) => {
@@ -162,7 +187,16 @@ function Workbench({
     return () => window.removeEventListener("keydown", onKey);
   }, [run.checks, selected, select]);
 
-  const rail = <ChecksRail run={run} gallery={gallery} selected={selected} onSelect={select} onOpenImage={openImage} />;
+  const rail = <ChecksRail
+      run={run}
+      gallery={gallery}
+      selected={selected}
+      onSelect={select}
+      onOpenImage={openImage}
+      comparison={comparison}
+      linkActions={linkActions}
+      onOpenHistory={openCheckHistory}
+    />;
   const timeline = (
     <Timeline
       run={run}
@@ -200,6 +234,15 @@ function Workbench({
   return (
     <>
       <RunHeader run={run} device={device} projectName={projectName} connected={connected} actions={actions} />
+      <CompareStrip
+        run={run}
+        state={comparisonState}
+        baselineParam={baseline}
+        now={now}
+        pickerOpen={pickerOpen}
+        onPickerOpenChange={setPickerOpen}
+        onPick={(picked) => window.location.replace(runHash(run.id, selected ?? undefined, picked ?? undefined))}
+      />
       {active ? <PhaseStepper run={run} /> : null}
       <OutcomeCallout run={run} actions={actions} />
 

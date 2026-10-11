@@ -152,6 +152,25 @@ describe("project CRUD", () => {
     expect(updateProject("my-app", { agent: null }).agent).toBeUndefined();
   });
 
+  test("defaultBranch is validated, persisted, survives a reload and can be cleared", () => {
+    createProject(input({ defaultBranch: "  develop " }));
+    expect(getProject("my-app")?.defaultBranch).toBe("develop");
+    expect((readFileConfig().projects as { defaultBranch?: unknown }[])[0]!.defaultBranch).toBe("develop");
+    initProjects();
+    expect(getProject("my-app")?.defaultBranch).toBe("develop");
+
+    expect(updateProject("my-app", { defaultBranch: "release/1.x" }).defaultBranch).toBe("release/1.x");
+    for (const bad of ["-rf", "a b", "x".repeat(201), "a..b", 5]) {
+      expect(thrown(() => updateProject("my-app", { defaultBranch: bad }))).toMatchObject({ status: 400 });
+    }
+    expect(getProject("my-app")?.defaultBranch).toBe("release/1.x");
+    expect(updateProject("my-app", { name: "Renamed" }).defaultBranch).toBe("release/1.x");
+    expect(updateProject("my-app", { defaultBranch: null }).defaultBranch).toBeUndefined();
+    expect("defaultBranch" in (readFileConfig().projects as object[])[0]!).toBe(false);
+    createProject(input({ id: "no-branch", defaultBranch: "" }));
+    expect(getProject("no-branch")?.defaultBranch).toBeUndefined();
+  });
+
   test("update cannot change the id, and unknown ids are 404", () => {
     createProject(input());
     expect(thrown(() => updateProject("my-app", { id: "other" }))).toMatchObject({ status: 400 });

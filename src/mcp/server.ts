@@ -3,7 +3,7 @@ import path from "node:path";
 import { type CallToolResult, fromJsonSchema, McpServer, WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import pkg from "../../package.json";
-import { batchView, devicesView, findRun, runDurationMs, runner, runScreenshots, scheduler } from "../app";
+import { batchView, compareView, devicesView, findRegressions, findRun, historyView, runDurationMs, runner, runScreenshots, scheduler } from "../app";
 import { config, HttpError, MAX_STEER_CHARS } from "../config";
 import { runDoctor } from "../doctor";
 import { gateway, gateSchema, type ToolDef } from "../devices/gateway";
@@ -15,6 +15,7 @@ import { exportRun, LEGACY_REPORTS_DIR, reportFile, screenshotFile, screenshotsD
 import { realpathLoose } from "../reports/reports";
 import { runMatches } from "../runs/source";
 import { listRuns } from "../runs/store";
+import type { ComparePair, CompareSide } from "../regression/types";
 import { ACTIVE, type Run } from "../runs/types";
 import type { AcquireResult, LeaseGrant } from "../runs/scheduler";
 import { listSuites } from "../suites";
@@ -39,6 +40,12 @@ const ProjectFields = {
     .nullable()
     .optional()
     .describe("QA persona markdown, relative to the repo; null for the built-in persona"),
+  defaultBranch: z
+    .string()
+    .max(200)
+    .nullable()
+    .optional()
+    .describe("Branch regression baselines fall back to, e.g. develop; null or empty clears it (default: origin/HEAD, then main/master)"),
 };
 
 const SourceInput = z.object({
@@ -134,6 +141,10 @@ const RunOptions = {
     .enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"])
     .optional()
     .describe("Reasoning effort for the QA agent, in the harness's own terms (omp thinking level, Claude --effort, Codex model_reasoning_effort); unsupported levels are rejected or mapped by the harness"),
+  reuseChecks: z
+    .boolean()
+    .optional()
+    .describe("Tell the agent to reuse the check ids and titles of earlier runs of this test, so results compare cleanly across runs (default true for every run that does not use a suite; false opts out)"),
 };
 
 const SOURCE_HINT =
@@ -239,6 +250,42 @@ function parseArgs<T extends z.ZodType>(schema: T, input: unknown): z.infer<T> {
   if (!parsed.success) throw new HttpError(400, parsed.error.issues.map((i) => i.message).join("; "), "invalid_argument");
   return parsed.data;
 }
+
+const CheckHistoryShape = {
+  projectId: z.string().min(1).max(64).optional().describe("Project id, with checkKey"),
+  checkKey: z.string().min(1).max(200).optional().describe("Stable check key from qa_compare_runs or qa_find_regressions"),
+  runId: z.string().min(1).max(200).optional().describe("Run id, with checkId"),
+  checkId: z.string().min(1).max(200).optional().describe("Check id in that run, e.g. C3"),
+  limit: z.number().int().min(1).max(200).optional().describe("Default 30, max 200"),
+};
+const CheckHistoryArgs = z
+  .object(CheckHistoryShape)
+  .refine((a) => Boolean(a.projectId && a.checkKey) || Boolean(a.runId && a.checkId), { message: "give projectId and checkKey, or runId and checkId" });
+
+const FindRegressionsShape = {
+  projectId: z.string().min(1).max(64).describe("Project id from qa_list_projects"),
+  branch: z.string().max(200).optional().describe("Exact git branch name"),
+  prNumber: z.number().int().positive().optional().describe("Pull request number"),
+  commit: z.string().max(200).optional().describe("Commit sha or prefix"),
+  includeFlaky: z.boolean().optional().describe("Default false: flaky checks are listed apart and do not count as regressions"),
+};
+const FindRegressionsArgs = z
+  .object(FindRegressionsShape)
+  .refine((a) => a.branch !== undefined || a.prNumber !== undefined || Boolean(a.commit), { message: "give at least one of branch, prNumber, commit" });
+
+/** Absolute path of a check's screenshot, as `qa_get_run` reports artefact paths; null when the check has none or the file is gone. */
+function checkScreenshotPath(runId: string, checkId: string): string | null {
+  const run = findRun(runId);
+  const rel = run?.checks.find((c) => c.id === checkId)?.screenshot;
+  return run && rel ? screenshotFile(run, getProject(run.projectId) ?? null, rel) : null;
+}
+
+function slimSide(side: CompareSide | null) {
+  return side && { runId: side.runId, checkId: side.checkId, title: side.title, status: side.status, note: side.note, screenshotPath: checkScreenshotPath(side.runId, side.checkId) };
+}
+
+const slimPair = (pair: ComparePair) => ({ ...pair, baseline: slimSide(pair.baseline), current: slimSide(pair.current) });
+
 /**
  * Shared by the `device_acquire` tool and `POST /api/leases`: validates once, then asks the scheduler (long-polls up to
  * `waitSeconds`). A grant is the flat `LeaseGrant`; otherwise `{ timedOut: true, ticket, ... }`.
@@ -306,6 +353,7 @@ function buildServer(): McpServer {
           defaultPlatform: args.defaultPlatform ?? suggestion.defaultPlatform,
           defaultPackage: args.defaultPackage ?? suggestion.defaultPackage,
           personaFile: args.personaFile === undefined ? suggestion.personaFile : args.personaFile,
+          defaultBranch: args.defaultBranch,
         };
         const missing = (["id", "name", "defaultPackage", "defaultPlatform"] as const).filter((k) => !input[k]);
         if (missing.length > 0) {
@@ -429,6 +477,7 @@ function buildServer(): McpServer {
           packageId: args.packageId,
           model: args.model,
           thinking: args.thinking,
+          reuseChecks: args.reuseChecks,
           install: args.install ? { path: args.install } : undefined,
           source: args.source,
           requestedBy: args.requester ?? "mcp",
@@ -477,6 +526,7 @@ function buildServer(): McpServer {
           packageId: args.packageId,
           model: args.model,
           thinking: args.thinking,
+          reuseChecks: args.reuseChecks,
           install: args.install ? { path: args.install } : undefined,
           source: args.source,
           requestedBy: args.requester ?? "mcp",
@@ -708,6 +758,68 @@ function buildServer(): McpServer {
           .filter((r) => (!args.status || r.status === args.status) && (!bySource || runMatches(r, filter)))
           .slice(0, limit)
           .map(runSummary);
+      }),
+  );
+
+  server.registerTool(
+    "qa_compare_runs",
+    {
+      title: "Compare a run with its baseline",
+      description:
+        "Compare a finished (or running) run with its baseline: the automatic one (the latest run of the same test on the PR base / default branch, else the same branch) or the run in baselineRunId. Returns pairs of checks with transition newly_failing (passed before, fails now), fixed, flaky (excluded from the failure counts), still_failing, changed (incl. lostCoverage), new, removed or pending, with each side's status, note and absolute screenshotPath. Only changed rows by default. With no baseline you get { comparison: null, reason, reasonText }.",
+      inputSchema: z.object({
+        runId: z.string().max(200).describe("The run to judge (the newer one)"),
+        baselineRunId: z.string().max(200).optional().describe("Omit for the automatic baseline"),
+        includeUnchanged: z.boolean().optional().describe("Default false: only changed rows"),
+      }),
+    },
+    ({ runId, baselineRunId, includeUnchanged }) =>
+      respond(() => {
+        const { comparison, reason, reasonText } = compareView(runId, { baseline: baselineRunId ?? "auto", includeFlaky: false });
+        if (!comparison) return { comparison: null, reason, reasonText };
+        const { baseline, verdict, counts, cost, durationMs, pairs } = comparison;
+        return {
+          baseline,
+          verdict,
+          counts,
+          cost,
+          durationMs,
+          pairs: pairs.filter((p) => includeUnchanged || p.transition !== "unchanged").map(slimPair),
+        };
+      }),
+  );
+
+  server.registerTool(
+    "qa_check_history",
+    {
+      title: "History of a check",
+      description:
+        "How one check fared across runs, newest first: status, note, branch, commit, device and absolute screenshotPath per run, plus whether it is flaky (flips between pass and fail on the same code), device-sensitive or unstable. Name the check by projectId + checkKey (from qa_compare_runs / qa_find_regressions) or by runId + checkId (as in qa_get_run).",
+      inputSchema: z.object(CheckHistoryShape),
+    },
+    (args) =>
+      respond(() => {
+        const parsed = parseArgs(CheckHistoryArgs, args);
+        const input =
+          parsed.projectId && parsed.checkKey ? { projectId: parsed.projectId, checkKey: parsed.checkKey } : { runId: parsed.runId ?? "", checkId: parsed.checkId ?? "" };
+        const history = historyView(input, { limit: parsed.limit ?? 30 });
+        return { ...history, entries: history.entries.map(({ screenshotUrl: _url, ...entry }) => ({ ...entry, screenshotPath: checkScreenshotPath(entry.runId, entry.checkId) })) };
+      }),
+  );
+
+  server.registerTool(
+    "qa_find_regressions",
+    {
+      title: "Did I break anything?",
+      description:
+        "Call this after QA runs of your change finished: it takes the runs of a branch, PR or commit, compares each test with its automatic baseline and lists checks that passed before and fail now (newlyFailing, flaky ones apart in flakyFailing), checks that lost coverage and failures that are new. status is regressions, clean, pending (runs still active), no_runs or no_baseline; summary is one sentence you can quote. Give at least one of branch, prNumber, commit.",
+      inputSchema: z.object(FindRegressionsShape),
+    },
+    (args) =>
+      respond(() => {
+        const parsed = parseArgs(FindRegressionsArgs, args);
+        if (!getProject(parsed.projectId)) throw new HttpError(404, `unknown project ${parsed.projectId}`);
+        return findRegressions(parsed);
       }),
   );
 

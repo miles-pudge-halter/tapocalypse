@@ -10,11 +10,16 @@ let tmp: string;
 let dataDir: string;
 let configFile: string;
 
+interface Instance {
+  dataDir: string;
+  configFile: string;
+}
+
 /** Runs a script in a fresh Bun process whose config and data dir are the seeded demo ones, and returns its JSON output. */
-async function inspect<T>(code: string): Promise<T> {
+async function inspect<T>(code: string, at: Instance = { dataDir, configFile }): Promise<T> {
   const proc = Bun.spawn([process.execPath, "-e", code], {
     cwd: ROOT,
-    env: { ...process.env, TAPOCALYPSE_CONFIG: configFile, TAPOCALYPSE_DATA_DIR: dataDir },
+    env: { ...process.env, TAPOCALYPSE_CONFIG: at.configFile, TAPOCALYPSE_DATA_DIR: at.dataDir },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -50,9 +55,9 @@ describe("demo seed", () => {
       }
       console.log(JSON.stringify({ total: listRuns().length, verdicts, statuses }));
     `);
-    expect(summary.total).toBe(22);
-    expect(summary.verdicts).toMatchObject({ PASS: 12, "PASS WITH ISSUES": 3, FAIL: 3, BLOCKED: 1, PARTIAL: 1 });
-    expect(summary.statuses).toMatchObject({ done: 20, error: 1, cancelled: 1 });
+    expect(summary.total).toBe(30);
+    expect(summary.verdicts).toMatchObject({ PASS: 13, "PASS WITH ISSUES": 8, FAIL: 5, BLOCKED: 1, PARTIAL: 1 });
+    expect(summary.statuses).toMatchObject({ done: 28, error: 1, cancelled: 1 });
   });
 
   test("every harness's raw frames replay into a timeline with device tool rows and check milestones", async () => {
@@ -119,8 +124,8 @@ describe("demo seed", () => {
       console.log(JSON.stringify({ problems, data, withReport, projectHasReportsDir: "reportsDir" in cfg.projects[0], repoEntries }));
     `);
     expect(res.problems).toEqual([]);
-    expect(res.data).toBe(20);
-    expect(res.withReport).toBe(17);
+    expect(res.data).toBe(28);
+    expect(res.withReport).toBe(25);
     expect(res.projectHasReportsDir).toBe(false);
     expect(res.repoEntries).toEqual([]);
   });
@@ -212,5 +217,108 @@ describe("demo seed", () => {
     expect(created).toHaveLength(1);
     expect(fs.existsSync(path.join(fresh, created[0]!, "runs"))).toBe(true);
     expect(fs.existsSync(path.join(fresh, created[0]!, "config.json"))).toBe(true);
+  });
+
+  test("two recurring tests have runs on main and on PR #142, a rerun lineage, a same-commit flip pattern and a device that disagrees", async () => {
+    const res = await inspect<{
+      tests: Record<string, { main: number; pr: { branch: string; number: number; base: string }[]; total: number }>;
+      rerun: { parentFound: boolean; sameCommit: boolean; briefNamesParent: boolean; idsSubset: boolean; checks: number };
+      flips: { statuses: string[]; dirty: (boolean | null)[]; devices: string[] };
+      sensitive: { passDevices: string[]; failDevices: string[]; platforms: string[] };
+    }>(`
+      import { listRuns } from "./src/runs/store";
+      const runs = listRuns().slice().sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      const baseBrief = (r) => r.brief.split("\\n\\nRe-run ONLY")[0];
+      const START = { checkout: "Smoke-test the happy path", dark: "Switch the app to the dark theme" };
+      const tests = {};
+      for (const [name, prefix] of Object.entries(START)) {
+        const mine = runs.filter((r) => baseBrief(r).startsWith(prefix));
+        tests[name] = {
+          total: mine.length,
+          main: mine.filter((r) => r.source.branch === "main").length,
+          pr: mine.filter((r) => r.source.pr).map((r) => ({ branch: r.source.branch, number: r.source.pr.number, base: r.source.pr.baseBranch })),
+        };
+      }
+      const checkout = runs.filter((r) => baseBrief(r).startsWith(START.checkout));
+      const child = checkout.find((r) => r.rerunOf);
+      const parent = child && runs.find((r) => r.id === child.rerunOf);
+      const rerun = {
+        parentFound: Boolean(parent),
+        sameCommit: Boolean(parent) && parent.source.commit === child.source.commit,
+        briefNamesParent: Boolean(parent) && child.brief.includes("Re-run ONLY these checks from run " + parent.id),
+        idsSubset: Boolean(parent) && child.checks.every((c) => parent.checks.some((p) => p.id === c.id)),
+        checks: child ? child.checks.length : 0,
+      };
+      // Newest main commit on the Pixel 8: one check passes, fails, passes again on the same clean code.
+      const mainPixel = checkout.filter((r) => r.source.branch === "main" && r.deviceName === "Pixel 8");
+      const code = mainPixel[mainPixel.length - 1].source.commit;
+      const sameCode = mainPixel.filter((r) => r.source.commit === code);
+      const quantity = sameCode.map((r) => ({ r, c: r.checks.find((c) => c.title === "Quantity change recalculates totals") })).filter((x) => x.c);
+      const flips = { statuses: quantity.map((x) => x.c.status), dirty: quantity.map((x) => x.r.source.dirty), devices: [...new Set(quantity.map((x) => x.r.deviceName))] };
+      // The same code on two Android devices: one passes the catalog check, the other fails it.
+      const catalog = checkout.filter((r) => r.source.commit === code && r.deviceRequest.platform === "android").map((r) => ({ r, c: r.checks.find((c) => c.title === "Catalog loads with four products") })).filter((x) => x.c);
+      const names = (status) => [...new Set(catalog.filter((x) => x.c.status === status).map((x) => x.r.deviceName))];
+      const sensitive = { passDevices: names("pass"), failDevices: names("fail"), platforms: [...new Set(catalog.map((x) => x.r.deviceRequest.platform))] };
+      console.log(JSON.stringify({ tests, rerun, flips, sensitive }));
+    `);
+    for (const test of Object.values(res.tests)) {
+      expect(test.total).toBeGreaterThanOrEqual(3);
+      expect(test.main).toBeGreaterThanOrEqual(2);
+      expect(test.pr).toContainEqual({ branch: "feat/cart-badge", number: 142, base: "main" });
+    }
+    expect(res.rerun).toMatchObject({ parentFound: true, sameCommit: true, briefNamesParent: true, idsSubset: true });
+    expect(res.rerun.checks).toBeGreaterThan(0);
+    expect(res.flips.statuses).toEqual(["pass", "fail", "pass"]);
+    expect(res.flips.dirty.every((d) => d === false)).toBe(true);
+    expect(res.flips.devices).toEqual(["Pixel 8"]);
+    expect(res.sensitive.platforms).toEqual(["android"]);
+    expect(res.sensitive.passDevices).toContain("Pixel 8");
+    expect(res.sensitive.failDevices.length).toBeGreaterThan(0);
+    expect(res.sensitive.failDevices).not.toContain("Pixel 8");
+  });
+
+  test("after the boot backfill the PR run compares against main with a newly failing, a fixed and a flaky check, and the paraphrased title is an inferred match", async () => {
+    const instance: Instance = { dataDir: path.join(tmp, "regression", "data"), configFile: path.join(tmp, "regression", "config.json") };
+    const seeded = await seed(["--dir", instance.dataDir, "--config", instance.configFile]);
+    expect(seeded.exit).toBe(0);
+    const res = await inspect<{
+      baseline: { auto: boolean; tier: string; branch: string | null };
+      counts: Record<string, number>;
+      rows: Record<string, { current: string; baseline: string | null }[]>;
+      inferred: { current: string; baseline: string | null; transition: string; confidence: string | null }[];
+      flaky: { title: string; confidence: string }[];
+      sensitive: boolean;
+    }>(
+      `
+      import { backfill } from "./src/regression/index";
+      import { listRuns } from "./src/runs/store";
+      import { compareView, flakyView, historyView } from "./src/app";
+      await backfill();
+      const head = listRuns().filter((r) => r.brief.startsWith("Smoke-test the happy path") && r.source.pr?.number === 142 && !r.rerunOf)[0];
+      const { comparison } = compareView(head.id, { baseline: "auto", includeFlaky: false });
+      const rows = {};
+      for (const p of comparison.pairs) (rows[p.transition] ??= []).push({ current: p.current?.title ?? "", baseline: p.baseline?.title ?? null });
+      const inferred = comparison.pairs.filter((p) => p.match === "inferred").map((p) => ({ current: p.current?.title ?? "", baseline: p.baseline?.title ?? null, transition: p.transition, confidence: p.confidence }));
+      const flaky = flakyView(head.projectId, { window: 20 }).checks.map((c) => ({ title: c.title, confidence: c.confidence }));
+      const catalog = comparison.pairs.find((p) => p.current?.title === "Catalog loads with four products");
+      const history = historyView({ projectId: head.projectId, checkKey: catalog.checkKey }, { limit: 30 });
+      console.log(JSON.stringify({
+        baseline: { auto: comparison.baseline.auto, tier: comparison.baseline.tier, branch: comparison.baseline.branch },
+        counts: comparison.counts, rows, inferred, flaky, sensitive: history.deviceSensitive,
+      }));
+    `,
+      instance,
+    );
+    expect(res.baseline).toEqual({ auto: true, tier: "pr-base", branch: "main" });
+    expect(res.counts).toMatchObject({ newly_failing: 1, fixed: 1, flaky: 1 });
+    expect(res.rows.newly_failing?.map((r) => r.current)).toEqual(["Checkout reaches the order summary"]);
+    expect(res.rows.fixed?.map((r) => r.current)).toEqual(["Add to cart updates the cart"]);
+    expect(res.rows.flaky?.map((r) => r.current)).toEqual(["Quantity change recalculates totals"]);
+    expect(res.flaky.map((c) => c.title)).toContain("Quantity change recalculates totals");
+    expect(res.flaky.find((c) => c.title === "Quantity change recalculates totals")?.confidence).toBe("flaky");
+    expect(res.inferred).toHaveLength(1);
+    expect(res.inferred[0]).toMatchObject({ transition: "unchanged", confidence: "inferred", baseline: "Product detail opens from the catalog" });
+    expect(res.inferred[0]!.current).not.toBe(res.inferred[0]!.baseline);
+    expect(res.sensitive).toBe(true);
   });
 });

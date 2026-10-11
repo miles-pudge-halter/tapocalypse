@@ -17,6 +17,7 @@ export type CheckStatus = "pending" | "running" | "pass" | "fail" | "blocked" | 
 
 export type ErrorKind = "infra" | "agent" | "timeout" | "cancelled";
 export type VerdictSource = "agent" | "derived";
+export type KeyKind = "suite" | "lineage" | "carried" | "title" | "inferred" | "manual";
 
 export interface Check {
   id: string;
@@ -30,6 +31,13 @@ export interface Check {
   startedAt?: string;
   /** First time the check reached a terminal status. */
   endedAt?: string;
+  /** Identity across runs (see regression/keys.ts); absent until the run is terminal and keyed. */
+  checkKey?: string;
+  keyKind?: KeyKind;
+  /** `matchScore` of an inferred key (0.6–1.35). */
+  keyScore?: number;
+  /** As declared by the agent in qa_plan: id of the hinted previous check this one re-tests. */
+  was?: string;
 }
 
 /** Normalized per harness (omp `get_session_stats`, Claude `result`, Codex `turn.completed`); null `cost` when the harness reports none. */
@@ -92,6 +100,15 @@ export interface BuildInfo {
   capturedAt: string;
 }
 
+/** The previous checks a run's prompt showed the agent (no statuses or notes: they would anchor the verdict). */
+export interface CheckHints {
+  /** Runs whose checks were shown, newest first. */
+  fromRunIds: string[];
+  checks: { id: string; title: string; checkKey: string }[];
+  /** Checks cut by the prompt's size cap: never shown to the agent, so `was` cannot name them. */
+  more?: number;
+}
+
 export interface Run {
   id: string;
   projectId: string;
@@ -150,6 +167,12 @@ export interface Run {
    * Older runs mounted mobile-mcp themselves, so their recorded `mobile_mcp` tool calls are legitimate and must not replay as backend violations.
    */
   gated: boolean;
+  /** Null only for runs persisted before regression intelligence and not yet backfilled (see regression/keys.ts). */
+  testKey: string | null;
+  /** The previous checks the prompt showed (null: none shown). */
+  checkHints: CheckHints | null;
+  /** False when the run opted out of showing the agent the previous checks; a re-run of everything and an infra retry keep it. */
+  reuseChecks: boolean;
 }
 
 export interface Activity {

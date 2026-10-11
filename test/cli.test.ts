@@ -10,6 +10,7 @@ import {
   exitCodeForError,
   exitCodeForRun,
   exitCodeForRuns,
+  executeCompare,
   executeReport,
   executeRun,
   executeService,
@@ -143,6 +144,37 @@ describe("parseCli", () => {
     expect(parseDuration("1.5h")).toBe(5_400_000);
     expect(() => parseDuration("soon")).toThrow(UsageError);
     expect(parseFailOn("fail, pass_with_issues,FAIL")).toEqual(["FAIL", "PASS WITH ISSUES"]);
+  });
+});
+
+describe("parseCli: compare and --fail-on regression", () => {
+  test("compare takes one id; baseline defaults to auto, flags and url are read", () => {
+    expect(parseCli(["compare", "r1"])).toEqual({
+      name: "compare",
+      id: "r1",
+      baseline: "auto",
+      includeFlaky: false,
+      json: false,
+      junit: null,
+      url: "http://127.0.0.1:4310",
+    });
+    expect(parseCli(["compare", "r1", "--baseline", "r0", "--include-flaky", "--json", "--junit", "out.xml", "--url", "http://localhost:4400/"])).toMatchObject({
+      baseline: "r0",
+      includeFlaky: true,
+      json: true,
+      junit: "out.xml",
+      url: "http://localhost:4400",
+    });
+    for (const argv of [["compare"], ["compare", "a", "b"], ["compare", "r1", "--baseline"], ["compare", "r1", "--nope"]]) {
+      expect(() => parseCli(argv)).toThrow(UsageError);
+    }
+  });
+
+  test("regression is a --fail-on token next to verdicts, and alone it replaces the verdict defaults", () => {
+    expect(runOptions(["--brief", "x"])).toMatchObject({ failOnRegression: false, failOn: ["FAIL", "BLOCKED", "PARTIAL"] });
+    expect(runOptions(["--brief", "x", "--fail-on", "regression"])).toMatchObject({ failOnRegression: true, failOn: [] });
+    expect(runOptions(["--brief", "x", "--fail-on", "FAIL,regression"])).toMatchObject({ failOnRegression: true, failOn: ["FAIL"] });
+    expect(() => runOptions(["--brief", "x", "--fail-on", "regressions"])).toThrow(UsageError);
   });
 });
 
@@ -488,5 +520,279 @@ describe("executeRun against a fake server", () => {
   test("an unreachable server raises ServerUnreachableError", async () => {
     const options = runOptions(["--brief", "x", "--url", "http://127.0.0.1:1"]);
     await expect(executeRun(options, deps(options.url, [], []))).rejects.toBeInstanceOf(ServerUnreachableError);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// compare
+
+type CompareSide = { runId: string; checkId: string; title: string; status: string; note: string | null };
+type Pair = { key: string; checkKey: string | null; transition: string; flaky: boolean; lostCoverage: boolean; baseline: CompareSide | null; current: CompareSide | null };
+
+const side = (runId: string, checkId: string, title: string, status: string, note: string | null = null): CompareSide => ({ runId, checkId, title, status, note });
+const pair = (over: Partial<Pair> & Pick<Pair, "key" | "transition">): Pair => ({ checkKey: `k-${over.key}`, flaky: false, lostCoverage: false, baseline: null, current: null, ...over });
+
+function comparisonOf(pairs: Pair[], over: Record<string, unknown> = {}) {
+  const counts: Record<string, number> = {};
+  for (const p of pairs) counts[p.transition] = (counts[p.transition] ?? 0) + 1;
+  return {
+    baseline: { auto: true, tier: "default-branch", primaryRunId: "base-1", runIds: ["base-1"], branch: "main", commit: "abcdef1234567", reason: "latest run on main" },
+    verdict: { baseline: "PASS", current: "FAIL", direction: "worse" },
+    counts,
+    pairs,
+    ...over,
+  };
+}
+
+const regressed = comparisonOf([
+  pair({ key: "C1", transition: "unchanged", baseline: side("base-1", "C1", "Launch", "pass"), current: side("head-1", "C1", "Launch", "pass") }),
+  pair({ key: "C2", transition: "newly_failing", baseline: side("base-1", "C2", "Checkout total updates", "pass"), current: side("head-1", "C2", "Checkout total updates", "fail", "total stayed 0") }),
+  pair({ key: "C3", transition: "fixed", baseline: side("base-1", "C3", "Profile", "fail"), current: side("head-1", "C3", "Profile", "pass") }),
+  pair({ key: "C4", transition: "flaky", flaky: true, baseline: side("base-1", "C4", "Banner", "pass"), current: side("head-1", "C4", "Banner", "fail", "banner missing") }),
+  pair({ key: "C5", transition: "changed", lostCoverage: true, baseline: side("base-1", "C5", "Settings", "pass"), current: side("head-1", "C5", "Settings", "blocked", "no login") }),
+]);
+const clean = comparisonOf([pair({ key: "C1", transition: "unchanged", baseline: side("base-1", "C1", "Launch", "pass"), current: side("head-2", "C1", "Launch", "pass") })], {
+  verdict: { baseline: "PASS", current: "PASS", direction: "same" },
+});
+const flakyOnly = comparisonOf([
+  pair({ key: "C4", transition: "flaky", flaky: true, baseline: side("base-1", "C4", "Banner", "pass"), current: side("head-3", "C4", "Banner", "fail", "banner missing") }),
+]);
+
+describe("executeCompare against a fake server", () => {
+  let server: Server<undefined>;
+  const queries: string[] = [];
+  const checksOf = (comparison: { pairs: Pair[] }) =>
+    comparison.pairs.flatMap((p) => (p.current ? [{ id: p.current.checkId, title: p.current.title, status: p.current.status as "pass" | "fail" | "blocked", note: p.current.note ?? undefined }] : []));
+  const runs: Record<string, RunLite> = {
+    "head-1": run({ id: "head-1", title: "Checkout", verdict: "FAIL", checks: checksOf(regressed) }),
+    "head-2": run({ id: "head-2", title: "Checkout", checks: checksOf(clean) }),
+    "head-3": run({ id: "head-3", title: "Checkout", verdict: "FAIL", checks: checksOf(flakyOnly) }),
+    "head-nb": run({ id: "head-nb", title: "Checkout" }),
+    "head-live": run({ id: "head-live", title: "Checkout", status: "running", verdict: null, endedAt: null }),
+  };
+  const compares: Record<string, unknown> = {
+    "head-1": { comparison: regressed, reason: null, reasonText: null },
+    "head-2": { comparison: clean, reason: null, reasonText: null },
+    "head-3": { comparison: flakyOnly, reason: null, reasonText: null },
+    "head-nb": { comparison: null, reason: "no_baseline", reasonText: "No earlier run of this test to compare with." },
+  };
+
+  beforeAll(() => {
+    server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        const url = new URL(req.url);
+        const m = /^\/api\/runs\/([^/]+)(\/compare)?$/.exec(url.pathname);
+        if (m) {
+          const id = m[1]!;
+          if (m[2]) {
+            queries.push(`${id}${url.search}`);
+            return compares[id] ? Response.json(compares[id]) : Response.json({ error: "unknown run" }, { status: 404 });
+          }
+          return runs[id] ? Response.json(runs[id]) : Response.json({ error: `unknown run ${id}` }, { status: 404 });
+        }
+        if (url.pathname === "/api/batches/b-lanes") return Response.json({ id: "b-lanes", title: "Lanes", runs: [runs["head-2"], runs["head-nb"]] });
+        if (url.pathname === "/api/batches/b-bad") return Response.json({ id: "b-bad", title: "Lanes", runs: [runs["head-2"], runs["head-1"]] });
+        if (url.pathname === "/api/batches/b-live") return Response.json({ id: "b-live", title: "Lanes", runs: [runs["head-2"], runs["head-live"]] });
+        if (url.pathname === "/api/projects/my-app/flaky") {
+          return Response.json({ checks: [{ checkKey: "k-C4", flips: 3, window: 20 }], trackedKeys: 1, repeatedKeys: 1 });
+        }
+        return Response.json({ error: "not found" }, { status: 404 });
+      },
+    });
+  });
+  afterAll(() => server.stop(true));
+  beforeEach(() => {
+    queries.length = 0;
+  });
+
+  const compareOptions = (id: string, over: Partial<Extract<ReturnType<typeof parseCli>, { name: "compare" }>> = {}) => {
+    const cmd = parseCli(["compare", id, "--url", `http://127.0.0.1:${server.port}`]);
+    if (cmd.name !== "compare") throw new Error("expected compare");
+    return { ...cmd, ...over };
+  };
+  const harness = () => {
+    const out: string[] = [];
+    const err: string[] = [];
+    const files = new Map<string, string>();
+    return {
+      out,
+      err,
+      files,
+      deps: { api: new ApiClient(`http://127.0.0.1:${server.port}`), io: { out: (t: string) => out.push(t), err: (t: string) => err.push(t) }, writeFile: async (f: string, t: string) => void files.set(f, t) },
+    };
+  };
+
+  test("a run without newly failing checks exits 0", async () => {
+    const h = harness();
+    expect(await executeCompare(compareOptions("head-2"), h.deps)).toBe(EXIT.OK);
+    expect(queries).toEqual(["head-2?baseline=auto"]);
+  });
+
+  test("a non-flaky newly failing check exits 1 and is listed with its note; fixed and lost coverage are listed too", async () => {
+    const h = harness();
+    expect(await executeCompare(compareOptions("head-1"), h.deps)).toBe(EXIT.VERDICT);
+    const text = h.out.join("\n");
+    expect(text).toContain("Checkout total updates");
+    expect(text).toContain("total stayed 0");
+    expect(text).toContain("Profile");
+    expect(text).toContain("Settings");
+  });
+
+  test("flaky failures alone do not fail the exit code; --include-flaky and --baseline are forwarded", async () => {
+    const h = harness();
+    expect(await executeCompare(compareOptions("head-3", { includeFlaky: true, baseline: "base-9" }), h.deps)).toBe(EXIT.OK);
+    expect(queries).toEqual(["head-3?baseline=base-9&includeFlaky=1"]);
+  });
+
+  test("no baseline exits 0 with a note on stderr, so a first CI run is not red", async () => {
+    const h = harness();
+    expect(await executeCompare(compareOptions("head-nb"), h.deps)).toBe(EXIT.OK);
+    expect(h.err.join("\n")).toContain("No earlier run of this test");
+    expect(h.out.join("\n")).not.toContain("newly failing");
+  });
+
+  test("an unknown run and a still-active run exit 2", async () => {
+    const unknown = harness();
+    expect(await executeCompare(compareOptions("nope"), unknown.deps)).toBe(EXIT.ERROR);
+    expect(unknown.err.join("\n")).toContain("unknown run");
+    const live = harness();
+    expect(await executeCompare(compareOptions("head-live"), live.deps)).toBe(EXIT.ERROR);
+    expect(live.err.join("\n")).toContain("still");
+    expect(queries).toEqual([]);
+  });
+
+  test("a batch compares every lane; the worst lane decides, and an active lane is an error", async () => {
+    const ok = harness();
+    expect(await executeCompare(compareOptions("b-lanes"), ok.deps)).toBe(EXIT.OK);
+    expect(queries.sort()).toEqual(["head-2?baseline=auto", "head-nb?baseline=auto"]);
+    expect(ok.err.join("\n")).toContain("head-nb");
+    expect(await executeCompare(compareOptions("b-bad"), harness().deps)).toBe(EXIT.VERDICT);
+    expect(await executeCompare(compareOptions("b-live"), harness().deps)).toBe(EXIT.ERROR);
+    await expect(executeCompare(compareOptions("b-lanes", { baseline: "base-1" }), harness().deps)).rejects.toThrow(UsageError);
+  });
+
+  test("--json prints the exit code and each run's comparison", async () => {
+    const h = harness();
+    expect(await executeCompare(compareOptions("head-1", { json: true }), h.deps)).toBe(EXIT.VERDICT);
+    const parsed = JSON.parse(h.out[0]!) as { exitCode: number; runs: { runId: string; regressions: number; comparison: { pairs: unknown[] } }[] };
+    expect(parsed.exitCode).toBe(EXIT.VERDICT);
+    expect(parsed.runs[0]).toMatchObject({ runId: "head-1", regressions: 1 });
+    expect(parsed.runs[0]!.comparison.pairs).toHaveLength(5);
+  });
+
+  test("--junit writes the baseline properties and the Newly failing / Flaky prefixes", async () => {
+    const h = harness();
+    expect(await executeCompare(compareOptions("head-1", { junit: "out.xml" }), h.deps)).toBe(EXIT.VERDICT);
+    const xml = h.files.get("out.xml")!;
+    expect(xml).toContain('<property name="baseline.run" value="base-1"/>');
+    expect(xml).toContain('<property name="baseline.tier" value="default-branch"/>');
+    expect(xml).toContain('<property name="baseline.commit" value="abcdef1234567"/>');
+    expect(xml).toContain('<property name="regressions" value="1"/>');
+    expect(xml).toContain('<failure message="Newly failing (was pass in base-1, main@abcdef1): total stayed 0">');
+    expect(xml).toContain("Flaky (3 flips in last 20): banner missing");
+    expect(xml).toMatch(/<system-out>[^]*Fixed: Profile[^]*<\/system-out>/);
+    expect(xml).toMatch(/<system-out>[^]*Lost coverage: Settings[^]*<\/system-out>/);
+  });
+});
+
+describe("executeRun --fail-on regression", () => {
+  let server: Server<undefined>;
+  const finished = (verdict: "PASS" | "FAIL") => run({ id: "head-r", title: "Checkout", status: "done", verdict, checks: [{ id: "C2", title: "Checkout total updates", status: verdict === "FAIL" ? "fail" : "pass", note: "total stayed 0" }] });
+  let current = finished("PASS");
+  let comparison: unknown = regressed;
+  let compareStatus = 200;
+
+  beforeAll(() => {
+    server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname === "/api/projects") return Response.json([{ id: "my-app", defaultPlatform: "android" }]);
+        if (url.pathname === "/api/runs" && req.method === "POST") return Response.json({ ...current, status: "queued", verdict: null }, { status: 201 });
+        if (url.pathname === `/api/runs/${current.id}`) return Response.json(current);
+        if (url.pathname === `/api/runs/${current.id}/compare`) {
+          return compareStatus === 200 ? Response.json({ comparison, reason: null, reasonText: null }) : Response.json({ error: "boom" }, { status: compareStatus });
+        }
+        if (url.pathname === "/api/projects/my-app/flaky") return Response.json({ checks: [], trackedKeys: 0, repeatedKeys: 0 });
+        return Response.json({ error: "not found" }, { status: 404 });
+      },
+    });
+  });
+  afterAll(() => server.stop(true));
+
+  async function go(argv: string[]) {
+    const out: string[] = [];
+    const err: string[] = [];
+    const files = new Map<string, string>();
+    const options = runOptions(["--brief", "x", "--wait", "--url", `http://127.0.0.1:${server.port}`, ...argv]);
+    const code = await executeRun(options, {
+      api: new ApiClient(options.url),
+      io: { out: (t) => out.push(t), err: (t) => err.push(t) },
+      env: {},
+      pollMs: 1,
+      sleep: () => Promise.resolve(),
+      now: () => Date.now(),
+      writeFile: async (f, t) => void files.set(f, t),
+    });
+    return { code, out, err, files };
+  }
+
+  test("a passing run with a newly failing check exits 1; without the token the verdict alone decides", async () => {
+    current = finished("PASS");
+    comparison = regressed;
+    expect((await go(["--fail-on", "regression"])).code).toBe(EXIT.VERDICT);
+    expect((await go([])).code).toBe(EXIT.OK);
+  });
+
+  test("regression alone ignores a FAIL verdict when nothing newly fails; with FAIL listed it still exits 1", async () => {
+    current = finished("FAIL");
+    comparison = clean;
+    expect((await go(["--fail-on", "regression"])).code).toBe(EXIT.OK);
+    expect((await go(["--fail-on", "regression,FAIL"])).code).toBe(EXIT.VERDICT);
+  });
+
+  test("a first run without a baseline passes the gate and says why on stderr", async () => {
+    current = finished("PASS");
+    comparison = null;
+    const result = await go(["--fail-on", "regression"]);
+    expect(result.code).toBe(EXIT.OK);
+  });
+
+  test("a comparison that cannot be fetched is an error (exit 2), not a silent pass", async () => {
+    current = finished("PASS");
+    compareStatus = 500;
+    try {
+      const result = await go(["--fail-on", "regression"]);
+      expect(result.code).toBe(EXIT.ERROR);
+      expect(result.err.join("\n")).toContain("could not compare");
+    } finally {
+      compareStatus = 200;
+    }
+  });
+
+  test("--junit carries the baseline properties even without the regression token, and survives a missing comparison", async () => {
+    current = finished("FAIL");
+    comparison = regressed;
+    const withBaseline = await go(["--junit", "j.xml"]);
+    expect(withBaseline.files.get("j.xml")).toContain('<property name="baseline.run" value="base-1"/>');
+    compareStatus = 404;
+    try {
+      const without = await go(["--junit", "j.xml"]);
+      expect(without.files.get("j.xml")).not.toContain("baseline.run");
+      expect(without.code).toBe(EXIT.VERDICT);
+    } finally {
+      compareStatus = 200;
+    }
+  });
+
+  test("--junit alone never turns a passing run with a newly failing check into exit 1", async () => {
+    current = finished("PASS");
+    comparison = regressed;
+    const result = await go(["--junit", "j.xml"]);
+    expect(result.files.get("j.xml")).toContain('<property name="regressions" value="1"/>');
+    expect(result.code).toBe(EXIT.OK);
   });
 });

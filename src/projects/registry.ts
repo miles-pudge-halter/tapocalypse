@@ -22,6 +22,8 @@ export interface Project {
   reportsDir?: string;
   defaultPackage: string;
   defaultPlatform: Platform;
+  /** Branch regression baselines fall back to (e.g. `develop`); absent = origin/HEAD, then main/master. */
+  defaultBranch?: string;
   /** Per-project agent runtime overrides (harness, harness-native model and effort); absent = defaults. */
   agent?: ProjectAgent;
 }
@@ -55,6 +57,8 @@ export interface ValidationResult {
 
 const ID_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
 export const PACKAGE_RE = /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_-]+)+$/;
+/** No leading dash (would read as a git option), no whitespace or control characters. */
+const BRANCH_RE = /^[^\s\p{Cc}-][^\s\p{Cc}]*$/u;
 const FIELD_ORDER: (keyof Project)[] = [
   "id",
   "name",
@@ -63,6 +67,7 @@ const FIELD_ORDER: (keyof Project)[] = [
   "reportsDir",
   "defaultPackage",
   "defaultPlatform",
+  "defaultBranch",
   "agent",
 ];
 const BUNDLED_PERSONA = path.join(REPO_ROOT, "personas", "default-mobile-qa.md");
@@ -115,6 +120,7 @@ function coerce(raw: Raw): Project {
     repoPath: str(raw.repoPath),
     personaFile: typeof raw.personaFile === "string" && raw.personaFile ? raw.personaFile : null,
     ...(str(raw.reportsDir) ? { reportsDir: str(raw.reportsDir) } : {}),
+    ...(str(raw.defaultBranch).trim() ? { defaultBranch: str(raw.defaultBranch).trim() } : {}),
     defaultPackage: str(raw.defaultPackage),
     defaultPlatform: raw.defaultPlatform === "ios" ? "ios" : "android",
     ...(agent.success && Object.keys(agent.data).length > 0 ? { agent: agent.data } : {}),
@@ -187,6 +193,17 @@ function check(input: Raw, unique: boolean): Check {
   const defaultPlatform = input.defaultPlatform;
   if (defaultPlatform !== "android" && defaultPlatform !== "ios") errors.defaultPlatform = 'must be "android" or "ios"';
 
+  let defaultBranch: string | undefined;
+  if (input.defaultBranch !== undefined && input.defaultBranch !== null && input.defaultBranch !== "") {
+    if (typeof input.defaultBranch !== "string") errors.defaultBranch = "must be a branch name";
+    else {
+      const name = input.defaultBranch.trim();
+      if (name.length > 200) errors.defaultBranch = "must be at most 200 characters";
+      else if (!BRANCH_RE.test(name) || name.includes("..")) errors.defaultBranch = "must be a plain branch name such as develop or release/1.x";
+      else defaultBranch = name;
+    }
+  }
+
   let agent: ProjectAgent | undefined;
   if (input.agent !== undefined && input.agent !== null) {
     const parsed = ProjectAgentSchema.safeParse(input.agent);
@@ -202,7 +219,17 @@ function check(input: Raw, unique: boolean): Check {
   const result: ValidationResult = { ok: Object.keys(errors).length === 0, errors, warnings };
   if (!result.ok || (defaultPlatform !== "android" && defaultPlatform !== "ios")) return { project: null, result };
   return {
-    project: { id, name, repoPath, personaFile, ...(reportsDir ? { reportsDir } : {}), defaultPackage, defaultPlatform, ...(agent ? { agent } : {}) },
+    project: {
+      id,
+      name,
+      repoPath,
+      personaFile,
+      ...(reportsDir ? { reportsDir } : {}),
+      defaultPackage,
+      defaultPlatform,
+      ...(defaultBranch ? { defaultBranch } : {}),
+      ...(agent ? { agent } : {}),
+    },
     result,
   };
 }

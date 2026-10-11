@@ -4,7 +4,7 @@ import { init, runner, scheduler } from "./app";
 import { config } from "./config";
 import { gateway } from "./devices/gateway";
 
-init();
+await init();
 
 /** Every legitimate body is a brief, a steer message or a suite: far below this. Bun's default is 128 MB. */
 const MAX_REQUEST_BODY_BYTES = 1024 * 1024;

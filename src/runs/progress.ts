@@ -7,7 +7,17 @@ import { resolveUnder } from "../reports/reports";
 import { hasImageMagic, isImagePath, readHead } from "./artefacts";
 import { type Activity, type Check, type CheckStatus, type Run, VERDICTS } from "./types";
 
-export const QaPlanArgs = z.object({ checks: z.array(z.object({ id: z.string(), title: z.string() })).min(1) });
+export const QaPlanArgs = z.object({
+  checks: z
+    .array(
+      z.object({
+        id: z.string(),
+        title: z.string(),
+        was: z.string().optional().describe("Id of a check under 'Previous checks' in your prompt that this check re-tests; omit for new checks."),
+      }),
+    )
+    .min(1),
+});
 export const QaCheckArgs = z.object({
   id: z.string(),
   status: z.enum(["running", "pass", "fail", "blocked", "skipped"]),
@@ -41,7 +51,14 @@ export const PROGRESS_TOOLS = [
           minItems: 1,
           items: {
             type: "object",
-            properties: { id: { type: "string" }, title: { type: "string" } },
+            properties: {
+              id: { type: "string" },
+              title: { type: "string" },
+              was: {
+                type: "string",
+                description: "Id of a check under 'Previous checks' in your prompt that this check re-tests; omit for new checks.",
+              },
+            },
             required: ["id", "title"],
             additionalProperties: false,
           },
@@ -102,7 +119,7 @@ export type ProgressToolName = (typeof PROGRESS_TOOLS)[number]["name"];
 export const PROGRESS_TOOL_NAMES: readonly ProgressToolName[] = PROGRESS_TOOLS.map((t) => t.name);
 
 /** The slice of a run the recorder reads and writes; a full `Run` satisfies it. */
-export type ProgressRun = Pick<Run, "status" | "checks" | "verdict" | "verdictSource" | "summary" | "reportPath">;
+export type ProgressRun = Pick<Run, "status" | "checks" | "verdict" | "verdictSource" | "summary" | "reportPath"> & Partial<Pick<Run, "checkHints">>;
 
 export interface ProgressRecorderOptions {
   getRun(): ProgressRun;
@@ -239,9 +256,24 @@ export class ProgressRecorder implements ProgressSink {
   private plan({ checks }: z.infer<typeof QaPlanArgs>): void {
     const now = new Date().toISOString();
     this.options.update((run) => {
-      run.checks = checks.map((c): Check => ({ id: c.id, title: c.title, status: "pending", updatedAt: now }));
+      run.checks = checks.map((c): Check => ({ id: c.id, title: c.title, status: "pending", updatedAt: now, ...(c.was === undefined ? {} : { was: c.was }) }));
     });
     this.options.log("check", `Test plan: ${checks.length} check${checks.length === 1 ? "" : "s"}`);
+    this.logIgnoredClaims(checks);
+  }
+
+  /** `was` only counts when it names a hinted check nobody claimed before; the rest stays on the check for audit and is noted here. */
+  private logIgnoredClaims(checks: z.infer<typeof QaPlanArgs>["checks"]): void {
+    const hinted = this.options.getRun().checkHints?.checks;
+    if (!hinted) return;
+    const claimedBy = new Map<string, string>();
+    for (const c of checks) {
+      if (c.was === undefined) continue;
+      const first = claimedBy.get(c.was);
+      if (!hinted.some((h) => h.id === c.was)) this.options.log("info", `${c.id}: was ${JSON.stringify(c.was)} is not one of the previous checks; ignored`);
+      else if (first !== undefined) this.options.log("info", `${c.id}: was ${JSON.stringify(c.was)} is already claimed by ${first}; ignored`);
+      else claimedBy.set(c.was, c.id);
+    }
   }
 
   private check(a: z.infer<typeof QaCheckArgs>): string {

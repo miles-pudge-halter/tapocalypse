@@ -17,13 +17,13 @@ Back to the [README](../README.md). Everything the web UI does goes through this
 
 | Route | Purpose |
 | --- | --- |
-| `POST /api/runs` | Queue a run. Body: `{ projectId, title?, brief?, suiteId?, device?: { platform?, serial? }, harness?, packageId?, model?, thinking?, effort?, install?: { path }, source?, requestedBy? }`. Give a `brief` or a `suiteId`. Without `harness` the default is resolved (project, persona, config, first installed and signed in, else first installed, else omp). Title ≤ 200 chars, brief ≤ 20 000. Returns 201 and the run. While the run waits for a device held by a coding agent, the run carries `queueHold: { serial, deviceName, holder, reason, expiresAt }` and `queueReason` names the holder |
-| `GET /api/runs` | Newest-first page `{ runs, hasMore }`. Query: `project`, `status` (comma list), `verdict` (comma list; `none` matches runs without one), `q` (title, branch, PR, ticket, commit), `batch`, `branch`, `pr`, `ticket`, `commit` (sha prefix), `limit` (default 100, max 500), `before` (a `createdAt` cursor) |
+| `POST /api/runs` | Queue a run. Body: `{ projectId, title?, brief?, suiteId?, device?: { platform?, serial? }, harness?, packageId?, model?, thinking?, effort?, install?: { path }, source?, reuseChecks?, requestedBy? }`. Give a `brief` or a `suiteId`. Without `harness` the default is resolved (project, persona, config, first installed and signed in, else first installed, else omp). `reuseChecks` (default `true`) lets the prompt show the agent the checks of the test's previous runs so they keep their identity; `false` opts out ([details](guide.md#helping-the-agent-keep-identity)). Title ≤ 200 chars, brief ≤ 20 000. Returns 201 and the run. While the run waits for a device held by a coding agent, the run carries `queueHold: { serial, deviceName, holder, reason, expiresAt }` and `queueReason` names the holder |
+| `GET /api/runs` | Newest-first page `{ runs, hasMore }`. Query: `project`, `status` (comma list), `verdict` (comma list; `none` matches runs without one), `q` (title, branch, PR, ticket, commit), `batch`, `branch`, `pr`, `ticket`, `commit` (sha prefix), `regressed=1` (only finished runs with newly failing checks, see `regression` below), `limit` (default 100, max 500), `before` (a `createdAt` cursor) |
 | `GET /api/runs/:id` | One run |
 | `DELETE /api/runs/:id` | Delete a finished run and its folder (409 while it is queued or active) |
 | `POST /api/runs/:id/cancel` | Cancel a queued or active run |
 | `POST /api/runs/:id/steer` | `{ message }` (≤ 4000 chars) to a running agent. 409 `steering is not supported by <harness>` when the run's harness cannot be steered (`capabilities.steer` in `GET /api/harnesses`) |
-| `POST /api/runs/:id/rerun` | `{ only: "failed" \| "all", device?, harness? }` queues a new run from a finished one, on the original run's harness unless you name another; 400 when nothing failed |
+| `POST /api/runs/:id/rerun` | `{ only: "failed" \| "all", device?, harness? }` queues a new run from a finished one, on the original run's harness unless you name another; 400 when nothing failed. The new run's `source` (branch, commit, dirty) is read from the project at queue time, not copied from the original; an `all` re-run shows the parent's checks to the agent to keep their identity |
 | `GET /api/runs/:id/events` | Server-sent events: `snapshot` (`{ run, activity, hasMoreActivity }`), then `run` and `activity` updates |
 | `GET /api/runs/:id/activity?before=&limit=` | Activity feed page (`seq` cursor; default 200, max 500) |
 | `GET /api/runs/:id/stderr?tail=` | Last lines of the agent's stderr as text (default 200, max 5000; 404 if none) |
@@ -32,18 +32,34 @@ Back to the [README](../README.md). Everything the web UI does goes through this
 | `GET /api/runs/:id/report` | `{ markdown }`, the report as the agent wrote it (404 when the run has none) |
 | `POST /api/runs/:id/export` | `{ dir }` (absolute path, no NUL byte) copies the report as `QA-REPORT-<id>.md` and the screenshots as `screenshots/<name>` into `dir`, creating it. `dir` is as trusted as any local client, but never inside Tapocalypse's data folder or a `.git` folder (400). Returns `{ report, screenshots }`: the absolute paths written |
 | `GET /api/runs/:id/transcript` | The full agent transcript as HTML, served sandboxed (404 until exported; only harnesses with `capabilities.transcriptExport`, today omp, write one) |
-| `POST /api/batches` | `{ projectId, title?, brief?, suiteId?, devices: [{ platform?, serial? }] (1-8), harness?, packageId?, model?, thinking?, effort?, install?, source?, requestedBy? }`. Returns 201 `{ batchId, runs }` |
+| `POST /api/batches` | `{ projectId, title?, brief?, suiteId?, devices: [{ platform?, serial? }] (1-8), harness?, packageId?, model?, thinking?, effort?, install?, source?, reuseChecks?, requestedBy? }`. Returns 201 `{ batchId, runs }` |
 | `GET /api/batches/:id` | `{ id, projectId, title, runs, status: "active" \| "done", verdict, cost, startedAt, endedAt }` |
 | `GET /api/events` | Global server-sent events: every `run` update, every [`lease`](#lease-events) change and `projects` changes; drives the live lists |
 | `GET /api/stats?project=&days=7` | Totals for the last 1-90 days: runs, pass/fail/issues/other, cost, median duration, per-day buckets |
+
+### Regressions, history and flaky checks
+
+How checks are matched, which run is the baseline and what the transitions mean: [Regressions, history and flaky checks](guide.md#regressions-history-and-flaky-checks). Terminal runs in `GET /api/runs*` carry `regression: { baselineId, baselineTitle, baselineBranch, baselineCreatedAt, newlyFailing, fixed, flaky } | null` (null while the run is active, or without a baseline); flaky checks are not in `newlyFailing`. Each check of a finished run carries `checkKey`, `keyKind` (`suite`, `lineage`, `carried`, `title`, `inferred` or `manual`), `keyScore` (inferred matches) and `was`; a run carries `testKey` and `checkHints` (the previous checks its prompt showed, or `null`).
+
+| Route | Purpose |
+| --- | --- |
+| `GET /api/runs/:id/compare?baseline=auto&includeFlaky=0` | `{ comparison, reason, reasonText }`. `baseline` is `auto` (default) or a run id of the same project (400 for another project's run, or the run itself). `comparison` is `null` with `reason` `no_baseline` or `no_checks` (and `reasonText` in words); otherwise `{ current, baselineRun, baseline, verdict, counts, durationMs, cost, pairs }`. `baseline` names the tier (`explicit`, `pr-base`, `default-branch`, `same-branch`, `any`), the runs it folds, a `reason` and the flags `platformMismatch`, `deviceChanged`, `harnessChanged`, `modelChanged`, `buildChanged`, `sameCommit`. `counts` has one number per transition (`newly_failing`, `fixed`, `flaky`, `still_failing`, `unchanged`, `changed`, `new`, `removed`, `pending`). A `pair` is `{ key, checkKey, transition, match, confidence, flaky, lostCoverage, notReached, baseline, current, suggestion }`, each side `{ runId, checkId, title, status, note, screenshotUrl, durationMs, createdAt }`; `suggestion` (explicit comparisons only) is a possible match for an unmatched row and is never counted. `includeFlaky=1` counts flaky checks as newly failing or fixed. Works on a running run (`pending` rows). Unknown run 404 |
+| `GET /api/runs/:id/baseline-candidates?q=&limit=` | `{ candidates: [{ run, suggested, group, platformMismatch, reason }] }` for the baseline picker; `group` is `suggested`, `branch`, `base`, `test` or `other`; `limit` 1-100, default 30 |
+| `GET /api/projects/:id/checks/:checkKey/history?limit=&before=&branch=&platform=` | A check's history: `{ projectId, checkKey, keyKind, title, flaky: "flaky" \| "suspect" \| null, deviceSensitive, unstable, flips, window, passRate, entries, hasMore }`, newest first (`limit` max 200, default 30, `before` a cursor). Each entry has the run, check id, status, note, screenshot URL, branch, commit, device and `flippedOnSameCode`. 404 for an unknown key |
+| `GET /api/runs/:id/checks/:checkId/history?…` | The same, for the key of that check (a live run's key is computed on the fly) |
+| `GET /api/projects/:id/flaky?platform=&window=20` | `{ checks, trackedKeys, repeatedKeys }`: flaky and suspect checks (`confidence`, `flips`, `passRate`, `recent`, `lastFlipAt`, `lastFlipBranch`) and how many keys exist and have more than one run. `window` 4-50 |
+| `POST /api/check-links` | `{ projectId, a: { runId, checkId }, b: { runId, checkId } }`: the check `b` (newer) tests the same thing as `a`; every check of the project with `b`'s key is re-keyed to `a`'s (`keyKind: "manual"`); when the two already share a key (a fuzzy-title match) both are just marked `manual`. 400 for the same run, the same check, two checks of one run, or keys that already co-exist in a run. 204 |
+| `DELETE /api/check-links` | Same body: the check `b` gets a key of its own (`manual`); `b`'s run must belong to `projectId` (400). 204 |
+
+Unknown projects, runs and checks are 404; bad input is 400. Both `check-links` routes need `Content-Type: application/json`.
 
 ### Projects, reports and suites
 
 | Route | Purpose |
 | --- | --- |
 | `GET /api/projects` | Projects with `status` (`ok`/`invalid`) and problems |
-| `POST /api/projects` | Create a project (201). Body as in [Projects](guide.md#projects) |
-| `PUT /api/projects/:id` | Change fields of a project |
+| `POST /api/projects` | Create a project (201). Body as in [Projects](guide.md#projects), including the optional `defaultBranch` (a branch name) that regressions compare feature branches against |
+| `PUT /api/projects/:id` | Change fields of a project. `defaultBranch: null` or `""` clears it |
 | `DELETE /api/projects/:id` | Remove a project (409 while it has queued or active runs; the repo is untouched) |
 | `POST /api/projects/validate` | `{ input, mode: "create" \| "update", existingId? }` checks a project without saving |
 | `POST /api/projects/detect` | `{ repoPath }` suggests every project field from the repo |
@@ -120,8 +136,8 @@ Register `http://127.0.0.1:<port>/mcp` in your agent; see [Dispatching runs from
 | --- | --- |
 | `qa_list_projects` | Registered projects with `status` and problems. Only `ok` projects can start runs |
 | `qa_detect_project { repoPath }` | Inspect a repo and suggest project settings |
-| `qa_create_project { repoPath, id?, name?, defaultPackage?, defaultPlatform?, personaFile? }` | Register a project; omitted fields come from detection |
-| `qa_update_project { id, repoPath?, name?, defaultPackage?, defaultPlatform?, personaFile? }` | Change only the fields you pass |
+| `qa_create_project { repoPath, id?, name?, defaultPackage?, defaultPlatform?, defaultBranch?, personaFile? }` | Register a project; omitted fields come from detection |
+| `qa_update_project { id, repoPath?, name?, defaultPackage?, defaultPlatform?, defaultBranch?, personaFile? }` | Change only the fields you pass; `defaultBranch` `null` or `""` clears it |
 | `qa_delete_project { id }` | Remove a project (fails while it has queued or active runs) |
 | `qa_list_devices` | Connected devices with `busyRunId`, booting flags, `lease` (the agent lease holding the device, without its secret, or `null`) and `waiters` |
 | `qa_doctor` | Prerequisite report with a fix for anything missing, including which agent harnesses are installed and signed in |
@@ -151,8 +167,8 @@ mobile-mcp's device tools, served by Tapocalypse and enforced by the lease ([Sha
 
 | Tool | Purpose |
 | --- | --- |
-| `qa_start_run { projectId, title?, brief?, suiteId?, platform?, serial?, harness?, packageId?, model?, thinking?, install?, requester?, source? }` | Queue a run; returns `runId`, `status`, `queuePosition`, a UI `url` and the recorded `source`. `install` is an absolute `.apk` / `.app` / `.ipa` path installed before the run |
-| `qa_start_batch { projectId, title?, brief?, suiteId?, devices: [{ platform?, serial? }] (1-8), harness?, packageId?, model?, thinking?, install?, requester?, source? }` | One run per device entry; returns `batchId`, a `url` and the runs |
+| `qa_start_run { projectId, title?, brief?, suiteId?, platform?, serial?, harness?, packageId?, model?, thinking?, install?, reuseChecks?, requester?, source? }` | Queue a run; returns `runId`, `status`, `queuePosition`, a UI `url` and the recorded `source`. `install` is an absolute `.apk` / `.app` / `.ipa` path installed before the run; `reuseChecks: false` opts out of showing the agent the test's previous checks |
+| `qa_start_batch { projectId, title?, brief?, suiteId?, devices: [{ platform?, serial? }] (1-8), harness?, packageId?, model?, thinking?, install?, reuseChecks?, requester?, source? }` | One run per device entry; returns `batchId`, a `url` and the runs |
 | `qa_rerun { runId, only: "failed" \| "all", platform?, serial?, harness?, requester? }` | New run from a finished one, on the same harness unless you pass another |
 | `qa_steer_run { runId, message }` | Send an instruction to a running agent; fails when the run's harness cannot be steered |
 | `qa_cancel_run { runId }` | Cancel a queued or active run |
@@ -169,6 +185,16 @@ mobile-mcp's device tools, served by Tapocalypse and enforced by the lease ([Sha
 | `qa_get_screenshots { runId }` | `[{ checkId, name, path, url }]`: every screenshot of the run, `path` absolute in the data folder, `url` served by Tapocalypse. Read the images from `path` |
 | `qa_export { runId, dir }` | Copy the report (`QA-REPORT-<id>.md`) and the screenshots (`screenshots/<name>`) into the absolute folder `dir`, for example inside your repo or a CI artefact folder (never inside Tapocalypse's data folder or a `.git` folder). Returns `{ report, screenshots }`. Nothing is exported unless you call this |
 
+### Regressions and history
+
+What an agent asks after it changed code ([Regressions, history and flaky checks](guide.md#regressions-history-and-flaky-checks)). Screenshot paths are absolute, in the data folder, as in `qa_get_run`. Wait for the runs first (`qa_wait_run` / `qa_wait_runs`).
+
+| Tool | Purpose |
+| --- | --- |
+| `qa_find_regressions { projectId, branch?, prNumber?, commit?, includeFlaky? }` | Give at least one of `branch`, `prNumber`, `commit`. Takes the runs for that code that are not replaced by a retry, groups them by test and platform (a snapshot: the newest run plus its same-commit re-runs), compares each group with its automatic baseline and returns `{ status, summary, tests }`. `status` is `regressions`, `clean`, `pending` (a matching run is still active), `no_runs` or `no_baseline`; `summary` is one sentence such as "2 checks that passed on main fail now (1 test); 1 flaky failure ignored". Each test has `testKey`, `title`, `platform`, `headRunIds`, `baseline`, the verdicts, and the lists `newlyFailing`, `flakyFailing`, `lostCoverage` (was pass or fail, now blocked, skipped or not reached) and `newFailures` (failing with no baseline counterpart), each item `{ checkKey, title, current: { runId, checkId, status, note, screenshotPath }, baseline: { runId, checkId, status, screenshotPath } \| null }`, plus the counts `fixed` and `stillFailing`. Flaky checks are listed in `flakyFailing` only; `includeFlaky: true` moves them into `newlyFailing` |
+| `qa_compare_runs { runId, baselineRunId?, includeUnchanged? }` | One run against its automatic baseline, or against `baselineRunId`. Returns the `baseline` description, the `verdict` change, `counts`, `cost`, `durationMs` and `pairs`; by default only changed rows (`includeUnchanged: true` for all). Sides are `{ runId, checkId, title, status, note, screenshotPath }` |
+| `qa_check_history { projectId?, checkKey?, runId?, checkId?, limit? }` | Give `projectId` + `checkKey` (as returned in `qa_find_regressions` and `qa_compare_runs`), or `runId` + `checkId` of any check. The same shape as the history route, with `screenshotPath` instead of a URL |
+
 Runs launched by Tapocalypse are told never to call `tapocalypse` tools, so registering the server at user level cannot cause recursion.
 
 ## Run progress endpoint
@@ -181,7 +207,7 @@ Agents report their checks to Tapocalypse through a second MCP endpoint that exi
 
 | Tool | Arguments | Effect |
 | --- | --- | --- |
-| `qa_plan` | `{ checks: [{ id, title }] }` (at least one) | Declares every check before the first device action; they show as pending |
+| `qa_plan` | `{ checks: [{ id, title, was? }] }` (at least one) | Declares every check before the first device action; they show as pending. `was` is the id of a check listed under "Previous checks" in the prompt that this one re-tests; it only counts when it names one of those, the first claim on a previous check wins, and it is kept on the check even when ignored. Omit it for new checks |
 | `qa_check` | `{ id, status, note?, screenshot? }`; `status` is `running`, `pass`, `fail`, `blocked` or `skipped`; `screenshot` is an absolute path, or a path relative to the agent's working directory (the repo), of an image file (`png`, `jpg`, `jpeg`, `webp` or `gif`, checked by its first bytes, at most 25 MB) that lies inside the repo, the run's folder or the OS temp directory | Sets a check's status and copies the image into the run's `screenshots/` folder (unless it is already there; the reply names the stored file, for example `screenshots/01-home.png`); also writes the `check` line into the activity feed |
 | `qa_finish` | `{ verdict, summary, reportMarkdown?, reportPath? }`; `verdict` is `PASS`, `FAIL`, `PASS WITH ISSUES`, `BLOCKED` or `PARTIAL`; give exactly one of `reportMarkdown` (the report text, up to 2 MB) or `reportPath` (a `.md`, `.markdown` or `.txt` file of at most 2 MB the agent wrote, absolute or relative to its working directory, inside the repo, the run's folder or the OS temp directory) | Called exactly once. The report is stored as the run's `report.md`; the source file of a `reportPath` is left untouched. Images are linked in the report as `screenshots/<name>`, the names returned by `qa_check` |
 

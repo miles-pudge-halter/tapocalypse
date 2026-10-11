@@ -574,3 +574,55 @@ describe("ProgressRecorder file confinement", () => {
     expect(fs.readFileSync(path.join(runDir, "report.md"), "utf8")).toBe("# Old\n\n![home](screenshots/02-home.png)\n![other](screenshots/other-run/x.png)\n");
   });
 });
+
+describe("qa_plan `was`", () => {
+  const hints = { fromRunIds: ["earlier"], checks: [{ id: "W1", title: "Login", checkKey: "t:one" }, { id: "W2", title: "Cart", checkKey: "t:two" }] };
+
+  test("is optional, kept on the check, and absent when the agent gave none", async () => {
+    const { run, recorder } = fixture();
+    await recorder.record("qa_plan", { checks: [{ id: "C1", title: "Login", was: "W1" }, { id: "C2", title: "New" }] });
+    expect(run.checks[0]!.was).toBe("W1");
+    expect("was" in run.checks[1]!).toBe(false);
+    await expect(recorder.record("qa_plan", { checks: [{ id: "C1", title: "Login", was: 3 }] })).rejects.toThrow("invalid qa_plan arguments");
+  });
+
+  test("the omp host tool describes it as an optional string on each check, like the MCP schema", () => {
+    const plan = PROGRESS_TOOLS.find((t) => t.name === "qa_plan")!;
+    const items = plan.parameters.properties.checks.items;
+    const ItemSchema = z.object({
+      properties: z.object({ checks: z.object({ items: z.object({ properties: z.record(z.string(), z.unknown()), required: z.array(z.string()) }) }) }),
+    });
+    const fromZod = ItemSchema.parse(z.toJSONSchema(QaPlanArgs, { io: "input" })).properties.checks.items;
+    expect(Object.keys(items.properties).sort()).toEqual(Object.keys(fromZod.properties).sort());
+    expect(Object.keys(items.properties)).toContain("was");
+    const required: readonly string[] = items.required;
+    expect([...required].sort()).toEqual([...fromZod.required].sort());
+    expect(required).not.toContain("was");
+  });
+
+  test("a claim of an unknown id or of an already-claimed hint is kept on the check and logged as info; a valid claim is not", async () => {
+    const { run, logged, recorder } = fixture();
+    run.checkHints = hints;
+    await recorder.record("qa_plan", {
+      checks: [
+        { id: "C1", title: "a", was: "W1" },
+        { id: "C2", title: "b", was: "W1" },
+        { id: "C3", title: "c", was: "W9" },
+        { id: "C4", title: "d" },
+      ],
+    });
+    expect(run.checks.map((c) => c.was)).toEqual(["W1", "W1", "W9", undefined]);
+    const info = logged.filter((l) => l.kind === "info").map((l) => l.text);
+    expect(info).toHaveLength(2);
+    expect(info[0]).toContain("C2");
+    expect(info[0]).toContain("W1");
+    expect(info[1]).toContain("C3");
+    expect(info[1]).toContain("W9");
+  });
+
+  test("a run that was shown no hints logs nothing for a stray `was`", async () => {
+    const { logged, recorder } = fixture();
+    await recorder.record("qa_plan", { checks: [{ id: "C1", title: "a", was: "W1" }] });
+    expect(logged.filter((l) => l.kind === "info")).toEqual([]);
+  });
+});

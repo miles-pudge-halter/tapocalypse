@@ -67,10 +67,17 @@ beforeAll(async () => {
 }, 40_000); // the poll above allows 30 s: under a full randomized suite a cold start can take well over Bun's 5 s hook default
 
 afterAll(async () => {
+  // SIGTERM lets the server drain the gateway's children (≈ 0.5 s alone). Under a loaded randomized suite that drain has
+  // exceeded 15 s, so fall back to SIGKILL after 8 s: the fake mobile-mcp child exits when its stdin closes with the parent.
   server?.kill("SIGTERM");
-  await server?.exited;
+  const exited = await Promise.race([server?.exited.then(() => true), Bun.sleep(8_000).then(() => false)]);
+  if (!exited) {
+    console.warn("lease e2e server ignored SIGTERM for 8 s; killing it");
+    server?.kill("SIGKILL");
+    await server?.exited;
+  }
   fs.rmSync(root, { recursive: true, force: true });
-}, 15_000); // SIGTERM makes the server drain the gateway's children before exiting
+}, 15_000);
 
 const post = (pathname: string, body: unknown, signal?: AbortSignal) =>
   fetch(`${base}${pathname}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal });

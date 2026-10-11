@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * Maintainer tool: seeds a throwaway demo instance (fictional "Acme Shop" project, ~22 finished runs over the last four
+ * Maintainer tool: seeds a throwaway demo instance (fictional "Acme Shop" project, ~30 finished runs over the last four
  * days) for screenshots and demos. `bun scripts/seed-demo.ts [--dir <dataDir>] [--config <file>] [--repo <dir>]`.
  * Runs are stored like real ones (`storage: "data"`: `report.md` and `screenshots/` in the run dir) except the two oldest, which
  * are legacy `storage: "repo"` runs with report and screenshots under the temp repo's `qa/`.
@@ -27,7 +27,7 @@ const RUN_MAX_TIME = "12m";
 const MIN = 60_000;
 
 type Screen = "home" | "product" | "cart" | "checkout" | "settings";
-type DeviceKey = "pixel" | "iphone";
+type DeviceKey = "pixel" | "pixelSmall" | "iphone";
 
 interface DemoDevice {
   platform: Platform;
@@ -41,6 +41,8 @@ interface DemoDevice {
 
 const DEVICES: Record<DeviceKey, DemoDevice> = {
   pixel: { platform: "android", serial: "emulator-5554", name: "Pixel 8", label: "Pixel_8_API_35", osVersion: "Android 15", screen: "1080×2400" },
+  /** Second Android device, so the catalog check can pass on one Android phone and fail on the other at the same commit. */
+  pixelSmall: { platform: "android", serial: "emulator-5556", name: "Pixel 6a", label: "Pixel_6a_API_34", osVersion: "Android 14", screen: "1080×2400" },
   iphone: {
     platform: "ios",
     serial: "4F2B8E1C-7A39-4D56-B0E4-93C1D2A85F70",
@@ -288,7 +290,11 @@ interface Branch {
 
 const BRANCHES: Record<string, Branch> = {
   main: { commitSubject: "Merge pull request #139 from acme/fix-cart-rounding", versionName: "2.5.0", versionCode: "2431" },
+  /** The main commit before `main`: what the oldest runs tested. */
+  "main@prev": { commitSubject: "Merge pull request #135 from acme/wishlist-heart", versionName: "2.5.0", versionCode: "2424" },
   "feat/cart-badge": { commitSubject: "Show item count badge on the cart icon", versionName: "2.5.0", versionCode: "2436" },
+  /** A later commit of the PR branch, after review fixes. */
+  "feat/cart-badge@fix": { commitSubject: "Keep the badge readable in the dark theme", versionName: "2.5.0", versionCode: "2439" },
   "release/2.4": { commitSubject: "Bump version to 2.4.0+2417", versionName: "2.4.0", versionCode: "2417" },
 };
 
@@ -318,6 +324,13 @@ interface RunSpec {
   /** This run is the successor of the (infra-failed) run with this key. */
   retryOf?: string;
   key?: string;
+  /** Runs a later commit of the branch (`BRANCHES["<branch>@<revision>"]`). */
+  revision?: string;
+  /** Re-run of the finished run with this key: only the checks listed in `only` (1-based, ids kept), with the parent's status and note quoted in the brief. */
+  rerunOf?: string;
+  only?: number[];
+  /** Wording of a check in this run when the agent phrased it differently from the scenario (1-based check number → title). */
+  titles?: Record<number, string>;
   /** Stored the pre-data-dir way: report and screenshots under the temp repo's `qa/` (`storage: "repo"`). */
   legacy?: boolean;
 }
@@ -328,9 +341,25 @@ const BLOCKED_LOGIN: Record<number, Override> = {
   3: { status: "skipped", note: "Blocked by C1: nothing to sign out of." },
 };
 
-/** Newest first. 12 PASS, 3 PASS WITH ISSUES, 3 FAIL, 1 BLOCKED, 1 infra error with its retry, 1 cancelled, 1 derived PARTIAL. */
+const CART_ROUNDING_NOTE = "Subtotal reads $129.01 instead of $129.00 after adding Trail Runner; the cart screen rounds the price up.";
+
+/**
+ * Mostly newest first, then the regression story (the last block, oldest first so a re-run follows its parent): "Checkout smoke" and
+ * "Dark mode survives restart" recur on main, on a second Android phone and on PR #142. 13 PASS, 8 PASS WITH ISSUES, 5 FAIL, 1 BLOCKED,
+ * 1 infra error with its retry, 1 cancelled, 1 derived PARTIAL.
+ */
 const RUN_SPECS: RunSpec[] = [
-  { scenario: "checkout", harness: "claude", device: "pixel", branch: "main", agoMin: 28, durationMin: 6.4, summary: "The happy path from catalog to order summary works on the Pixel 8. All five checks passed with a screenshot each." },
+  {
+    scenario: "checkout",
+    harness: "claude",
+    device: "pixel",
+    branch: "main",
+    agoMin: 28,
+    durationMin: 6.4,
+    outcomes: { 3: { status: "fail", note: CART_ROUNDING_NOTE } },
+    verdict: "PASS WITH ISSUES",
+    summary: "The happy path from catalog to order summary works on the Pixel 8, but the cart subtotal is off by one cent after adding an item.",
+  },
   {
     scenario: "cartBadge",
     harness: "omp",
@@ -448,7 +477,118 @@ const RUN_SPECS: RunSpec[] = [
   },
   { scenario: "gallery", harness: "omp", device: "pixel", branch: "main", agoMin: 4540, durationMin: 4.4, summary: "The product gallery opens, swipes through all photos and resets zoom on close." },
   { scenario: "checkout", title: "Smoke on release candidate", harness: "claude", device: "pixel", branch: "release/2.4", agoMin: 5560, durationMin: 6.8, legacy: true, summary: "The release candidate passes the checkout smoke test." },
-  { scenario: "checkout", harness: "omp", device: "pixel", branch: "main", agoMin: 5660, durationMin: 6, legacy: true, summary: "The happy path from catalog to order summary works." },
+  { scenario: "checkout", harness: "omp", device: "pixel", branch: "main", revision: "prev", agoMin: 5660, durationMin: 6, legacy: true, summary: "The happy path from catalog to order summary works." },
+  // Regression story: same tests, same code, different outcomes. All of it on the Pixel 8 (and its small sibling) unless noted.
+  {
+    scenario: "checkout",
+    harness: "omp",
+    device: "pixel",
+    branch: "main",
+    agoMin: 2200,
+    durationMin: 6.3,
+    outcomes: { 3: { status: "fail", note: CART_ROUNDING_NOTE } },
+    verdict: "PASS WITH ISSUES",
+    summary: "Checkout works end to end on the Pixel 8. The cart subtotal reads $129.01 instead of $129.00.",
+  },
+  {
+    scenario: "darkMode",
+    harness: "claude",
+    device: "pixel",
+    branch: "main",
+    agoMin: 1900,
+    durationMin: 4.5,
+    summary: "The dark theme persists across a force-stop and is applied to the product and checkout screens.",
+  },
+  {
+    scenario: "checkout",
+    harness: "claude",
+    device: "pixel",
+    branch: "main",
+    agoMin: 1100,
+    durationMin: 6.6,
+    outcomes: {
+      3: { status: "fail", note: CART_ROUNDING_NOTE },
+      4: { status: "fail", note: "After tapping + the subtotal stays at $129.00; the cart only shows $258.00 after leaving and re-opening it." },
+    },
+    verdict: "PASS WITH ISSUES",
+    summary: "Checkout works end to end, but the cart subtotal is off by a cent and did not update after a quantity change.",
+  },
+  {
+    scenario: "checkout",
+    harness: "omp",
+    device: "pixelSmall",
+    branch: "main",
+    agoMin: 1000,
+    durationMin: 6.9,
+    outcomes: {
+      1: { status: "fail", note: "Only three products fit on the Pixel 6a screen; Wool Beanie is cut off and the list does not scroll to it." },
+      3: { status: "fail", note: CART_ROUNDING_NOTE },
+    },
+    verdict: "PASS WITH ISSUES",
+    summary: "Checkout works on the Pixel 6a, but the catalog cuts off the fourth product and the cart subtotal is off by a cent.",
+  },
+  {
+    scenario: "darkMode",
+    harness: "omp",
+    device: "pixel",
+    branch: "feat/cart-badge",
+    agoMin: 40,
+    durationMin: 5,
+    requestedBy: "claude-code",
+    pr: { number: 142, title: "Show item count badge on the cart icon" },
+    tickets: ["ACME-312"],
+    outcomes: { 4: { status: "fail", note: "The checkout form fields keep the light palette behind the new badge container; labels are unreadable (contrast 1.4:1)." } },
+    verdict: "PASS WITH ISSUES",
+    summary: "The dark theme persists across a restart, but the checkout screen shows light form fields on the PR branch.",
+  },
+  {
+    scenario: "checkout",
+    harness: "claude",
+    device: "pixel",
+    branch: "feat/cart-badge",
+    agoMin: 14,
+    durationMin: 7.1,
+    requestedBy: "claude-code",
+    pr: { number: 142, title: "Show item count badge on the cart icon" },
+    tickets: ["ACME-312"],
+    key: "pr-checkout",
+    titles: { 2: "Product page opens from the catalog" },
+    outcomes: {
+      4: { status: "fail", note: "After tapping + the cart still reads $129.00 and the subtotal does not change." },
+      5: { status: "fail", note: "Continue is covered by the new cart badge overlay on the order summary step and cannot be tapped (ACME-312)." },
+    },
+    verdict: "FAIL",
+    summary: "Checkout is blocked on the PR branch: the cart badge overlay covers the Continue button on the order summary step. The cart subtotal also did not update after a quantity change.",
+  },
+  {
+    scenario: "darkMode",
+    harness: "omp",
+    device: "pixel",
+    branch: "feat/cart-badge",
+    revision: "fix",
+    agoMin: 10,
+    durationMin: 4.6,
+    requestedBy: "claude-code",
+    pr: { number: 142, title: "Show item count badge on the cart icon" },
+    tickets: ["ACME-312"],
+    summary: "After the review fix the dark theme persists across a force-stop and covers the product and checkout screens.",
+  },
+  {
+    scenario: "checkout",
+    harness: "claude",
+    device: "pixel",
+    branch: "feat/cart-badge",
+    agoMin: 6,
+    durationMin: 3.2,
+    requestedBy: "claude-code",
+    pr: { number: 142, title: "Show item count badge on the cart icon" },
+    tickets: ["ACME-312"],
+    rerunOf: "pr-checkout",
+    only: [4, 5],
+    outcomes: { 5: { status: "fail", note: "Continue is still covered by the cart badge overlay on the order summary step." } },
+    verdict: "FAIL",
+    summary: "The quantity change now updates the subtotal. Continue is still covered by the cart badge overlay.",
+  },
 ];
 
 function mulberry32(seed: number): () => number {
@@ -706,16 +846,26 @@ interface BuildContext {
   index: number;
   /** Ids of earlier-built runs by spec key (retry links point at the failed attempt). */
   ids: Map<string, string>;
+  /** Earlier-built runs by spec key (a re-run quotes its parent's failed checks). */
+  runs: Map<string, Run>;
   batchId: string | null;
+}
+
+/** The brief of a "re-run failed only" run, as the scheduler writes it: the parent's brief plus its failed checks with their status and note. */
+function rerunBrief(brief: string, parent: Run): string {
+  const failed = parent.checks.filter((c) => c.status !== "pass" && c.status !== "skipped");
+  const lines = failed.map((c) => `- ${c.id} ${c.title} (${c.status}${c.note ? `: ${c.note}` : ""})`);
+  return `${brief}\n\nRe-run ONLY these checks from run ${parent.id} (previous status + note):\n${lines.join("\n")}`;
 }
 
 function buildRun(spec: RunSpec, ctx: BuildContext): Finished {
   const scenario = SCENARIOS[spec.scenario]!;
   const title = spec.title ?? scenario.title;
   const device = DEVICES[spec.device];
-  const runTitle = spec.batch ? `${title} · ${device.name}` : title;
+  const runTitle = spec.batch ? `${title} · ${device.name}` : spec.rerunOf ? `${title} (re-run)` : title;
   const harness = HARNESSES[spec.harness];
-  const branch = BRANCHES[spec.branch]!;
+  const branch = BRANCHES[spec.revision ? `${spec.branch}@${spec.revision}` : spec.branch]!;
+  const parent = spec.rerunOf ? (ctx.runs.get(spec.rerunOf) ?? null) : null;
   const rand = mulberry32(hashInt(`${title}:${ctx.index}`));
 
   const startMs = ctx.now - spec.agoMin * MIN;
@@ -779,10 +929,11 @@ function buildRun(spec: RunSpec, ctx: BuildContext): Finished {
     const setupMs = durationMs * 0.1;
     const wrapMs = durationMs * 0.09;
     const checksMs = durationMs - setupMs - wrapMs - 4000;
-    const stopIndex = spec.stopAt ? spec.stopAt - 1 : scenario.checks.length;
+    const planned = scenario.checks.map((c, i) => ({ c, n: i + 1, title: spec.titles?.[i + 1] ?? c.title })).filter((p) => !spec.only || spec.only.includes(p.n));
+    const stopIndex = spec.stopAt ? spec.stopAt - 1 : planned.length;
     const ctxStep: StepCtx = { device, rand };
 
-    feed.say(`I'll confirm the device and the installed build, declare a plan of ${scenario.checks.length} checks and then work through them one by one.`);
+    feed.say(`I'll confirm the device and the installed build, declare a plan of ${planned.length} checks and then work through them one by one.`);
     feed.t += 2500;
     feed.tool(
       {
@@ -795,18 +946,18 @@ function buildRun(spec: RunSpec, ctx: BuildContext): Finished {
       },
       1800,
     );
-    feed.activity("check", `Test plan: ${scenario.checks.length} check${scenario.checks.length === 1 ? "" : "s"}`);
-    for (const [i, c] of scenario.checks.entries()) {
-      checks.push({ id: `C${i + 1}`, title: c.title, status: "pending", updatedAt: iso(feed.t) });
+    feed.activity("check", `Test plan: ${planned.length} check${planned.length === 1 ? "" : "s"}`);
+    for (const p of planned) {
+      checks.push({ id: `C${p.n}`, title: p.title, status: "pending", updatedAt: iso(feed.t) });
     }
     feed.t = startMs + 4000 + setupMs;
 
-    const slice = checksMs / scenario.checks.length;
-    for (const [i, c] of scenario.checks.entries()) {
+    const slice = checksMs / planned.length;
+    for (const [i, { c, n, title: checkTitle }] of planned.entries()) {
       const check = checks[i]!;
       const checkStart = feed.t;
       if (i > stopIndex) break;
-      const override = spec.outcomes?.[i + 1];
+      const override = spec.outcomes?.[n];
       const finalStatus: CheckStatus = override?.status ?? "pass";
       const note = override?.note ?? c.note;
 
@@ -825,12 +976,12 @@ function buildRun(spec: RunSpec, ctx: BuildContext): Finished {
       check.startedAt = iso(feed.t);
       check.updatedAt = check.startedAt;
       feed.t += 600;
-      feed.say(`${check.id}: ${c.title}.`);
+      feed.say(`${check.id}: ${checkTitle}.`);
 
       const calls = c.steps.flatMap((s) => stepCalls(s, ctxStep));
       const evidence =
         finalStatus === "pass" || finalStatus === "fail"
-          ? `${shotPrefix}/${pad(i + 1)}-${c.screen}.png`
+          ? `${shotPrefix}/${pad(n)}-${c.screen}.png`
           : null;
       if (evidence) {
         calls.push({ call: { kind: "mcp", name: "mobile_save_screenshot", args: { device: device.label, saveTo: legacy ? evidence : path.join(runDir, evidence) }, result: `Saved screenshot to ${legacy ? evidence : path.join(runDir, evidence)}` }, weight: 1.2 });
@@ -899,7 +1050,7 @@ function buildRun(spec: RunSpec, ctx: BuildContext): Finished {
     id,
     projectId: PROJECT_ID,
     title: runTitle,
-    brief: scenario.brief,
+    brief: parent ? rerunBrief(scenario.brief, parent) : scenario.brief,
     requestedBy: spec.requestedBy ?? "web",
     deviceRequest: spec.batch ? { platform: device.platform, serial: device.serial } : { platform: device.platform },
     deviceSerial: infra ? null : device.serial,
@@ -945,8 +1096,10 @@ function buildRun(spec: RunSpec, ctx: BuildContext): Finished {
     attempt: spec.retryOf ? 2 : 1,
     retryOf: spec.retryOf ? (ctx.ids.get(spec.retryOf) ?? null) : null,
     retriedBy: null,
-    rerunOf: null,
+    rerunOf: parent?.id ?? null,
     install: null,
+    testKey: null,
+    checkHints: null,
   };
   return { run, events: feed.lines.join("\n") + "\n", report, screenshots };
 }
@@ -1134,6 +1287,7 @@ export function seedDemo(opts: SeedOptions): SeedResult {
 
   const persona = readFileSync(PERSONA_FILE, "utf8");
   const ids = new Map<string, string>();
+  const byKey = new Map<string, Run>();
   const runIds: string[] = [];
   const built: Finished[] = [];
   const batchRuns: Run[] = [];
@@ -1144,8 +1298,11 @@ export function seedDemo(opts: SeedOptions): SeedResult {
       const first = new Date(now - spec.agoMin * MIN - 30_000);
       batchId = `b-${stamp(first)}-${sha("onboarding-batch").slice(0, 4)}`;
     }
-    const finished = buildRun(spec, { now, repoDir, dataDir, index, ids, batchId: spec.batch ? batchId : null });
-    if (spec.key) ids.set(spec.key, finished.run.id);
+    const finished = buildRun(spec, { now, repoDir, dataDir, index, ids, runs: byKey, batchId: spec.batch ? batchId : null });
+    if (spec.key) {
+      ids.set(spec.key, finished.run.id);
+      byKey.set(spec.key, finished.run);
+    }
     built.push(finished);
     runIds.push(finished.run.id);
     if (spec.batch) batchRuns.push(finished.run);

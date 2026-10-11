@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { AppSidebar } from "@/components/app-sidebar";
 import { Lockup } from "@/components/brand";
 import { CommandPalette } from "@/components/command-palette";
+import { CheckHistorySheet } from "@/components/regression/check-history-sheet";
 import { NewRunSheet } from "@/components/new-run-sheet";
 import { Notifications } from "@/components/notifications";
 import { ShortcutsDialog } from "@/components/shortcuts-dialog";
@@ -11,8 +12,10 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { navigate, type Route, useNewRun, useRoute, useShortcut } from "@/lib/hooks";
 import { readStorage, writeStorage } from "@/lib/storage";
 import { Batch } from "@/views/Batch";
+import { Compare } from "@/views/Compare";
 import { Dashboard } from "@/views/Dashboard";
 import { Devices } from "@/views/Devices";
+import { FlakyChecks } from "@/views/Flaky";
 import { Projects } from "@/views/Projects";
 import { ReportList, ReportView } from "@/views/Reports";
 import { RunDetail } from "@/views/RunDetail";
@@ -26,8 +29,12 @@ function pageKey(route: Route): string {
     case "run":
     case "batch":
       return `${route.name}:${route.id}`;
+    case "compare":
+      return `compare:${route.id}:${route.baselineId}`;
     case "reports":
       return `reports:${route.projectId}`;
+    case "flaky":
+      return `flaky:${route.projectId}`;
     case "report":
       return `report:${route.projectId}:${route.reportName}`;
     default:
@@ -46,7 +53,9 @@ function View() {
     case "runs":
       return <Dashboard />;
     case "run":
-      return <RunDetail key={route.id} id={route.id} check={route.check} />;
+      return <RunDetail key={route.id} id={route.id} check={route.check} baseline={route.baseline} />;
+    case "compare":
+      return <Compare key={`${route.id}:${route.baselineId}`} id={route.id} baselineId={route.baselineId} show={route.show} pair={route.pair} />;
     case "batch":
       return <Batch key={route.id} id={route.id} />;
     case "devices":
@@ -57,6 +66,8 @@ function View() {
       return <Projects openNew={route.openNew} />;
     case "reports":
       return <ReportList projectId={route.projectId} />;
+    case "flaky":
+      return <FlakyChecks projectId={route.projectId} />;
     case "report":
       return <ReportView projectId={route.projectId} name={route.reportName} />;
   }
@@ -95,6 +106,7 @@ export function App() {
         </SidebarInset>
       </SidebarProvider>
       <NewRunSheet />
+      <CheckHistorySheet />
       <CommandPalette />
       <ShortcutsDialog />
       <Notifications />

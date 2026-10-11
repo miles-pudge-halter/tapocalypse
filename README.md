@@ -119,10 +119,13 @@ The agent follows [docs/agent-setup.md](docs/agent-setup.md). It checks the prer
 2. Calls `qa_start_run { projectId, title, brief, requester, source: { path: "<its cwd>" } }`, so the run records its branch, commit and PR.
 3. Calls `qa_wait_run { runId }` until `timedOut` is `false`, narrating the checks as they resolve.
 4. Reads the verdict and the report (`qa_get_report`, with the screenshots from `qa_get_screenshots`), fixes what failed, then confirms with `qa_rerun { runId, only: "failed" }`.
+5. Calls `qa_find_regressions { projectId, branch }` to see whether anything that passed before now fails (see below).
 
 The tools range from batches to steering to device leases: [MCP reference](docs/guide.md#dispatching-runs-from-your-coding-agent-mcp) and [parameters](docs/api.md#mcp-tools).
 
 **Share devices between agents.** Tapocalypse is also the device broker for every coding agent on the machine. An agent borrows an emulator or simulator with `device_acquire` (a *lease*), uses only that one, and gives it back with `device_release`. While it is leased, no other agent and no QA run is given that device; they wait in one first-in, first-out queue, and a lease that is not renewed ends on its own (default 30 minutes). The Devices page shows who holds each device and why, and lets you release a stuck lease. Leases are cooperative: they keep well-behaved agents apart but do not stop a process that runs `adb` on its own. [Sharing devices between agents](docs/guide.md#sharing-devices-between-agents), and the snippet to give your agents is in [docs/agent-setup.md](docs/agent-setup.md#8-let-your-agents-borrow-devices-optional).
+
+**Catch regressions.** Tapocalypse remembers every check of every run. Each check gets an identity across runs, and every run is compared with an automatic baseline (the same test on the PR's base branch, the default branch or the previous commit), so you see what is *newly failing*, *fixed*, *flaky* or no longer covered, check by check with screenshots side by side, plus a history for any single check. `qa_find_regressions` answers "did I break anything?" for the agent that just changed your code, `tapocalypse compare <run>` and `tapocalypse run … --fail-on regression` do it in CI (exit 1 only on checks that passed before and fail now, flaky ones excluded), and the UI shows it in a *Compared to* strip, a compare page and a flaky-checks page. History needs the same test to run repeatedly: see [Regressions, history and flaky checks](docs/guide.md#regressions-history-and-flaky-checks).
 
 ## Runtimes
 
@@ -140,7 +143,7 @@ Selection order, limits and models: [Agent runtimes](docs/guide.md#agent-runtime
 
 ## Docs
 
-- [Guide](docs/guide.md): the UI, projects and personas, devices, run outcomes, MCP, CLI and CI, suites, data, troubleshooting
+- [Guide](docs/guide.md): the UI, projects and personas, devices, run outcomes, regressions and flaky checks, MCP, CLI and CI, suites, data, troubleshooting
 - [Configuration](docs/configuration.md): every config key and environment variable
 - [HTTP API and MCP tools](docs/api.md): every route and tool parameter
 - [Agent setup](docs/agent-setup.md): step-by-step instructions for a coding agent

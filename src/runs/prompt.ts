@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { HARNESS_IDS, type HarnessId, PROGRESS_SERVER } from "../harness/types";
 import { screenshotsDir } from "./artefacts";
-import type { Run } from "./types";
+import type { CheckHints, Run } from "./types";
 
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
@@ -88,6 +88,40 @@ function suiteBlock(run: Run, planTool: string): string {
   return `Use exactly these check ids and titles in ${planTool}: ${run.suiteChecks.map((c) => `${c.id} ${JSON.stringify(c.title)}`).join(", ")}\n`;
 }
 
+const HINT_MAX_CHECKS = 40;
+const HINT_MAX_CHARS = 6000;
+
+const hintLine = (c: CheckHints["checks"][number]): string => `- ${c.id} ${JSON.stringify(c.title)}`;
+
+/** What the prompt can show of `hints` (at most 40 checks, 6,000 characters); the rest is counted in `more`. Persist this, not the full list. */
+export function capHints(hints: CheckHints): CheckHints {
+  const checks: CheckHints["checks"] = [];
+  let used = 40; // room for the "… and N more" line
+  for (const c of hints.checks.slice(0, HINT_MAX_CHECKS)) {
+    const length = hintLine(c).length;
+    if (used + length + 1 > HINT_MAX_CHARS) break;
+    checks.push(c);
+    used += length + 1;
+  }
+  const dropped = hints.checks.length - checks.length;
+  return dropped === 0 ? hints : { ...hints, checks, more: (hints.more ?? 0) + dropped };
+}
+
+/**
+ * The previous checks of this test, so the agent can say which one each of its checks re-tests (`was` in qa_plan) and keep
+ * stable wording. Ids and titles only: a status or note would anchor the verdict. Empty when the run was shown none.
+ */
+function hintsBlock(run: Run, planTool: string): string {
+  if (!run.checkHints?.checks.length) return "";
+  const hints = capHints(run.checkHints);
+  const shown = hints.checks.map(hintLine);
+  if (hints.more) shown.push(`- … and ${hints.more} more`);
+  return `Previous checks of this test (${hints.fromRunIds.length === 1 ? "run" : "runs"} ${hints.fromRunIds.join(", ")}). Reuse them where they still apply:
+${shown.join("\n")}
+In ${planTool}, give each check that tests the same thing as one of these \`was: "<previous id>"\`. Keep the previous id and title unless the brief defines its own ids or the check itself changed. Do not add checks the brief no longer asks for, and judge every check afresh: these are not expected results.
+`;
+}
+
 export interface PromptOptions {
   /** The run's time budget as configured (`runMaxTime`). */
   runMaxTime: string;
@@ -116,7 +150,7 @@ Progress reporting (mandatory — the Tapocalypse UI is built from these calls):
 3. Screenshot directory: ${shots}
    Save every screenshot there, e.g. ${shots}/01-launch.png (Android: \`adb -s <serial> exec-out screencap -p > ${shots}/01-launch.png\`; iOS: \`xcrun simctl io <udid> screenshot ${shots}/01-launch.png\`). Never write into the repository: it is the app under test. Tapocalypse stores your screenshots and report itself, and ${check} tells you the stored name (screenshots/<name>) of the screenshot you attach.
 4. Finally call ${finish} with the verdict, a 2-4 sentence summary and the whole report as reportMarkdown (do not write a report file). Embed screenshots in it as ![alt](screenshots/<name>), using the stored names.
-${suiteBlock(run, plan)}
+${suiteBlock(run, plan)}${hintsBlock(run, plan)}
 Brief:
 ${run.brief}`;
 }

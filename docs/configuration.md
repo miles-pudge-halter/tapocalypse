@@ -27,6 +27,7 @@ The config file is created with the defaults below when it does not exist. It is
 | `agent.maxBudgetUsd` | unset | Claude Code only (`--max-budget-usd`): end the session once it has spent about this much. Other harnesses ignore it |
 | `agent.model`, `agent.thinking` | unset | Legacy omp keys, kept as they were: the omp model and thinking level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) for runs whose request, suite, project and persona name none. Prefer `agent.harnesses.omp.model` / `.effort` |
 | `projects[].agent` | unset | Per-project override `{ harness?, model?, effort? }`, see [Projects](guide.md#projects) |
+| `projects[].defaultBranch` | unset | Branch that [regression comparisons](guide.md#regressions-history-and-flaky-checks) treat as the project's default, for example `main`. Unset: the repo's `origin/HEAD` (looked up with `git`, cached for 10 minutes), else `main` or `master` if the repo has one |
 | `retry.infra` | `1` | Automatic retries of a run that failed on infrastructure (boot failure, agent crash, MCP tools missing) before any check resolved. `0` disables retries |
 | `retention.days` | unset | Delete finished runs that ended more than this many days ago. Unset keeps them |
 | `retention.maxRuns` | unset | Keep only the newest this-many runs, deleting older finished ones. Unset keeps them |
@@ -108,10 +109,11 @@ bun run dev                               # server with hot reload
 bun src/cli.ts serve [--port 4311] [--dev]
 bun src/cli.ts service install|uninstall|start|stop|restart|status|logs
 bun src/cli.ts report <runId> [--export <dir>] [--json]
+bun src/cli.ts compare <runId|batchId> [--baseline <runId|auto>] [--include-flaky] [--json] [--junit <file>]
 bun run doctor
 ```
 
-`serve --dev` runs the same server with Bun's development server (hot module reloading for the UI and browser console forwarding); without it `serve` runs in production mode. The `run`, `status` and `report` commands are described in [CLI and CI](guide.md#cli-and-ci); `run --harness omp|claude|codex` picks the agent runtime for one run.
+`serve --dev` runs the same server with Bun's development server (hot module reloading for the UI and browser console forwarding); without it `serve` runs in production mode. The `run`, `status`, `report` and `compare` commands are described in [CLI and CI](guide.md#cli-and-ci); `run --harness omp|claude|codex` picks the agent runtime for one run, and `run --fail-on regression` fails only on newly failing checks.
 
 `service` keeps the server running in the background and starts it at login: `install` writes a launchd agent (macOS, `~/Library/LaunchAgents/dev.tapocalypse.server.plist`) or a systemd user unit (Linux, `~/.config/systemd/user/tapocalypse.service`) and starts it; `status` shows whether it is installed, running and answering; `logs` prints the end of `<data dir>/logs/service.log` (Linux: the journal); `start`, `stop` and `restart` control it; `uninstall` stops it and removes the unit. The unit stores the environment it was installed from (`PATH`, `HOME`, `TAPOCALYPSE_*`, `ANDROID_HOME`, `ANDROID_SDK_ROOT` and the `*_BIN` variables above), so run `install` again after changing it. It only touches its own unit and is not supported on Windows. Details: [Running as a service](guide.md#running-as-a-service).
 

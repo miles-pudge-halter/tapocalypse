@@ -436,6 +436,30 @@ describe("Gateway.stopAll", () => {
     expect(made[0]!.closed).toBeGreaterThan(0);
   });
 
+  test("stopAll gives up on a probe child whose start never settles, so shutdown cannot hang", async () => {
+    // The child's MCP handshake can stall (a wedged npx, a machine under load); shutdown must still finish promptly.
+    const gw = new Gateway({ stopGraceMs: 50, spawnClient: () => Promise.withResolvers<GatewayClient>().promise });
+    void gw.tools();
+    await Bun.sleep(5);
+    const started = Date.now();
+    await gw.stopAll();
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
+  test("stopAll gives up on a device child whose close never settles", async () => {
+    class Stuck extends FakeClient {
+      override async close(): Promise<void> {
+        this.closed++;
+        return Promise.withResolvers<void>().promise;
+      }
+    }
+    const gw = new Gateway({ stopGraceMs: 50, cacheFile: null, spawnClient: async (cwd) => new Stuck(cwd) });
+    await gw.call("lease-1", "emulator-5554", tmpdir(), "mobile_take_screenshot", {});
+    const started = Date.now();
+    await gw.stopAll();
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
   test("once stopAll ran, a gateway with no tool list answers an empty one without probing", async () => {
     const { gw, spawned } = setupCache(null);
     await gw.stopAll();

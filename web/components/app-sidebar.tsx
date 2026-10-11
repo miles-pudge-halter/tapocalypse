@@ -276,7 +276,7 @@ function LiveIndicator() {
 
 export function AppSidebar() {
   const route = useRoute();
-  const runsActive = route.name === "runs" || route.name === "run" || route.name === "batch";
+  const runsActive = route.name === "runs" || route.name === "run" || route.name === "compare" || route.name === "batch";
   return (
     <Sidebar collapsible="icon">
       <SidebarHeader>
@@ -300,7 +300,7 @@ export function AppSidebar() {
               </SidebarMenuItem>
               <RunsNav active={runsActive} />
               <DevicesNav active={route.name === "devices"} />
-              <ReportsNav active={route.name === "reports" || route.name === "report"} />
+              <ReportsNav active={route.name === "reports" || route.name === "report" || route.name === "flaky"} />
               <SidebarMenuItem>
                 <SidebarMenuButton asChild isActive={route.name === "projects"} tooltip="Projects" className="strike">
                   <a href="#/projects">

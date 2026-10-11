@@ -4,7 +4,7 @@ import { toast } from "sonner";
 import { DeviceFrame } from "@/components/device-frame";
 import { DeviceName } from "@/components/device-name";
 import { EmptyState } from "@/components/empty-state";
-import { isFailedLane, rerunFailedLanes } from "@/components/run-row";
+import { isFailedLane, RunRegressionChip, rerunFailedLanes } from "@/components/run-row";
 import { RunStatusIcon } from "@/components/run-status-icon";
 import { CheckCounts, SegmentedProgress } from "@/components/segmented-progress";
 import { StatusBadge } from "@/components/status-badge";
@@ -165,6 +165,7 @@ function Lane({ run, device, now }: { run: RunView; device: Device | undefined; 
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {run.verdict ? <VerdictBadge verdict={run.verdict} /> : <StatusBadge status={run.status} />}
+          <RunRegressionChip run={run} now={now} />
           {run.status === "queued" && (
             <span className="text-xs text-muted-foreground">
               Queue #{run.queuePosition ?? "?"}

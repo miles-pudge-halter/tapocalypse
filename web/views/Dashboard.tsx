@@ -1,9 +1,10 @@
-import { AlertCircle, ChevronDown, Inbox, Loader2, Plus, Search, SearchX, X } from "lucide-react";
+import { AlertCircle, ArrowDown, ChevronDown, Inbox, Loader2, Plus, Search, SearchX, X } from "lucide-react";
 import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { Lockup } from "@/components/brand";
 import { BatchRow, RunActions, RunRow } from "@/components/run-row";
 import { RunStatusIcon } from "@/components/run-status-icon";
 import { SegmentedProgress } from "@/components/segmented-progress";
+import { VERDICT_DOT } from "@/components/verdict-badge";
 import { SetupBanner } from "@/components/setup-checklist";
 import { DeviceFrame } from "@/components/device-frame";
 import { LeaseRing } from "@/components/lease-ring";
@@ -17,6 +18,7 @@ import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Toggle } from "@/components/ui/toggle";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { isActive, runHash, type Device, type RunStatus, type RunView, type Verdict } from "@/lib/api";
 import { deviceDisplayName, formatCost, formatDuration } from "@/lib/format";
@@ -59,14 +61,6 @@ const STATUS_DOT: Record<RunStatus, string> = {
   error: "bg-red-500",
   cancelled: "bg-stone-500",
   interrupted: "bg-orange-400",
-};
-
-const VERDICT_DOT: Record<Verdict, string> = {
-  PASS: "bg-emerald-500",
-  "PASS WITH ISSUES": "bg-orange-400",
-  FAIL: "bg-red-500",
-  BLOCKED: "bg-rose-800",
-  PARTIAL: "bg-orange-400/40 ring-1 ring-orange-400",
 };
 
 type Item = { kind: "run"; run: RunView } | { kind: "batch"; id: string; runs: RunView[] };
@@ -134,6 +128,7 @@ function describeFilters(filters: RunFilters, projectName: string | null): strin
   if (filters.verdict?.length) parts.push(`verdict: ${filters.verdict.join(", ")}`);
   if (projectName) parts.push(`project: ${projectName}`);
   if (filters.q) parts.push(`search: “${filters.q}”`);
+  if (filters.regressed) parts.push("with newly failing checks");
   return parts.join(" · ");
 }
 
@@ -160,8 +155,9 @@ export function Dashboard() {
       status: filters.status?.length ? filters.status : TERMINAL_STATUSES,
       verdict: filters.verdict,
       q: filters.q,
+      regressed: filters.regressed,
     }),
-    [project, filters.status, filters.verdict, filters.q],
+    [project, filters.status, filters.verdict, filters.q, filters.regressed],
   );
   const activeStore = useActiveRuns();
   const activeBatchIds = useMemo(() => new Set(activeStore.runs.flatMap((r) => (r.batchId ? [r.batchId] : []))), [activeStore.runs]);
@@ -481,7 +477,7 @@ function FilterBar({
   const { setProjectId } = useProjectScope();
   const [q, setQ] = useState(filters.q ?? "");
   const group = filters.group ?? "day";
-  const filterCount = (filters.status?.length ?? 0) + (filters.verdict?.length ?? 0) + (filters.q ? 1 : 0) + (filters.project ? 1 : 0);
+  const filterCount = (filters.status?.length ?? 0) + (filters.verdict?.length ?? 0) + (filters.q ? 1 : 0) + (filters.project ? 1 : 0) + (filters.regressed ? 1 : 0);
 
   useEffect(() => setQ(filters.q ?? ""), [filters.q]);
   useEffect(() => {
@@ -531,6 +527,21 @@ function FilterBar({
         text={(v) => v}
         onChange={(verdict) => setRunFilters({ ...filters, verdict })}
       />
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Toggle
+            variant="outline"
+            size="sm"
+            className="h-8 data-[state=on]:border-ring/60 data-[state=on]:bg-accent"
+            pressed={filters.regressed === true}
+            onPressedChange={(on) => setRunFilters({ ...filters, regressed: on ? true : undefined })}
+          >
+            <ArrowDown className="text-red-500" />
+            Has regressions
+          </Toggle>
+        </TooltipTrigger>
+        <TooltipContent>Finished runs with checks that passed in their baseline and fail now</TooltipContent>
+      </Tooltip>
       <Select value={projectValue} onValueChange={changeProject}>
         <SelectTrigger size="sm" className="w-40" aria-label="Filter by project">
           <SelectValue placeholder="All projects" />

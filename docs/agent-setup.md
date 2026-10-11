@@ -266,7 +266,22 @@ If a call says the lease ended, stop touching the device and acquire again.
 
 Check that `qa_list_devices` is callable (the `mobile_*` tools appear in the tool list too, each taking a `leaseId`), and tell the user what is enforced and what is not: Tapocalypse's `mobile_*` tools only drive the leased device, but a process that runs `adb` or `xcrun simctl` on its own, or its own mobile-mcp server, is not stopped. Details: [Sharing devices between agents](guide.md#sharing-devices-between-agents).
 
-## 9. Report back
+## 9. Teach your agents the QA loop (optional)
+
+Tapocalypse remembers earlier runs of the same test, so after a code change an agent can ask "did I break anything that used to pass?" instead of reading every report. A run is compared with an automatic baseline (the same test on the project's default branch, a pull request's base branch or the previous commit); checks that passed there and fail now are *newly failing*, and checks that flip between pass and fail on the same code are reported as flaky and left out. Details: [Regressions, history and flaky checks](guide.md#regressions-history-and-flaky-checks). Ask the user whether to add the snippet below to the same instruction files as in step 8, as its own section, and do not write it without their go-ahead:
+
+```md
+## Checking my changes with Tapocalypse
+After changing app code that a user can see:
+1. `qa_start_run { projectId, title, brief, requester, source: { path: <your working dir> } }`. Re-use the same title and brief when you test the same thing again: history links runs of the same test, and checks that keep their wording keep their history. Do not pass `reuseChecks: false`.
+2. `qa_wait_run { runId }` until `timedOut` is false (`qa_wait_runs` for several).
+3. `qa_find_regressions { projectId, branch | prNumber | commit }`. `regressions`: fix the `newlyFailing` checks first (open `current.screenshotPath`, compare with `baseline.screenshotPath`), then `lostCoverage`. `flakyFailing` is noise unless it keeps failing. `pending`: wait for the other runs. `no_baseline`: there is nothing earlier to compare with yet, so read the report instead.
+4. Confirm a fix with `qa_rerun { runId, only: "failed" }`, then call `qa_find_regressions` again. For one check's past results use `qa_check_history`, for the details of a run `qa_compare_runs`.
+```
+
+Check that `qa_find_regressions` is among the tools your harness lists. A fresh install has no history, so on the first runs it answers `no_baseline`: say so to the user instead of treating it as an error.
+
+## 10. Report back
 
 Send the user one short message:
 
@@ -277,8 +292,9 @@ Tapocalypse is set up.
 - Project: <id> (<defaultPackage>, <platform>).
 - Smoke run: <verdict>. <summary>. Watch or replay: <url>. Report: <reportPath from `qa_get_run`, in Tapocalypse's data folder; read it with `qa_get_report` or `tapocalypse report <run-id>`>. Cost: <cost, or tokens>.
 - Device sharing: <snippet added to <file> | not added>.
+- QA loop: <snippet added to <file> | not added>.
 - Still missing: <optional items, or "nothing">.
-Next time, ask me to "QA what you just built with Tapocalypse" and I will start a run, wait for it and fix what fails.
+Next time, ask me to "QA what you just built with Tapocalypse" and I will start a run, wait for it, check it for regressions and fix what fails.
 ```
 
 Done. Do not start further runs unless the user asks.

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { toast } from "sonner";
 import { api, runHash, type Check, type RunView } from "@/lib/api";
-import { navigate } from "@/lib/hooks";
+import { navigate, useNewRun, type NewRunPrefill } from "@/lib/hooks";
 
 function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -12,9 +12,25 @@ export function failedChecks(checks: readonly Check[]): Check[] {
   return checks.filter((c) => c.status !== "pass" && c.status !== "skipped");
 }
 
+/** "Re-run with changes…": the New run sheet seeded from `run`, offering to reuse its checks (not for suite runs: their ids come from the suite). */
+export function rerunWithChangesPrefill(run: RunView): NewRunPrefill {
+  return {
+    projectId: run.projectId,
+    title: run.title,
+    brief: run.brief,
+    device: run.deviceRequest,
+    packageId: run.packageId,
+    harness: run.harness,
+    model: run.model ?? undefined,
+    effort: run.effort ?? run.thinking ?? undefined,
+    ...(run.suiteId ? { suiteId: run.suiteId } : { reuseChecksFrom: run.id }),
+  };
+}
+
 export interface RunActions {
   busy: boolean;
   rerun(only: "failed" | "all"): Promise<void>;
+  rerunWithChanges(): void;
   cancel(): Promise<boolean>;
   remove(): Promise<boolean>;
 }
@@ -22,6 +38,7 @@ export interface RunActions {
 /** Re-run / cancel / delete with toast feedback; a successful re-run navigates to the new run. */
 export function useRunActions(run: RunView): RunActions {
   const [busy, setBusy] = useState(false);
+  const { openNewRun } = useNewRun();
 
   async function rerun(only: "failed" | "all") {
     setBusy(true);
@@ -65,5 +82,5 @@ export function useRunActions(run: RunView): RunActions {
     }
   }
 
-  return { busy, rerun, cancel, remove };
+  return { busy, rerun, rerunWithChanges: () => openNewRun(rerunWithChangesPrefill(run)), cancel, remove };
 }

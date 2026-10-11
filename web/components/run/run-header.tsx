@@ -103,6 +103,7 @@ export function RunHeader({
                 <DropdownMenuItem disabled={failed === 0} onSelect={() => void actions.rerun("failed")}>
                   Re-run failed only{failed > 0 ? ` (${failed})` : ""}
                 </DropdownMenuItem>
+                <DropdownMenuItem onSelect={actions.rerunWithChanges}>Re-run with changes…</DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
           )}

@@ -27,9 +27,17 @@ function outcomeLabel(run: RunView): string {
   return run.status === "done" && run.verdict ? run.verdict : run.status.toUpperCase();
 }
 
+/** "2 newly failing vs main": set only when the finished run regressed against its baseline. */
+function regressionLine(run: RunView): string | null {
+  const reg = run.regression;
+  if (!reg || reg.newlyFailing <= 0) return null;
+  return `${reg.newlyFailing} newly failing vs ${reg.baselineBranch ?? "the baseline"}`;
+}
+
 function showToast(run: RunView): void {
   const label = `${outcomeLabel(run)} · ${run.title}`;
-  const options = { action: { label: "View run", onClick: () => navigate(runHash(run.id)) }, duration: TOAST_MS };
+  const description = regressionLine(run) ?? undefined;
+  const options = { action: { label: "View run", onClick: () => navigate(runHash(run.id)) }, duration: TOAST_MS, description };
   if (run.status === "done" && (run.verdict === "PASS")) toast.success(label, options);
   else if (run.status === "done" && run.verdict === "PASS WITH ISSUES") toast.warning(label, options);
   else if (run.status === "cancelled" || run.status === "interrupted") toast.info(label, options);
@@ -37,7 +45,7 @@ function showToast(run: RunView): void {
 }
 
 function showDesktopNotification(run: RunView): void {
-  const body = run.summary ?? run.error ?? undefined;
+  const body = [regressionLine(run), run.summary ?? run.error].filter(Boolean).join("\n") || undefined;
   const n = new Notification(`${outcomeLabel(run)} · ${run.title}`, { body, tag: run.id, icon: notificationIcon });
   n.onclick = () => {
     window.focus();

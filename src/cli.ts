@@ -58,7 +58,10 @@ export interface RunOptions {
   timeoutMs: number;
   json: boolean;
   junit: string | null;
+  /** Verdicts that make the exit code 1; empty together with `failOnRegression` = only new failures do. */
   failOn: Verdict[];
+  /** `--fail-on regression`: after the wait, compare against the automatic baseline and exit 1 on non-flaky newly failing checks. */
+  failOnRegression: boolean;
   url: string;
 }
 
@@ -70,6 +73,7 @@ export type Command =
   | { name: "run"; options: RunOptions }
   | { name: "status"; id: string; json: boolean; url: string }
   | { name: "report"; id: string; exportDir: string | null; json: boolean; url: string }
+  | { name: "compare"; id: string; baseline: string; includeFlaky: boolean; json: boolean; junit: string | null; url: string }
   | { name: "service"; action: ServiceAction };
 
 const SERVICE_ACTIONS = ["install", "uninstall", "start", "stop", "restart", "status", "logs"] as const satisfies readonly ServiceAction[];
@@ -88,6 +92,10 @@ Usage:
   tapocalypse report <runId> [--export <dir>] [--json] [--url <url>]
       Print a run's markdown report. Reports and screenshots live in Tapocalypse's data dir, not in your repository;
       --export copies them (QA-REPORT-<runId>.md + screenshots/) into <dir>. --json prints { runId, reportPath, markdown }.
+  tapocalypse compare <runId|batchId> [--baseline <runId|auto>] [--include-flaky] [--json] [--junit <file>] [--url <url>]
+      Compare a finished run with its baseline (the automatic one, or a run id): newly failing, fixed and flaky checks.
+      A batch compares every lane against its own automatic baseline. Exits 1 on non-flaky newly failing checks,
+      0 when there are none (also when there is no baseline yet; a note goes to stderr), 2 for an unknown or still-active run.
   tapocalypse service ${SERVICE_ACTIONS.join("|")}
       Manage the always-on background service (launchd on macOS, a systemd user unit on Linux) that keeps the server running.
 
@@ -107,7 +115,8 @@ Run options:
   --timeout <dur>       Stop waiting after this long (default ${DEFAULT_TIMEOUT}; e.g. 30s, 45m, 2h); only used with --wait
   --json                Print JSON to stdout instead of text
   --junit <file>        Write a JUnit XML report (implies --wait)
-  --fail-on <list>      Verdicts that make the exit code 1 (default ${DEFAULT_FAIL_ON.join(",")})
+  --fail-on <list>      Verdicts that make the exit code 1 (default ${DEFAULT_FAIL_ON.join(",")}); add \`regression\` to also exit 1 on
+                        checks that newly fail against the automatic baseline (alone: fail only on those)
   --url <url>           Server URL (default $TAPOCALYPSE_URL, else http://127.0.0.1:${DEFAULT_PORT})
 
 Exit codes:
@@ -195,6 +204,29 @@ export function parseCli(argv: string[], env: Record<string, string | undefined>
         url: baseUrl(values.url, env),
       };
     }
+    case "compare": {
+      const { values, positionals } = tokenize(rest, {
+        baseline: { type: "string" },
+        "include-flaky": { type: "boolean" },
+        json: { type: "boolean" },
+        junit: { type: "string" },
+        url: { type: "string" },
+      });
+      if (positionals.length !== 1) {
+        throw new UsageError("usage: tapocalypse compare <runId|batchId> [--baseline <runId|auto>] [--include-flaky] [--json] [--junit <file>] [--url <url>]");
+      }
+      const baseline = values.baseline?.trim() ?? "auto";
+      if (!baseline) throw new UsageError("--baseline must be a run id or auto");
+      return {
+        name: "compare",
+        id: positionals[0]!,
+        baseline,
+        includeFlaky: values["include-flaky"] === true,
+        json: values.json === true,
+        junit: values.junit ?? null,
+        url: baseUrl(values.url, env),
+      };
+    }
     case "service": {
       const { positionals } = tokenize(rest, {});
       const action = SERVICE_ACTIONS.find((a) => a === positionals[0]);
@@ -258,6 +290,10 @@ function parseRunOptions(args: string[], env: Record<string, string | undefined>
     throw new UsageError(`invalid --harness "${values.harness}" (${HARNESS_IDS.join(", ")})`);
   }
 
+  const failOnTokens = values["fail-on"]?.split(",").map((t) => t.trim()) ?? [];
+  const failOnRegression = failOnTokens.some((t) => t.toLowerCase() === "regression");
+  const failOn =
+    values["fail-on"] === undefined ? DEFAULT_FAIL_ON : parseFailOn(failOnTokens.filter((t) => t.toLowerCase() !== "regression").join(","));
   const junit = values.junit ?? null;
   return {
     projectId: values.project,
@@ -275,7 +311,8 @@ function parseRunOptions(args: string[], env: Record<string, string | undefined>
     timeoutMs: parseDuration(values.timeout ?? DEFAULT_TIMEOUT),
     json: values.json === true,
     junit,
-    failOn: values["fail-on"] === undefined ? DEFAULT_FAIL_ON : parseFailOn(values["fail-on"]),
+    failOn,
+    failOnRegression,
     url: baseUrl(values.url, env),
   };
 }
@@ -320,6 +357,107 @@ export interface BatchLite {
 }
 
 export const isTerminal = (run: RunLite): boolean => TERMINAL.includes(run.status);
+
+// ---------------------------------------------------------------------------------------------------------------
+// Regression comparison (`GET /api/runs/:id/compare`; only the fields the CLI reads)
+
+export interface CompareSideLite {
+  runId: string;
+  checkId: string;
+  title: string;
+  status: CheckStatus;
+  note: string | null;
+}
+
+export interface ComparePairLite {
+  key: string;
+  checkKey: string | null;
+  transition: "newly_failing" | "fixed" | "flaky" | "still_failing" | "unchanged" | "changed" | "new" | "removed" | "pending";
+  flaky: boolean;
+  lostCoverage: boolean;
+  baseline: CompareSideLite | null;
+  current: CompareSideLite | null;
+}
+
+export interface CompareLite {
+  baseline: { tier: string; primaryRunId: string; branch: string | null; commit: string | null; reason: string };
+  pairs: ComparePairLite[];
+}
+
+export interface CompareResponse {
+  comparison: CompareLite | null;
+  reason: string | null;
+  reasonText: string | null;
+}
+
+export interface FlakyStat {
+  flips: number;
+  window: number;
+}
+
+/** A run's comparison plus the flip counts of its flaky checks (by check key), as the JUnit report needs them. */
+export interface RunRegression {
+  comparison: CompareLite;
+  flaky: Map<string, FlakyStat>;
+}
+
+/** Non-flaky newly failing checks (the server already files flaky ones under `flaky` unless --include-flaky). */
+const regressionsOf = (comparison: CompareLite): ComparePairLite[] => comparison.pairs.filter((p) => p.transition === "newly_failing");
+
+const pairTitle = (p: ComparePairLite): string => p.current?.title ?? p.baseline?.title ?? p.key;
+
+/** `main@abcdef1`, `main` or `abcdef1`: where the baseline was recorded. */
+function baselineWhere(b: CompareLite["baseline"]): string {
+  return [b.branch, b.commit?.slice(0, 7)].filter(Boolean).join("@");
+}
+
+/** Comparison of each run. `tolerant` skips a run whose comparison cannot be fetched instead of failing. */
+async function compareRuns(api: ApiClient, runs: RunLite[], baseline: string, includeFlaky: boolean, tolerant: boolean): Promise<Map<string, CompareResponse>> {
+  const out = new Map<string, CompareResponse>();
+  for (const run of runs) {
+    try {
+      const query = `baseline=${encodeURIComponent(baseline)}${includeFlaky ? "&includeFlaky=1" : ""}`;
+      out.set(run.id, await api.request<CompareResponse>("GET", `/api/runs/${encodeURIComponent(run.id)}/compare?${query}`));
+    } catch (e) {
+      if (!tolerant) throw e;
+    }
+  }
+  return out;
+}
+
+async function flakyStats(api: ApiClient, projectId: string): Promise<Map<string, FlakyStat>> {
+  try {
+    const { checks } = await api.request<{ checks: { checkKey: string; flips: number; window: number }[] }>("GET", `/api/projects/${encodeURIComponent(projectId)}/flaky`);
+    return new Map(checks.map((c) => [c.checkKey, { flips: c.flips, window: c.window }]));
+  } catch {
+    return new Map();
+  }
+}
+
+/** Attaches flip counts (one best-effort fetch per project) to every comparison that has a flaky check. */
+async function withFlakyStats(api: ApiClient, runs: RunLite[], comparisons: Map<string, CompareResponse>): Promise<Map<string, RunRegression>> {
+  const out = new Map<string, RunRegression>();
+  const byProject = new Map<string, Map<string, FlakyStat>>();
+  for (const run of runs) {
+    const comparison = comparisons.get(run.id)?.comparison;
+    if (!comparison) continue;
+    let flaky = new Map<string, FlakyStat>();
+    if (comparison.pairs.some((p) => p.flaky)) {
+      const cached = byProject.get(run.projectId) ?? (await flakyStats(api, run.projectId));
+      byProject.set(run.projectId, cached);
+      flaky = cached;
+    }
+    out.set(run.id, { comparison, flaky });
+  }
+  return out;
+}
+
+/** Runs that have a comparison, with the number of non-flaky newly failing checks in each. */
+function regressionCount(comparisons: Map<string, CompareResponse>): number {
+  let n = 0;
+  for (const { comparison } of comparisons.values()) if (comparison) n += regressionsOf(comparison).length;
+  return n;
+}
 
 // ---------------------------------------------------------------------------------------------------------------
 // Request building
@@ -530,7 +668,30 @@ interface JUnitCase {
   outcome: { kind: "pass" } | { kind: "failure" | "error" | "skipped"; message: string; detail?: string };
 }
 
-function casesFor(run: RunLite): JUnitCase[] {
+/** Message prefix for a failing check that the comparison classifies: a regression, or a flaky failure. */
+function failurePrefix(pair: ComparePairLite | undefined, regression: RunRegression): string {
+  if (!pair) return "";
+  if (pair.transition === "newly_failing") {
+    const where = baselineWhere(regression.comparison.baseline);
+    return `Newly failing (was pass in ${pair.baseline?.runId ?? regression.comparison.baseline.primaryRunId}${where ? `, ${where}` : ""}): `;
+  }
+  if (pair.flaky) {
+    const stat = pair.checkKey ? regression.flaky.get(pair.checkKey) : undefined;
+    return stat ? `Flaky (${stat.flips} flips in last ${stat.window}): ` : "Flaky: ";
+  }
+  return "";
+}
+
+/** What the comparison says besides failures, for the suite's `<system-out>`. */
+function regressionNotes(comparison: CompareLite): string[] {
+  return comparison.pairs.flatMap((p) => [
+    ...(p.transition === "fixed" ? [`Fixed: ${pairTitle(p)}`] : []),
+    ...(p.lostCoverage ? [`Lost coverage: ${pairTitle(p)}`] : []),
+  ]);
+}
+
+function casesFor(run: RunLite, regression?: RunRegression): JUnitCase[] {
+  const pairByCheck = new Map(regression?.comparison.pairs.flatMap((p) => (p.current ? [[p.current.checkId, p] as const] : [])));
   const ended = isTerminal(run);
   const cases: JUnitCase[] = run.checks.map((c): JUnitCase => {
     const name = `${c.id}: ${c.title}`;
@@ -538,8 +699,11 @@ function casesFor(run: RunLite): JUnitCase[] {
     switch (c.status) {
       case "pass":
         return { name, timeMs, outcome: { kind: "pass" } };
-      case "fail":
-        return { name, timeMs, outcome: { kind: "failure", message: c.note ?? "check failed", detail: c.note } };
+      case "fail": {
+        const base = c.note ?? "check failed";
+        const prefix = regression ? failurePrefix(pairByCheck.get(c.id), regression) : "";
+        return { name, timeMs, outcome: { kind: "failure", message: prefix + base, detail: prefix ? prefix + base : c.note } };
+      }
       case "skipped":
         return { name, timeMs, outcome: { kind: "skipped", message: c.note ? `skipped: ${c.note}` : "skipped" } };
       case "blocked":
@@ -578,9 +742,9 @@ function casesFor(run: RunLite): JUnitCase[] {
   return cases;
 }
 
-export function renderJUnit(runs: RunLite[], base: string): string {
+export function renderJUnit(runs: RunLite[], base: string, regressions?: Map<string, RunRegression>): string {
   const out: string[] = ['<?xml version="1.0" encoding="UTF-8"?>'];
-  const suites = runs.map((run) => ({ run, cases: casesFor(run) }));
+  const suites = runs.map((run) => ({ run, cases: casesFor(run, regressions?.get(run.id)) }));
   const count = (kinds: string[]) =>
     suites.reduce((n, s) => n + s.cases.filter((c) => kinds.includes(c.outcome.kind)).length, 0);
   const total = suites.reduce((n, s) => n + s.cases.length, 0);
@@ -601,6 +765,7 @@ export function renderJUnit(runs: RunLite[], base: string): string {
     if (run.startedAt) attrs.push(`timestamp="${xmlEscape(run.startedAt)}"`);
     out.push(`  <testsuite ${attrs.join(" ")}>`);
     out.push("    <properties>");
+    const regression = regressions?.get(run.id);
     const props: [string, string | null | undefined][] = [
       ["run.id", run.id],
       ["run.url", runUrl(base, run.id)],
@@ -611,6 +776,10 @@ export function renderJUnit(runs: RunLite[], base: string): string {
       ["device", run.deviceSerial],
       ["batch", run.batchId],
       ["report", run.reportFile],
+      ["baseline.run", regression?.comparison.baseline.primaryRunId],
+      ["baseline.tier", regression?.comparison.baseline.tier],
+      ["baseline.commit", regression?.comparison.baseline.commit],
+      ["regressions", regression && String(regressionsOf(regression.comparison).length)],
     ];
     for (const [name, value] of props) if (value) out.push(`      <property name="${name}" value="${xmlEscape(value)}"/>`);
     out.push("    </properties>");
@@ -621,7 +790,13 @@ export function renderJUnit(runs: RunLite[], base: string): string {
       else if (o.kind === "skipped") out.push(`${open}><skipped message="${xmlEscape(o.message)}"/></testcase>`);
       else out.push(`${open}><${o.kind} message="${xmlEscape(o.message)}">${xmlText(o.detail ?? o.message)}</${o.kind}></testcase>`);
     }
-    const log = [run.summary, run.error && (run.status !== "done" || run.verdictSource === "derived") ? `error: ${run.error}` : null].filter(Boolean).join("\n");
+    const log = [
+      run.summary,
+      run.error && (run.status !== "done" || run.verdictSource === "derived") ? `error: ${run.error}` : null,
+      ...(regression ? regressionNotes(regression.comparison) : []),
+    ]
+      .filter(Boolean)
+      .join("\n");
     if (log) out.push(`    <system-out>${xmlText(log)}</system-out>`);
     out.push("  </testsuite>");
   }
@@ -832,15 +1007,115 @@ export async function executeRun(options: RunOptions, deps: RunDeps): Promise<nu
     io.err(`timed out waiting after ${formatDuration(options.timeoutMs)}; the run(s) keep going on the server (cancel them from the UI or POST /api/runs/<id>/cancel)`);
   }
 
+  // `--fail-on regression` needs the comparison; a JUnit report carries it when it can be had.
+  let comparisons = new Map<string, CompareResponse>();
+  let compareFailed = false;
+  const finished = runs.filter(isTerminal);
+  if (options.failOnRegression || options.junit) {
+    try {
+      comparisons = await compareRuns(api, finished, "auto", false, !options.failOnRegression);
+    } catch (e) {
+      io.err(`could not compare with the baseline: ${oneLine(e instanceof Error ? e.message : String(e))}`);
+      compareFailed = true;
+    }
+  }
+  if (options.failOnRegression) noteMissingBaselines(finished, comparisons, io);
+
   if (options.junit) {
-    await deps.writeFile(options.junit, renderJUnit(runs, api.base));
+    await deps.writeFile(options.junit, renderJUnit(runs, api.base, await withFlakyStats(api, finished, comparisons)));
     io.err(`wrote JUnit report to ${options.junit}`);
   }
-  const code = exitCodeForRuns(runs, options.failOn, timedOut);
+  const regressions = regressionCount(comparisons);
+  let code = exitCodeForRuns(runs, options.failOn, timedOut);
+  if (options.failOnRegression && regressions > 0) code = Math.max(code, EXIT.VERDICT);
+  if (compareFailed) code = EXIT.ERROR;
   if (options.json) {
-    io.out(JSON.stringify({ batchId, timedOut, exitCode: code, runs: runs.map((r) => summarizeRun(r, api.base)) }, null, 2));
+    const regressionField = options.failOnRegression ? { regressions } : {};
+    io.out(JSON.stringify({ batchId, timedOut, exitCode: code, ...regressionField, runs: runs.map((r) => summarizeRun(r, api.base)) }, null, 2));
   } else {
-    io.out(runs.map((r) => formatRun(r, api.base)).join("\n\n"));
+    io.out(
+      runs
+        .map((r) => {
+          const comparison = options.failOnRegression ? comparisons.get(r.id)?.comparison : null;
+          return comparison ? `${formatRun(r, api.base)}\n${formatCompare(comparison)}` : formatRun(r, api.base);
+        })
+        .join("\n\n"),
+    );
+  }
+  return code;
+}
+
+/** A stderr note for each run that has nothing to compare with, so a first CI run is explained rather than silent. */
+function noteMissingBaselines(runs: RunLite[], comparisons: Map<string, CompareResponse>, io: Io): void {
+  for (const run of runs) {
+    const response = comparisons.get(run.id);
+    if (response && !response.comparison) io.err(`no comparison for ${run.id}: ${oneLine(response.reasonText ?? response.reason ?? "no baseline")}`);
+  }
+}
+
+/** Text report of one comparison: where the baseline is, the headline counts and every changed check. */
+function formatCompare(comparison: CompareLite): string {
+  const { baseline } = comparison;
+  const where = baselineWhere(baseline);
+  const lines = [`baseline ${baseline.primaryRunId} (${baseline.tier}${where ? `, ${where}` : ""}): ${oneLine(baseline.reason)}`];
+  const groups: [string, ComparePairLite[]][] = [
+    ["newly failing", regressionsOf(comparison)],
+    ["flaky", comparison.pairs.filter((p) => p.transition === "flaky")],
+    ["fixed", comparison.pairs.filter((p) => p.transition === "fixed")],
+    ["lost coverage", comparison.pairs.filter((p) => p.lostCoverage)],
+  ];
+  lines.push(groups.map(([label, pairs]) => `${pairs.length} ${label}`).join(", "));
+  for (const [label, pairs] of groups) {
+    for (const p of pairs) lines.push(`  ${label}: ${oneLine(pairTitle(p))}${p.current?.note ? ` - ${oneLine(p.current.note)}` : ""}`);
+  }
+  return lines.join("\n");
+}
+
+/** `tapocalypse compare <runId|batchId>`: 0 without non-flaky newly failing checks, 1 with, 2 for an unknown or still-active run. */
+export async function executeCompare(options: Omit<Extract<Command, { name: "compare" }>, "name" | "url">, deps: Pick<RunDeps, "api" | "io" | "writeFile">): Promise<number> {
+  const { api, io } = deps;
+  const batch = options.id.startsWith("b-");
+  if (batch && options.baseline !== "auto") throw new UsageError("--baseline cannot be used with a batch: every lane uses its own automatic baseline");
+  const fetchRun = (id: string) => api.request<RunLite>("GET", `/api/runs/${encodeURIComponent(id)}`);
+
+  let runs: RunLite[];
+  let comparisons: Map<string, CompareResponse>;
+  try {
+    const listed = batch ? (await api.request<BatchLite>("GET", `/api/batches/${encodeURIComponent(options.id)}`)).runs : [await fetchRun(options.id)];
+    runs = await followRetries(listed, fetchRun);
+    const active = runs.filter((r) => !isTerminal(r));
+    if (active.length > 0) {
+      io.err(`error: ${active.map((r) => `run ${r.id}`).join(", ")} still ${active[0]!.status}; compare finished runs`);
+      return EXIT.ERROR;
+    }
+    comparisons = await compareRuns(api, runs, options.baseline, options.includeFlaky, false);
+  } catch (e) {
+    // An unknown run is an environment problem for CI (exit 2); other 4xx answers (a bad --baseline) stay usage errors.
+    if (e instanceof ApiError && e.status === 404) {
+      io.err(`error: ${oneLine(e.message)}`);
+      return EXIT.ERROR;
+    }
+    throw e;
+  }
+
+  noteMissingBaselines(runs, comparisons, io);
+  const regressions = regressionCount(comparisons);
+  const code = regressions > 0 ? EXIT.VERDICT : EXIT.OK;
+  if (options.junit) {
+    await deps.writeFile(options.junit, renderJUnit(runs, api.base, await withFlakyStats(api, runs, comparisons)));
+    io.err(`wrote JUnit report to ${options.junit}`);
+  }
+  if (options.json) {
+    const results = runs.map((r) => {
+      const response = comparisons.get(r.id);
+      return { runId: r.id, regressions: response?.comparison ? regressionsOf(response.comparison).length : 0, ...response };
+    });
+    io.out(JSON.stringify({ batchId: batch ? options.id : null, exitCode: code, regressions, runs: results }, null, 2));
+  } else {
+    for (const r of runs) {
+      const comparison = comparisons.get(r.id)?.comparison;
+      if (comparison) io.out(`${r.id}  ${oneLine(r.title)}\n${formatCompare(comparison)}`);
+    }
   }
   return code;
 }
@@ -942,6 +1217,14 @@ export async function main(argv: string[], env: Record<string, string | undefine
       } catch (e) {
         console.error(`error: ${oneLine(e instanceof Error ? e.message : String(e))}`);
         return EXIT.ERROR;
+      }
+    }
+    case "compare": {
+      try {
+        return await executeCompare(command, defaultRunDeps(command.url, env));
+      } catch (e) {
+        console.error(`error: ${oneLine(e instanceof Error ? e.message : String(e))}`);
+        return exitCodeForError(e);
       }
     }
     case "run":

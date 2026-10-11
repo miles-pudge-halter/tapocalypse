@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { getBatchMeta, makeBatchId, pruneBatchMeta, saveBatchMeta } from "../batches";
@@ -10,9 +10,11 @@ import { HARNESS_IDS, type HarnessId } from "../harness/types";
 import { getProject, PACKAGE_RE, type Project, resolvePersonaPath } from "../projects/registry";
 import { androidName, type Device, type DeviceWaiter, mobileDeviceIdOf } from "../devices/devices";
 import { CLAIM_WINDOW_MS, formatClock, type Lease, leaseView, type LeaseNext, type LeaseStore, TTL } from "../devices/leases";
+import { hintsFor, keyLookup, keyRun } from "../regression";
+import { assignTestKey } from "../regression/keys";
 import { getSuite, MAX_BRIEF_LENGTH, MAX_TITLE_LENGTH, type Suite, type SuiteCheck } from "../suites";
 import { extractTickets, lookupPullRequest, resolveSource, type SourceInput, SourceInputSchema } from "./source";
-import { loadPersona } from "./prompt";
+import { capHints, loadPersona } from "./prompt";
 import { createRun, deleteRun as deleteStoredRun, getRun, listRuns, type NewRun, saveRun } from "./store";
 import { ACTIVE, type Activity, type Check, type DeviceRequest, type Platform, type Run, type RunSource } from "./types";
 
@@ -60,6 +62,8 @@ export interface EnqueueInput {
   install?: { path: string };
   /** Set by `enqueueBatch`; HTTP/MCP entry points must not forward it from clients. */
   batchId?: string;
+  /** Show the agent the previous checks of this test so it can keep their identity (default true). */
+  reuseChecks?: boolean;
 }
 
 export interface BatchInput {
@@ -76,6 +80,7 @@ export interface BatchInput {
   install?: { path: string };
   source?: SourceInput;
   requestedBy?: string;
+  reuseChecks?: boolean;
 }
 
 /** Missing / non-string text fields count as empty so the "title and brief are required" check reports them. */
@@ -123,6 +128,7 @@ const EnqueueSchema = z.object({
   suiteId: optionalText(),
   install: installRequest.optional(),
   batchId: optionalText(),
+  reuseChecks: z.boolean().optional(),
 });
 
 const BatchSchema = z.object({
@@ -139,6 +145,7 @@ const BatchSchema = z.object({
   thinking: thinkingLevel,
   effort: optionalText(40),
   install: installRequest.optional(),
+  reuseChecks: z.boolean().optional(),
 });
 
 function parseOrThrow<T>(schema: z.ZodType<T>, body: unknown, code?: string): T {
@@ -158,12 +165,26 @@ function personaHarness(project: Project): HarnessId | null {
   }
 }
 
-/** State carried over from an existing run by `rerun`; skips suite lookup and source resolution. */
+/** State carried over from an existing run by `rerun`; skips suite lookup. */
 interface RerunCopy {
   rerunOf: string;
   suiteId: string | null;
   suiteChecks: SuiteCheck[] | null;
-  source: RunSource | null;
+  /** Whose checks the new run's prompt shows (a re-run of everything); null for a re-run of the failed checks only. */
+  hintsFrom: Run | null;
+}
+
+/** What a re-run asks `resolveSource` for: the same worktree (while it exists), tickets, labels and a PR the requester named; git state is read afresh. */
+function rerunSourceInput(source: RunSource | null): SourceInput | undefined {
+  if (!source) return undefined;
+  const input: SourceInput = { tickets: source.tickets.slice(0, 20), labels: source.labels };
+  if (source.path && existsSync(source.path)) input.path = source.path;
+  if (source.prStatus === "provided" && source.pr) {
+    input.prNumber = source.pr.number;
+    if (source.pr.title) input.prTitle = source.pr.title;
+    if (source.pr.url) input.prUrl = source.pr.url;
+  }
+  return input;
 }
 
 interface PreparedRun {
@@ -383,6 +404,7 @@ export class Scheduler {
         run.status = "interrupted";
         run.error = "tapocalypse restarted while run was active";
         run.endedAt = new Date().toISOString();
+        keyRun(run);
         saveRun(run);
       }
     }
@@ -394,6 +416,7 @@ export class Scheduler {
 
   /** Persists and broadcasts a run mutation. */
   update(run: Run): void {
+    keyRun(run);
     saveRun(run);
     if (ACTIVE.includes(run.status)) this.live.set(run.id, run);
     else this.live.delete(run.id);
@@ -467,7 +490,14 @@ export class Scheduler {
         throw new HttpError(400, `device ${serial} is excluded in config`);
       }
     }
-    const source = copy ? structuredClone(copy.source) : await resolveSource(project, input.source, title);
+    const source = await resolveSource(project, input.source, title);
+    const suiteId = copy ? copy.suiteId : (suite?.id ?? null);
+    const deviceRequest: DeviceRequest = serial ? { serial, platform } : { platform };
+    const rerunOf = copy?.rerunOf ?? null;
+    const testKey = assignTestKey({ projectId: project.id, title, brief, suiteId, retryOf: null, rerunOf }, keyLookup);
+    const reuseChecks = input.reuseChecks !== false;
+    const hints = reuseChecks ? hintsFor({ projectId: project.id, testKey, suiteId, retryOf: null, rerunOf, deviceRequest }, { parent: copy?.hintsFrom }) : null;
+    const checkHints = hints ? capHints(hints) : null;
     const suiteChecks = copy ? copy.suiteChecks : suite?.checks?.length ? suite.checks.map((c) => ({ ...c })) : null;
     return {
       source,
@@ -476,7 +506,7 @@ export class Scheduler {
         title,
         brief,
         requestedBy: input.requestedBy || "web",
-        deviceRequest: serial ? { serial, platform } : { platform },
+        deviceRequest,
         deviceSerial: null,
         deviceLabel: null,
         bootedByRun: false,
@@ -495,13 +525,16 @@ export class Scheduler {
         source,
         build: null,
         batchId: input.batchId ?? null,
-        suiteId: copy ? copy.suiteId : (suite?.id ?? null),
+        suiteId,
         suiteChecks,
+        testKey,
+        checkHints,
+        reuseChecks,
         harness,
         model: input.model ?? suite?.model ?? null,
         thinking: input.thinking ?? (harness === "omp" ? (input.effort ?? null) : null),
         effort: input.effort ?? input.thinking ?? null,
-        rerunOf: copy?.rerunOf ?? null,
+        rerunOf,
         install: input.install ?? null,
       },
     };
@@ -557,6 +590,7 @@ export class Scheduler {
           install: input.install,
           source: input.source,
           requestedBy: input.requestedBy,
+          reuseChecks: input.reuseChecks,
           batchId,
         }).catch((e: unknown) => {
           if (e instanceof HttpError && input.devices.length > 1) {
@@ -610,8 +644,10 @@ export class Scheduler {
         thinking: (sameHarness ? run.thinking : null) ?? undefined,
         effort: (sameHarness ? run.effort : null) ?? undefined,
         requestedBy: opts.requestedBy ?? "web",
+        source: rerunSourceInput(run.source),
+        reuseChecks: run.reuseChecks,
       },
-      { rerunOf: run.id, suiteId: run.suiteId, suiteChecks, source: run.source },
+      { rerunOf: run.id, suiteId: run.suiteId, suiteChecks, hintsFrom: opts.only === "all" ? run : null },
     );
     return this.commit(prepared);
   }
@@ -622,6 +658,7 @@ export class Scheduler {
    * leaves the retry queued with its reason shown.
    */
   retry(run: Run): Run {
+    const retryHints = run.reuseChecks ? hintsFor({ ...run, retryOf: run.id }, { parent: run }) : null;
     const next = createRun({
       projectId: run.projectId,
       title: run.title,
@@ -648,6 +685,9 @@ export class Scheduler {
       batchId: run.batchId,
       suiteId: run.suiteId,
       suiteChecks: structuredClone(run.suiteChecks),
+      testKey: run.testKey ?? assignTestKey({ ...run, retryOf: run.id }, keyLookup),
+      checkHints: retryHints ? capHints(retryHints) : null,
+      reuseChecks: run.reuseChecks,
       harness: run.harness,
       model: run.model,
       thinking: run.thinking,

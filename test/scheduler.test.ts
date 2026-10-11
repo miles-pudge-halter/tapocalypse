@@ -5,7 +5,9 @@ import path from "node:path";
 import { HttpError } from "../src/config";
 import { CLAIM_WINDOW_MS } from "../src/devices/leases";
 import type { Scheduler } from "../src/runs/scheduler";
-import type { Platform } from "../src/runs/types";
+import { briefFingerprint } from "../src/regression/keys";
+import { getRun } from "../src/runs/store";
+import type { Platform, Run } from "../src/runs/types";
 import { type Env, emulator, setup, settle } from "./support/scheduler-env";
 
 /** The server's local HH:MM clock, as the queue reasons print it. */
@@ -962,5 +964,190 @@ describe("views for devices, pool and the live wait list", () => {
     expect(env.scheduler.nextFor("emulator-5556")).toEqual({ kind: "agent", holder: "omp · a" });
     expect(env.scheduler.nextFor("emulator-1111")).toBeNull();
     void run;
+  });
+});
+
+describe("regression identity", () => {
+  const unique = (label: string) => `${label} ${Date.now().toString(36)}-${++counter}`;
+  const plan = (id: string, title: string, status: "pass" | "fail" = "pass") => ({ id, title, status, updatedAt: "2026-01-01T00:00:00.000Z" });
+  /** Ends a run the way the runner does: terminal status, checks as reported, one update. */
+  const finishWith = (env: Env, run: Run, checks: Run["checks"], status: Run["status"] = "done") => {
+    run.checks = checks;
+    run.status = status;
+    env.scheduler.update(run);
+    env.scheduler.release(run.id);
+  };
+
+  test("a new run joins the test of the earliest run with the same brief, or of the same run title, else starts its own", async () => {
+    const env = setup();
+    const brief = unique("walk the cart");
+    const first = await env.scheduler.enqueueRun({ projectId: "test-proj", title: `${unique("cart lane")} v1.0`, brief });
+    expect(first.testKey).toBe(`brief:${briefFingerprint(brief)}`);
+
+    const sameBrief = await env.scheduler.enqueueRun({ projectId: "test-proj", title: unique("another title"), brief });
+    expect(sameBrief.testKey).toBe(first.testKey!);
+
+    const sameTitle = await env.scheduler.enqueueRun({ projectId: "test-proj", title: first.title.replace("v1.0", "v1.1"), brief: unique("rewritten") });
+    expect(sameTitle.testKey).toBe(first.testKey!);
+
+    const fresh = await env.scheduler.enqueueRun({ projectId: "test-proj", title: unique("unrelated"), brief: unique("unrelated brief") });
+    expect(fresh.testKey).not.toBe(first.testKey!);
+    expect(getRun(fresh.id)!.testKey).toBe(fresh.testKey!);
+  });
+
+  test("a re-run and a retry stay in their parent's test", async () => {
+    const env = setup();
+    const first = await env.scheduler.enqueueRun({ projectId: "test-proj", title: unique("lane"), brief: unique("brief") });
+    expect(first.testKey).not.toBeNull();
+    finishWith(env, first, [plan("C1", "Login", "fail")]);
+    const failedOnly = await env.scheduler.rerun(first.id, { only: "failed" });
+    expect(failedOnly.brief).not.toBe(first.brief);
+    expect(failedOnly.testKey).toBe(first.testKey!);
+    expect(env.scheduler.retry(failedOnly).testKey).toBe(first.testKey!);
+  });
+
+  test("the terminal update keys every check once and persists it; updates while the run is active do not", async () => {
+    const env = setup();
+    const run = await env.scheduler.enqueueRun({ projectId: "test-proj", title: unique("lane"), brief: unique("brief") });
+    run.status = "running";
+    run.checks = [plan("C1", "Cart total updates")];
+    env.scheduler.update(run);
+    expect(getRun(run.id)!.checks[0]!.checkKey).toBeUndefined();
+
+    finishWith(env, run, run.checks);
+    const stored = getRun(run.id)!.checks[0]!;
+    expect(stored).toMatchObject({ keyKind: "title" });
+    expect(stored.checkKey).toMatch(/^t:/);
+
+    run.checks[0]!.title = "Renamed afterwards";
+    env.scheduler.update(run);
+    expect(getRun(run.id)!.checks[0]!.checkKey).toBe(stored.checkKey!);
+  });
+
+  test("a run whose plan was never keyed at creation (testKey null) is keyed when it ends", async () => {
+    const env = setup();
+    const run = await env.scheduler.enqueueRun({ projectId: "test-proj", title: unique("lane"), brief: unique("brief") });
+    run.testKey = null;
+    finishWith(env, run, [plan("C1", "Login")], "error");
+    expect(getRun(run.id)!.testKey).toBe(`brief:${briefFingerprint(run.brief)}`);
+  });
+
+  test("restore keys the checks of a run it has to interrupt", async () => {
+    const env = setup();
+    const run = await env.scheduler.enqueueRun({ projectId: "test-proj", title: unique("lane"), brief: unique("brief") });
+    run.status = "running";
+    run.checks = [plan("C1", "Login works")];
+    env.scheduler.update(run);
+    const crashed = setup();
+    crashed.scheduler.restore();
+    const stored = getRun(run.id)!;
+    expect(stored.status).toBe("interrupted");
+    expect(stored.checks[0]!.checkKey).toMatch(/^t:/);
+  });
+
+  test("a run that cannot be keyed (no brief) is still saved by update and interrupted by restore", async () => {
+    const env = setup();
+    const run = await env.scheduler.enqueueRun({ projectId: "test-proj", title: unique("lane"), brief: unique("brief") });
+    run.status = "running";
+    run.brief = undefined as unknown as string;
+    run.testKey = null;
+    env.scheduler.update(run);
+    expect(getRun(run.id)!.status).toBe("running");
+    const crashed = setup();
+    crashed.scheduler.restore();
+    expect(getRun(run.id)!.status).toBe("interrupted");
+    run.status = "done";
+    env.scheduler.update(run);
+    expect(getRun(run.id)!.status).toBe("done");
+  });
+
+  describe("hints", () => {
+    const earlierRun = async (env: Env, brief: string, checks: Run["checks"]) => {
+      const run = await env.scheduler.enqueueRun({ projectId: "test-proj", title: unique("lane"), brief });
+      finishWith(env, run, checks);
+      return run;
+    };
+
+    test("a run of a test seen before is handed the previous checks and persists them; reuseChecks: false opts out", async () => {
+      const env = setup();
+      const brief = unique("brief");
+      const earlier = await earlierRun(env, brief, [plan("C1", "Login works"), plan("C2", "Cart total updates", "fail")]);
+      const next = await env.scheduler.enqueueRun({ projectId: "test-proj", title: unique("lane"), brief });
+      expect(next.checkHints).toEqual({
+        fromRunIds: [earlier.id],
+        checks: [
+          { id: "C1", title: "Login works", checkKey: getRun(earlier.id)!.checks[0]!.checkKey! },
+          { id: "C2", title: "Cart total updates", checkKey: getRun(earlier.id)!.checks[1]!.checkKey! },
+        ],
+      });
+      expect(getRun(next.id)!.checkHints).toEqual(next.checkHints);
+
+      const optedOut = await env.scheduler.enqueueRun({ projectId: "test-proj", title: unique("lane"), brief, reuseChecks: false });
+      expect(optedOut.checkHints).toBeNull();
+    });
+
+    test("a first run of a test gets none; batch lanes of a known test each get the previous checks", async () => {
+      const env = setup();
+      const brief = unique("brief");
+      expect((await env.scheduler.enqueueRun({ projectId: "test-proj", title: unique("lane"), brief })).checkHints).toBeNull();
+      await earlierRun(env, brief, [plan("C1", "Login works")]);
+      const { runs } = await env.scheduler.enqueueBatch({ projectId: "test-proj", title: unique("lane"), brief, devices: [{ platform: "android" }, { platform: "android" }] });
+      expect(runs.map((r) => r.checkHints?.checks.length)).toEqual([1, 1]);
+    });
+
+    test("re-running everything or retrying shows the parent's checks; re-running only the failed ones shows none", async () => {
+      const env = setup();
+      const parent = await earlierRun(env, unique("brief"), [plan("C1", "Login works"), plan("C2", "Cart total updates", "fail")]);
+      const all = await env.scheduler.rerun(parent.id, { only: "all" });
+      expect(all.checkHints?.fromRunIds).toEqual([parent.id]);
+      expect(all.checkHints?.checks.map((c) => c.id)).toEqual(["C1", "C2"]);
+      expect((await env.scheduler.rerun(parent.id, { only: "failed" })).checkHints).toBeNull();
+
+      const retried = env.scheduler.retry(parent);
+      expect(retried.checkHints?.checks.map((c) => c.id)).toEqual(["C1", "C2"]);
+    });
+
+    test("a run that opted out of hints keeps the opt-out through a re-run of everything and an infra retry", async () => {
+      const env = setup();
+      const parent = await env.scheduler.enqueueRun({ projectId: "test-proj", title: unique("lane"), brief: unique("brief"), reuseChecks: false });
+      finishWith(env, parent, [plan("C1", "Login works"), plan("C2", "Cart total updates", "fail")]);
+      expect(getRun(parent.id)!.reuseChecks).toBe(false);
+      expect((await env.scheduler.rerun(parent.id, { only: "all" })).checkHints).toBeNull();
+      expect(env.scheduler.retry(parent).checkHints).toBeNull();
+    });
+
+    test("only the hints the prompt shows are persisted, so `was` can name nothing the agent never saw", async () => {
+      const env = setup();
+      const brief = unique("brief");
+      await earlierRun(env, brief, Array.from({ length: 55 }, (_, i) => plan(`C${i + 1}`, `Check number ${i + 1} of the walk`)));
+      const next = await env.scheduler.enqueueRun({ projectId: "test-proj", title: unique("lane"), brief });
+      expect(next.checkHints?.checks).toHaveLength(40);
+      expect(next.checkHints?.more).toBe(15);
+      expect(getRun(next.id)!.checkHints?.more).toBe(15);
+      // C50 was never shown: naming it does not carry its key.
+      finishWith(env, next, [{ ...plan("N1", "Something else entirely"), was: "C50" }]);
+      expect(getRun(next.id)!.checks[0]!.keyKind).not.toBe("carried");
+    });
+  });
+
+  describe("source", () => {
+    test("a re-run reads the source again from the project, keeping tickets and labels; a retry keeps the original source", async () => {
+      const env = setup();
+      const first = await env.scheduler.enqueueRun({
+        projectId: "test-proj",
+        title: unique("lane"),
+        brief: unique("brief"),
+        source: { commit: "a".repeat(40), branch: "feature/old", tickets: ["ACME-12"], labels: { flavor: "dev" } },
+      });
+      finishWith(env, first, [plan("C1", "Login works")]);
+      expect(first.source).toMatchObject({ commit: "a".repeat(40), branch: "feature/old" });
+
+      const rerun = await env.scheduler.rerun(first.id, { only: "all" });
+      // The test project is not a git repo: what the project says now is "no commit, no branch".
+      expect(rerun.source).toMatchObject({ commit: null, branch: null, tickets: ["ACME-12"], labels: { flavor: "dev" } });
+
+      const retry = env.scheduler.retry(first);
+      expect(retry.source).toMatchObject({ commit: "a".repeat(40), branch: "feature/old" });
+    });
   });
 });

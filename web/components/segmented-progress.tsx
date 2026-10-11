@@ -2,7 +2,7 @@ import type { Check, CheckStatus } from "@/lib/api";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 
-const SEGMENT_COLOR: Record<CheckStatus, string> = {
+export const SEGMENT_COLOR: Record<CheckStatus, string> = {
   pass: "bg-emerald-500",
   fail: "bg-red-500",
   blocked: "bg-rose-900 dark:bg-rose-700",

@@ -44,6 +44,25 @@ const GROUPS: { title: string; rows: ShortcutRow[] }[] = [
     ],
   },
   {
+    title: "Run",
+    rows: [
+      { keys: ["j", "k"], label: "Next / previous check" },
+      { keys: ["Esc"], label: "Clear the selection" },
+      { keys: ["c"], label: "Open the comparison" },
+      { keys: ["b"], label: "Change the baseline" },
+      { keys: ["h"], label: "History of the selected check" },
+    ],
+  },
+  {
+    title: "Compare",
+    rows: [
+      { keys: ["j", "k"], label: "Next / previous check" },
+      { keys: ["1", "2", "3"], label: "Side by side / Swipe / Onion skin" },
+      { keys: ["[", "]"], label: "Move the swipe or fade" },
+      { keys: ["h"], label: "History of the selected check" },
+    ],
+  },
+  {
     title: "Image viewer",
     rows: [
       { keys: ["←", "→"], label: "Previous / next image" },

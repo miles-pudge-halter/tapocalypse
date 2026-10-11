@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import path from "node:path";
-import { appendEvent, appendStderr, createRun, deleteRun, getRun, listRuns, type NewRun, readActivity, runDir, saveRun } from "../src/runs/store";
+import { appendEvent, appendStderr, createRun, deleteRun, getRun, listRuns, type NewRun, readActivity, runDir, saveRun, subscribeRuns } from "../src/runs/store";
 
 const OLD_RUN = {
   id: "20260101-000000-abcd-old",
@@ -61,8 +61,24 @@ describe("store", () => {
       rerunOf: null,
       install: null,
       storage: "repo",
+      testKey: null,
+      checkHints: null,
+      reuseChecks: true,
     });
     expect(run.checks).toEqual(OLD_RUN.checks as typeof run.checks);
+  });
+
+  test("subscribers hear every save (with the stored snapshot) and delete, until they unsubscribe", () => {
+    const heard: string[] = [];
+    const off = subscribeRuns((change) => heard.push("saved" in change ? `saved:${change.saved.id}:${change.saved.status}` : `deleted:${change.deleted}`));
+    const r = createRun(newRun("subscribed"));
+    r.status = "running";
+    saveRun(r);
+    deleteRun(r.id);
+    off();
+    const after = createRun(newRun("after unsubscribe"));
+    deleteRun(after.id);
+    expect(heard).toEqual([`saved:${r.id}:queued`, `saved:${r.id}:running`, `deleted:${r.id}`]);
   });
 
   test("a persisted artemis run loads without its dropped backend key, and saving does not bring it back", () => {

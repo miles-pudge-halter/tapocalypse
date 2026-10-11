@@ -2,9 +2,13 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import {
+  baselineCandidates,
   batchView,
+  compareView,
   devicesView,
   findRun,
+  flakyView,
+  historyView,
   poolStateView,
   queryRuns,
   runner,
@@ -34,6 +38,7 @@ import {
   validateProject,
 } from "./projects/registry";
 import { suggestProjectFolders } from "./projects/suggest";
+import { relink, unlink } from "./regression/index";
 import { listReports, renderReport, reportFilePath } from "./reports/reports";
 import { exportRun, reportFile, screenshotFile } from "./runs/artefacts";
 import { readActivity, listRuns, runDir } from "./runs/store";
@@ -95,10 +100,11 @@ function connectedSerials(): Promise<ConnectedSerials> {
 function hasJsonBody(method: string, parts: string[]): boolean {
   const [root, a, b, c] = parts;
   if (method === "PUT") return parts.length === 3 && root === "api" && a === "projects";
+  if (method === "DELETE") return parts.length === 2 && root === "api" && a === "check-links";
   if (method !== "POST") return false;
   if (root === "mcp") return parts.length === 1 || (parts.length === 3 && a === "runs");
   if (root !== "api") return false;
-  if (parts.length === 2) return a === "runs" || a === "batches" || a === "projects" || a === "leases";
+  if (parts.length === 2) return a === "runs" || a === "batches" || a === "projects" || a === "leases" || a === "check-links";
   if (parts.length === 3) {
     return (
       (a === "projects" && (b === "validate" || b === "detect")) ||
@@ -189,6 +195,31 @@ function csvParam(url: URL, name: string): string[] | undefined {
   const values = url.searchParams.get(name)?.split(",").filter(Boolean);
   return values?.length ? values : undefined;
 }
+
+const BoolParam = z.enum(["1", "true", "0", "false"]).transform((v) => v === "1" || v === "true");
+const PlatformParam = z.enum(["android", "ios"]);
+const CompareQuery = z.object({ baseline: z.string().min(1).max(200).default("auto"), includeFlaky: BoolParam.default(false) });
+const CandidatesQuery = z.object({ q: z.string().max(200).optional(), limit: z.coerce.number().int().min(1).max(100).default(30) });
+const HistoryQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(200).default(30),
+  before: z.string().max(200).optional(),
+  branch: z.string().max(200).optional(),
+  platform: PlatformParam.optional(),
+});
+const FlakyQuery = z.object({ platform: PlatformParam.optional(), window: z.coerce.number().int().min(4).max(50).default(20) });
+const CheckRef = z.object({ runId: z.string().min(1).max(200), checkId: z.string().min(1).max(200) });
+const CheckLinkBody = z.object({ projectId: z.string().min(1).max(64), a: CheckRef, b: CheckRef });
+/** Unlinking detaches `b` only; `a` is accepted so the same body can undo a link. */
+const CheckUnlinkBody = CheckLinkBody.extend({ a: CheckRef.optional() });
+
+/** Query string or body parsed once; 400 naming every problem. */
+function parseInput<T extends z.ZodType>(schema: T, input: unknown): z.infer<T> {
+  const parsed = schema.safeParse(input);
+  if (!parsed.success) throw new HttpError(400, parsed.error.issues.map((i) => `${i.path.join(".") || "body"}: ${i.message}`).join("; "));
+  return parsed.data;
+}
+
+const query = (url: URL): Record<string, string> => Object.fromEntries(url.searchParams);
 
 /** SSE stream: `subscribe` wires listeners and returns their unsubscribe; ping + cleanup are handled here. */
 function sse(
@@ -380,6 +411,31 @@ async function route(req: Request, url: URL): Promise<Response> {
       if (method === "GET") return json(listSuites(p));
       if (method === "POST") return saveSuiteFromBody(p, await readJsonObject(req));
     }
+    if (parts[3] === "flaky" && parts.length === 4 && method === "GET") {
+      project(parts[2]);
+      return json(flakyView(parts[2], parseInput(FlakyQuery, query(url))));
+    }
+    if (parts[3] === "checks" && parts[5] === "history" && parts.length === 6 && method === "GET") {
+      project(parts[2]);
+      return json(historyView({ projectId: parts[2], checkKey: parts[4] }, parseInput(HistoryQuery, query(url))));
+    }
+  }
+
+  if (parts[1] === "check-links" && parts.length === 2 && (method === "POST" || method === "DELETE")) {
+    const body = await readJsonObject(req);
+    if (method === "POST") {
+      const { projectId, a, b } = parseInput(CheckLinkBody, body);
+      project(projectId);
+      run(a.runId);
+      run(b.runId);
+      relink(projectId, a, b);
+    } else {
+      const { projectId, b } = parseInput(CheckUnlinkBody, body);
+      project(projectId);
+      run(b.runId);
+      unlink(projectId, b.runId, b.checkId);
+    }
+    return new Response(null, { status: 204 });
   }
 
   if (parts[1] === "leases") {
@@ -489,6 +545,7 @@ async function route(req: Request, url: URL): Promise<Response> {
             commit: url.searchParams.get("commit") || undefined,
             limit: intParam(url, "limit"),
             before: url.searchParams.get("before") || undefined,
+            regressed: parseInput(z.object({ regressed: BoolParam.optional() }), query(url)).regressed,
           }),
         );
       }
@@ -574,6 +631,25 @@ async function route(req: Request, url: URL): Promise<Response> {
             headers: { "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": "sandbox" },
           });
         }
+      }
+      if (parts.length === 4 && action === "compare" && method === "GET") {
+        const { baseline, includeFlaky } = parseInput(CompareQuery, query(url));
+        try {
+          return json(compareView(id, { baseline, includeFlaky }));
+        } catch (err) {
+          // The UI reads the reason out of a 400 instead of showing a generic error.
+          if (err instanceof HttpError && (err.code === "same_run" || err.code === "different_project")) {
+            return json({ error: err.message, code: err.code, comparison: null, reason: err.code, reasonText: err.message }, 400);
+          }
+          throw err;
+        }
+      }
+      if (parts.length === 4 && action === "baseline-candidates" && method === "GET") {
+        run(id);
+        return json(baselineCandidates(id, parseInput(CandidatesQuery, query(url))));
+      }
+      if (parts.length === 6 && action === "checks" && parts[5] === "history" && method === "GET") {
+        return json(historyView({ runId: id, checkId: parts[4] }, parseInput(HistoryQuery, query(url))));
       }
       if (parts.length >= 5 && action === "files" && method === "GET") {
         const r = run(id);

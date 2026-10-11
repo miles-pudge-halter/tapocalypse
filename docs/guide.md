@@ -18,6 +18,7 @@ Back to the [README](../README.md). This is the long-form reference: every page 
 - [Dispatching runs from your coding agent (MCP)](#dispatching-runs-from-your-coding-agent-mcp)
 - [Run metadata](#run-metadata)
 - [Batches](#batches)
+- [Regressions, history and flaky checks](#regressions-history-and-flaky-checks)
 - [CLI and CI](#cli-and-ci)
 - [Reading reports and screenshots](#reading-reports-and-screenshots)
 - [Running as a service](#running-as-a-service)
@@ -116,6 +117,10 @@ The sidebar is on every page: a **project switcher** that scopes the whole UI to
 | **Setup** | A *Get started* checklist that ticks itself off (prerequisites, add a project, connect a device, first run, connect your coding agent), every doctor check (one pair per installed harness) with copyable fixes, and **Connect agent** snippets for omp, Claude Code and Cursor with live status of the first MCP call |
 | **Projects** | A card per project with its last runs, 7-day pass rate and spend; New run, Edit, Reports, Suites and Delete. The add-project wizard suggests folders and shows what detection found |
 | **Reports** | Per-project report list (search, verdict tabs, grouped by day). A report page has an "On this page" outline, the run's details with a link back to it, a screenshot gallery (click any image) and a reading-progress bar |
+| **Compare** (`#/runs/<id>/compare/<baselineId>`) | One run against a baseline, check by check: newly failing first, then flaky, fixed, changed, still failing, new, removed and unchanged. Screenshots side by side, as a swipe or as an onion skin, the two notes, duration and cost deltas, and **Confirm / Unlink / Link** for matches Tapocalypse is unsure about. See [Regressions, history and flaky checks](#regressions-history-and-flaky-checks) |
+| **Flaky checks** (`#/p/<projectId>/flaky`, the second tab of **Reports**) | Checks of the project that flip between pass and fail on the same code and device, with their recent results, pass rate and last flip; open any of them to see its history. Says "Not enough history yet" until some check has run more than once |
+
+**Regressions in the UI.** A finished or running run page shows a *Compared to* strip under its header: the auto-picked baseline run (change it with the picker or `b`), the verdict change (`PASS → FAIL`) and the counts (↓ newly failing, ↑ fixed, ❄ flaky, + new, − removed, = unchanged), with **Open comparison** (`c`). These links, the `↓ n` chip and `c` open the comparison with the automatic baseline (`#/runs/<id>/compare/auto`), so they show what the strip counted; a baseline you picked yourself stays picked in the links of that run page. Every check in the checks list carries a badge such as "was pass on main · 2d ago", and its **History** button (or `h`) opens the check's history in a side sheet: a strip of its recent results, the pass rate, and each result with branch, commit, device, note and screenshot. In the runs list a red `↓ 2` chip marks a run with checks that passed in its baseline and fail now, and **Has regressions** filters to those runs. When a finished run has newly failing checks, its toast and desktop notification say so.
 
 Finished runs raise a toast; with notifications enabled (sidebar bell) you also get a desktop notification while the tab is in the background, and the tab title shows how many runs finished while you were away.
 
@@ -132,6 +137,8 @@ Finished runs raise a toast; with notifications enabled (sidebar bell) you also 
 | `?` | Show the shortcuts |
 | `g` then `r` / `d` / `p` / `s` | Go to Runs / Devices / Projects / Setup |
 | `j` / `k`, `Esc` | On a run: next / previous check, clear the selection |
+| `c` / `b` / `h` | On a run: open the comparison / change the baseline / history of the selected check |
+| `1` `2` `3`, `[` `]`, `h` | On a comparison: side by side / swipe / onion skin, move the swipe or fade, history of the selected check |
 | `⌘Enter` / `Ctrl+Enter` | Send the steer message |
 | `←` `→`, `Esc` | Image viewer: previous / next, close |
 
@@ -149,6 +156,7 @@ A project tells Tapocalypse where your app's repository is and how to test it. A
 | `defaultPackage` | Android `applicationId` or iOS bundle id of the app under test, e.g. `com.example.app.dev` |
 | `defaultPlatform` | `android` or `ios`, used when a run names no platform or device |
 | `agent` | Optional per-project override `{ harness?, model?, effort? }` of the [harness](#agent-runtimes), model and effort for this project's runs |
+| `defaultBranch` | Optional. The branch [regressions](#regressions-history-and-flaky-checks) compare a feature branch against (for example `main`). Unset: the remote's default branch (`origin/HEAD`), else `main` or `master` when the repo has one. Editable in the project form; clear it to go back to the fallback |
 
 **Detection.** The UI wizard and `qa_detect_project` inspect the repo without running anything and suggest every field. They read: `pubspec.yaml` (Flutter), `package.json` dependencies (Expo, React Native), `app.json`/`app.config.json` (Expo ids), Gradle files and `AndroidManifest.xml` (`applicationId`, flavors and suffixes in `android/app`, `app`, `androidApp`, `composeApp`), Xcode `project.pbxproj` (`PRODUCT_BUNDLE_IDENTIFIER`), `shared`/`composeApp` modules (Kotlin Multiplatform), `.omp/agents/`, `.claude/agents/` and `.codex/agents/` for QA-looking persona files and whether the folder is a git repo. When several package ids exist it prefers one ending in `.dev` or `.debug`. The wizard also suggests app folders it finds under common code directories (`~/Projects`, `~/code`, `~/src`, `~/Developer`, …).
 
@@ -280,6 +288,9 @@ tool_timeout_sec = 120
 | `qa_get_report` | The markdown report of a finished run, read from Tapocalypse's data folder |
 | `qa_get_screenshots` | The run's screenshots: `[{ checkId, name, path, url }]`, `path` absolute so you can open the image |
 | `qa_export` | Copy the report and screenshots of a run into a folder you name (`{ runId, dir }`, `dir` absolute), for example inside your repo |
+| `qa_compare_runs` | Compare one run against its automatic baseline (or `baselineRunId`): verdict change, counts and the changed checks with status, note and absolute screenshot paths; see [Regressions, history and flaky checks](#regressions-history-and-flaky-checks) |
+| `qa_check_history` | The history of one check across runs (by `projectId` + `checkKey`, or `runId` + `checkId`): recent results, pass rate, flaky label |
+| `qa_find_regressions` | "Did I break anything?": the newly failing, flaky, lost-coverage and new failing checks of the runs for a branch, PR or commit, against their baselines. Call it after your runs finish |
 
 Parameters for every tool are in [docs/api.md](api.md#mcp-tools). `source` is `{ path?, branch?, commit?, prNumber?, prTitle?, prUrl?, tickets?, labels? }`.
 
@@ -323,6 +334,96 @@ Filter runs with `qa_list_runs` (`projectId`, `branch`, `prNumber`, `ticket`, `c
 
 A batch is one brief fanned out to several devices at once, for example the same smoke test on a phone and a tablet emulator, or on Android and iOS. Start one with `POST /api/batches`, the `qa_start_batch` MCP tool or `tapocalypse run --devices N` / repeated `--serial`. Every device gets its own run (titled `<title> · <device>`) that goes through the normal queue, so a batch is never faster than your device pool allows. The batch has one verdict, the worst of its runs (`FAIL` > `BLOCKED` > `PARTIAL` > `PASS WITH ISSUES` > `PASS`; none until every run has one), one total cost, and its own page in the UI with **Re-run failed lanes**.
 
+## Regressions, history and flaky checks
+
+A single run tells you what works today. Tapocalypse also remembers what worked before: every check gets an **identity across runs**, every run is compared with an automatic **baseline**, and you can ask "did this change break anything?" from the UI, an agent or CI. Nothing needs configuring and no model call is involved; it is derived from the runs you already have.
+
+### How checks are matched
+
+Two levels of identity are stored in each run's `run.json`:
+
+- **Test.** A recurring brief. A suite run is the test `suite:<id>`; a re-run or retry keeps its parent's test; otherwise a run joins the earliest run of the project with the same brief text (the "Re-run ONLY these checks" section that re-runs add is ignored), or the same run title once version numbers, a trailing round number and `(re-run)` are dropped. Anything else starts a new test.
+- **Check.** Each check gets a *check key*, decided when the run reaches a final state (including cancelled and interrupted runs), by the first rule that applies:
+
+| Rule | Matches when | Shown as |
+| --- | --- | --- |
+| Suite id | the run is a suite run and the check id is one the suite fixed | "Identified by suite check id" |
+| Re-run lineage | the run is a re-run or retry and its parent has a check with the same id | "Identified by re-run lineage" |
+| Carried over | the agent said the check re-tests one of the previous checks it was shown (`was`, see below) | "Identified by checks the agent carried over" |
+| Title | the title, normalised, equals that of an existing check in the project. Normalising drops accents, case, a leading agent id such as `B6.1` and filler words (`a`, `the`, `verify`, `check`, `ensure`, …) but keeps word order and negations, so "no crash" is not "crash" | "Identified by title" |
+| Similar title | no title matches, but a check of one of the test's last 3 runs shares at least 60% of its words (a shared ticket key adds weight) | "likely match" |
+| New | nothing matched | a new check |
+
+Within one run, two checks never share a key. Keys of a running run are provisional and are written once, when it ends, so an agent can re-plan freely. Runs recorded before this feature are keyed once, in order, the first time the server starts after the upgrade.
+
+### Helping the agent keep identity
+
+Titles written from scratch rarely line up, so Tapocalypse asks the agent to cooperate. When a run starts, its prompt lists the checks of the test's last two runs (same platform preferred, newest first, at most 40 checks and 6,000 characters) *without their statuses or notes*, so they cannot anchor the verdict, and tells the agent to reuse a title where a check still applies and to say so with `was: "<previous id>"` in `qa_plan`. Who gets previous checks:
+
+| Run | Checks shown |
+| --- | --- |
+| Suite run | none: the suite already fixes the ids |
+| Re-run of failed checks | none extra: the brief already lists them and the ids are kept |
+| Re-run of all checks, automatic retry | the parent's checks |
+| Any other run, batch lanes included | the last two runs of the same test with at least one check |
+
+Opt out with `reuseChecks: false` (`POST /api/runs`, `POST /api/batches`, `qa_start_run`, `qa_start_batch`), or **Don't reuse** under the brief in the New run sheet. `was` has limits: it is a request, not a guarantee. It only counts when it names one of the checks the prompt showed, the first claim on a previous check wins (a second claim falls back to the title rules and appears in the activity feed), an agent can ignore it, and it is kept on the check for audit even when ignored. A check the agent invented from scratch with a new wording is a new check.
+
+A re-run takes its source (branch, commit, uncommitted changes) from the project as it is when you queue it, not from the original run; only the automatic infrastructure retry keeps the original.
+
+### Which run is compared
+
+The baseline of a run is picked automatically among runs of the **same project, the same test and the same platform** that are older, finished with at least one resolved check, not replaced by a retry and not part of the run's own re-run chain. The first tier that has any wins:
+
+1. **PR base**: the run's pull request names a base branch, and a run exists on it.
+2. **Default branch**: the run is on another branch, and a run exists on `Project.defaultBranch` (or the fallback in [Projects](#projects)).
+3. **Same branch**: an older run on the same branch with a different commit.
+4. **Any branch.**
+
+Within the tier, runs at a different commit are preferred over runs at the same one (a run on a dirty working tree counts as code of its own, so two dirty runs at one commit are different code and edit, run, edit, run compares with the previous run), runs on the same device over other devices, and the baseline is the newest candidate *plus* every candidate at its commit, so a round-1 run and its round-2 run count as one baseline (per check, the newest pass or fail result wins, each linked to its own run). The comparison says what differs and never blocks: a different device, agent or model, a different build, the same commit ("any difference points to flakiness or the environment, not your change"), a different platform (only when you pick a baseline yourself). With no candidate the run says "No earlier run of this test to compare with yet", naming other platforms that do have runs. Picking a baseline yourself (`?baseline=<run id>` in the compare URL, the baseline picker) affects only that view; the runs-list chip, `qa_compare_runs`, `qa_find_regressions` and CI always use the automatic one unless you pass a run id.
+
+### What a comparison says
+
+Only **pass** and **fail** are decisive. Blocked, skipped and unfinished checks are never regressions: a check that passed before and is blocked now is *changed* with a **lost coverage** marker, because blocked results usually mean the device or network.
+
+| Transition | Baseline → this run |
+| --- | --- |
+| **Newly failing** | pass → fail |
+| **Fixed** | fail → pass |
+| Still failing | fail → fail |
+| Unchanged | same status (or both inconclusive) |
+| Changed | any other change, for example pass → blocked (lost coverage) or blocked → pass |
+| New / Removed | only in this run / only in the baseline (removed checks are marked *not reached* when this run was a re-run of failed checks or did not finish) |
+| Flaky | a newly failing or fixed check whose key is flaky or suspect (below) |
+| Pending | the baseline passed or failed and the check has not resolved in a running run |
+
+The comparison also gives the verdict change (`PASS → FAIL`, better or worse), duration and cost deltas (cost only when both runs used the same harness and model) and, per check, both screenshots. For `qa_find_regressions` the "run" is a snapshot per test and platform: the newest run for the branch, PR or commit plus its same-commit re-runs, so re-running the failed checks counts.
+
+### Flaky, suspect and device-sensitive
+
+Per project and check, Tapocalypse looks at the newest 20 pass or fail results. Results are grouped by **code** (the commit when the working tree was clean, else the app's version and build number; a dirty working tree is never "the same code" as another run, and unknown code is not used), platform and device. A *flip* is a pass↔fail change within a group.
+
+- **Flaky**: 2 or more flips. **Suspect**: exactly 1; one pass and one fail on the same code may be a flake or the agent judging the check differently. The label clears when the newest 5 results show no flip. The flaky page shows both (suspects can be filtered out).
+- **Device-sensitive**: the same code passes on one device and fails on another. That is usually a layout or device bug, not flakiness, so it is only a chip in the history sheet and is *not* excluded from regressions.
+- **Unstable**: repeated pass↔blocked mixes, an environment signal.
+
+Flaky and suspect checks are left out of the *newly failing* counts, the runs-list chip, `qa_find_regressions.newlyFailing` and the CLI exit code, and listed on their own (`flakyFailing`, a fuchsia ❄). Ask for them back with `includeFlaky`.
+
+### Correcting a match
+
+A wrong or missing match is fixable in the comparison. A `≈ likely match` row (a similar-title match) offers **Confirm** and **Unlink**; a new and a removed check that look alike offer **Link** and **Not the same**. **Not the same** only hides that pair of rows: it is remembered in this browser (per project) and writes nothing to a run. Links are saved: **Confirm** marks the match `manual`, so the `≈ likely match` badge goes away; linking a check to itself, two checks of one run, or two checks whose keys already appear together in a run is refused (400); otherwise linking re-keys every check of the project that carries the newer check's key to the older one (`keyKind: "manual"`), unlinking gives that one check its own key, both by rewriting `run.json`, through `POST` / `DELETE /api/check-links`. History, flakiness and later comparisons follow.
+
+### Where to ask
+
+- **UI**: the strip and rail badges on a run, the compare page, the history sheet, the runs-list chip and filter, the flaky page ([tour](#tour-of-the-ui)).
+- **Agents**: after changing code and finishing runs, `qa_find_regressions { projectId, branch | prNumber | commit }` returns `clean`, `regressions`, `pending`, `no_runs` or `no_baseline` with a one-sentence summary; `qa_compare_runs` and `qa_check_history` go deeper.
+- **CI**: `tapocalypse compare <run>` and `tapocalypse run … --fail-on regression` ([CLI and CI](#cli-and-ci)).
+- **HTTP**: [routes](api.md#regressions-history-and-flaky-checks).
+
+### What history needs
+
+Be honest about what this is: it compares runs of *the same test*, and it can only link checks that come back. A brief that is rewritten every time, checks the agent words differently on every run and a project that has run each test once produce "no baseline" or "new" everywhere; flaky detection needs the same check run more than once on the same code. To get useful history, run the same brief (or a [suite](#brief-templates-and-suites)) repeatedly, use **Re-run with changes** and the previous-check reuse, and keep the default of letting the agent see the previous checks. Tapocalypse does not judge whether an earlier pass was right either: a check the agent wrongly passed is a baseline like any other. History comes from the runs on disk, so [retention](#data-and-retention) shrinks it, and deleting a run removes it from baselines and histories. It is computed in memory from the stored runs; the only thing written is the key set in each `run.json`.
+
 ## CLI and CI
 
 `tapocalypse` (`bun src/cli.ts`, or `bunx tapocalypse` once published) starts the server and drives it over HTTP, which makes Tapocalypse usable from CI and scripts.
@@ -334,6 +435,7 @@ bun src/cli.ts doctor                        # same as `bun run doctor`
 bun src/cli.ts run --project my-app --brief "Launch the app and verify the home screen loads." --wait
 bun src/cli.ts status <runId|batchId> [--json]
 bun src/cli.ts report <runId> [--export <dir>] [--json]   # print a run's report, or copy it and its screenshots to <dir>
+bun src/cli.ts compare <runId|batchId> [--baseline <runId|auto>] [--include-flaky] [--json] [--junit <file>]   # compare with the baseline; exit 1 on a regression
 ```
 
 `run` options:
@@ -350,8 +452,8 @@ bun src/cli.ts report <runId> [--export <dir>] [--json]   # print a run's report
 | `--wait` | Wait for the run(s) to end, printing progress to stderr; the final report goes to stdout |
 | `--timeout <duration>` | Stop waiting after this long (default `90m`; `30s`, `45m`, `2h`). The run keeps going on the server |
 | `--json` | JSON on stdout instead of text |
-| `--junit <file>` | Write a JUnit XML report (implies `--wait`): one `<testsuite>` per run, one `<testcase>` per check; failed checks are failures, skipped, blocked and unfinished checks are skipped, and an errored run adds an `<error>` case |
-| `--fail-on <list>` | Verdicts that make the exit code 1 (default `FAIL,BLOCKED,PARTIAL`; e.g. `FAIL` to tolerate the rest) |
+| `--junit <file>` | Write a JUnit XML report (implies `--wait`): one `<testsuite>` per run, one `<testcase>` per check; failed checks are failures, skipped, blocked and unfinished checks are skipped, and an errored run adds an `<error>` case. The report carries the baseline comparison when it can be had, but `--junit` never changes the exit code |
+| `--fail-on <list>` | Verdicts that make the exit code 1 (default `FAIL,BLOCKED,PARTIAL`; e.g. `FAIL` to tolerate the rest). `regression` is also a token: after the wait the CLI compares each run with its automatic baseline and exits 1 on a newly failing check that is not flaky. `--fail-on regression` alone fails only on new failures, which suits an app with known open failures; `--fail-on FAIL,regression` combines both |
 | `--url <url>` | Server to use (default `$TAPOCALYPSE_URL`, else `http://127.0.0.1:4310`) |
 
 `run --wait` and `status` print the absolute path of the report (inside Tapocalypse's data folder). `report <runId>` prints the markdown (`--json`: `{ runId, reportPath, markdown }`); with `--export <dir>` it copies the report as `QA-REPORT-<runId>.md` and the screenshots as `screenshots/<name>` into `<dir>` instead.
@@ -362,12 +464,14 @@ Without `--wait` the command prints the run id and URL and exits 0 right away. W
 
 | Code | Meaning |
 | --- | --- |
-| 0 | Success: every verdict is outside `--fail-on` |
+| 0 | Success: every verdict is outside `--fail-on` (and, with the `regression` token, nothing newly fails) |
 | 1 | At least one verdict is in `--fail-on` |
 | 2 | A run errored, was cancelled, hit its time budget or had an infrastructure failure, or the wait timed out |
 | 3 | Usage error, a request the server rejected (for example an unknown project) or the server cannot be reached; the message says how to start it |
 
 With several runs the worst code wins (2 over 1 over 0).
+
+**`compare`** prints the comparison of a run (a batch: each lane against its own baseline): the baseline and why it was chosen, the verdict change and the changed checks. Exit code `0` when no check is newly failing outside flaky ones, `1` when at least one is, `2` for an unknown or still-active run or a server error, `3` for a usage error. A run with no baseline exits `0` with a note on stderr, so the first CI run of a test is not red. `--junit <file>` writes JUnit XML as `run --junit` does, and when a comparison exists it adds the properties `baseline.run`, `baseline.tier`, `baseline.commit` and `regressions` to the testsuite, prefixes a newly failing testcase's message with `Newly failing (was pass in <runId>, <branch>@<sha7>): ` and a flaky one's with `Flaky (n flips in last w): `, and lists fixed and lost-coverage checks in `<system-out>`. Testcase names do not change.
 
 **In CI.** Tapocalypse needs a signed-in agent runtime (omp, Claude Code or Codex CLI) and an emulator or simulator, so run it on a machine you control, for example a self-hosted runner with a booted emulator (on Linux with KVM). Start the server once there (`tapocalypse serve`), then call the CLI from the workflow:
 
@@ -383,6 +487,16 @@ With several runs the worst code wins (2 over 1 over 0).
 ```
 
 Reports and screenshots live in Tapocalypse's data folder, not in the checkout, so nothing is written into the workspace. To attach them to the build, export them after the run with `tapocalypse report <run-id> --export qa-report` (or `qa_export`, or `POST /api/runs/:id/export`) and upload that folder, or read a report through the API (`GET /api/runs/:id/report`). On a machine that is not the one running the server, call these against `--url` / `$TAPOCALYPSE_URL`.
+
+**Fail only on regressions.** A suite that is not green yet fails every build with `--fail-on` at its default. `--fail-on regression` fails only when a check that passed in the baseline fails now (flaky ones excluded), so known open failures do not block a pull request:
+
+```yaml
+- name: QA regression gate
+  run: |
+    tapocalypse run --project my-app --suite smoke --wait --junit qa-junit.xml --fail-on regression
+```
+
+The first run of a test has no baseline and exits 0; from the second run on, the baseline is the automatic one described in [Regressions, history and flaky checks](#regressions-history-and-flaky-checks). To compare a run you started elsewhere, call `tapocalypse compare <run-id>`.
 
 ## Reading reports and screenshots
 
@@ -490,6 +604,8 @@ Run ids look like `20260101-093015-a1b2-dark-mode-toggle`. By default nothing is
 
 **Restarts.** Stopping Tapocalypse (Ctrl-C) kills running agents. On the next start those runs are marked `interrupted`, and runs that were still queued are queued again. Emulators Tapocalypse booted keep running.
 
+**History and retention.** Check keys live in each run's `run.json`; baselines, comparisons and flaky labels are computed from the runs on disk, so retention and **Delete** shrink them (see [Regressions, history and flaky checks](#regressions-history-and-flaky-checks)).
+
 ## How it works
 
 1. **Queue and assign.** `POST /api/runs` (the UI, CLI or `qa_start_run`) validates the request and stores a `queued` run. The scheduler re-evaluates on every enqueue, release and cancel, and every 10 s, and assigns or boots devices as described in [Devices](#devices).
@@ -536,7 +652,7 @@ Start with `bun run doctor` (or the **Setup** page): it checks every prerequisit
 
 Roadmap, in no particular order. None of these exist today:
 
-- Comparing two runs, and a per-check history view across runs.
+- Scheduled comparisons and trend charts across many runs, and a named-test parameter that would pin a test's identity by hand (a test is inferred from the brief, suite or run title today).
 - Webhooks and other outbound notifications; exporting a run as a zip or HTML bundle; tags on runs.
 - Scheduled and recurring runs (use cron plus the [CLI](#cli-and-ci) for now).
 - A Settings page with hot reload: the config file is edited by hand and read once at startup (projects are the exception).
@@ -563,6 +679,7 @@ CI ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) runs `bun install
 | `src/server.ts`, `src/api.ts`, `src/app.ts` | Server start-up, HTTP/SSE routes and request guards, wiring |
 | `src/config.ts` | Config schema, defaults, config/data locations, environment overrides |
 | `src/runs/` | Scheduler (queue and device assignment), runner (run lifecycle), outcome rules, prompt, progress recorder, run metadata, run storage |
+| `src/regression/` | Check and test identity (`keys.ts`), the in-memory history index (`index.ts`), baseline selection, comparison and flaky detection |
 | `src/harness/` | The agent-runtime adapters: the shared `Harness` interface, the registry and default resolution, and one folder each for omp (RPC client, stdio-bridge plugin provisioning), Claude Code and Codex CLI |
 | `src/devices/` | Device discovery, screenshots, emulator/simulator boot and idle shutdown |
 | `src/projects/` | Project registry, repo detection and folder suggestions |
@@ -572,7 +689,7 @@ CI ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) runs `bun install
 | `src/batches.ts`, `src/suites.ts`, `src/stats.ts`, `src/retention.ts` | Batches, suites, usage statistics, history cleanup |
 | `src/mcp/server.ts`, `src/mcp/run-server.ts` | The MCP tools, and the run-scoped progress endpoint the agents call |
 | `src/doctor.ts`, `scripts/doctor.ts` | Prerequisite checks and their CLI |
-| `src/cli.ts` | The `tapocalypse` command: `serve`, `service`, `doctor`, `run`, `status`, `report` |
+| `src/cli.ts` | The `tapocalypse` command: `serve`, `service`, `doctor`, `run`, `status`, `report`, `compare` |
 | `web/` | The UI: React 19, Tailwind 4 and [shadcn/ui](https://ui.shadcn.com) (`views/` pages, `components/`, `components/ui/` primitives) |
 | `templates/briefs/`, `personas/` | Built-in brief templates and the built-in QA persona |
 | `docs/`, `test/` | This guide, the [configuration](configuration.md) and [HTTP API / MCP](api.md) references and the [agent setup](agent-setup.md) instructions; tests and fixtures |

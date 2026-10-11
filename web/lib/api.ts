@@ -1,4 +1,4 @@
-import type { Activity, Platform, Run, RunStatus, Verdict } from "../../src/runs/types";
+import type { Activity, CheckStatus, KeyKind, Platform, Run, RunStatus, Verdict } from "../../src/runs/types";
 
 export type {
   Activity,
@@ -10,6 +10,7 @@ export type {
   Platform,
   PrStatus,
   PullRequestInfo,
+  KeyKind,
   Run,
   RunSource,
   RunStatus,
@@ -64,6 +65,8 @@ export type RunView = Run & {
   reportFile: string | null;
   /** Absolute artefact folder of the run in Tapocalypse's data dir (report + screenshots). */
   runDir: string;
+  /** Auto-baseline comparison summary; terminal runs only, null when there is no baseline or no checks. */
+  regression?: RunRegression | null;
 };
 
 export interface BatchView {
@@ -89,6 +92,173 @@ export interface RunStats {
   cost: number | null;
   medianDurationMs: number | null;
   byDay: { date: string; runs: number; pass: number; fail: number; cost: number | null }[];
+}
+
+// --- regression intelligence (mirrors src/regression/types.ts; `RunView` here is the wire type) ---
+
+export type Transition =
+  | "newly_failing"
+  | "fixed"
+  | "flaky"
+  | "still_failing"
+  | "unchanged"
+  | "changed"
+  | "new"
+  | "removed"
+  | "pending";
+export type BaselineTier = "explicit" | "pr-base" | "default-branch" | "same-branch" | "any";
+
+export interface Baseline {
+  auto: boolean;
+  tier: BaselineTier;
+  kind: "run" | "snapshot";
+  primaryRunId: string;
+  /** Primary first. */
+  runIds: string[];
+  branch: string | null;
+  commit: string | null;
+  reason: string;
+  platformMismatch: boolean;
+  deviceChanged: boolean;
+  harnessChanged: boolean;
+  modelChanged: boolean;
+  buildChanged: boolean;
+  sameCommit: boolean;
+}
+
+export interface CompareSide {
+  runId: string;
+  checkId: string;
+  title: string;
+  status: CheckStatus;
+  note: string | null;
+  screenshotUrl: string | null;
+  durationMs: number | null;
+  createdAt: string;
+}
+
+export interface ComparePair {
+  /** Stable row id: the current check id, or `b:<baselineRunId>:<checkId>` for removed rows. */
+  key: string;
+  checkKey: string | null;
+  transition: Transition;
+  match: KeyKind | null;
+  confidence: "exact" | "inferred" | null;
+  flaky: boolean;
+  lostCoverage: boolean;
+  notReached: boolean;
+  baseline: CompareSide | null;
+  current: CompareSide | null;
+  suggestion: { runId: string; checkId: string; title: string; similarity: number } | null;
+}
+
+export interface RunComparison {
+  current: RunView;
+  baselineRun: RunView;
+  baseline: Baseline;
+  verdict: { baseline: Verdict | null; current: Verdict | null; direction: "better" | "worse" | "same" | "unknown" };
+  counts: Record<Transition, number>;
+  durationMs: { baseline: number | null; current: number | null; delta: number | null };
+  cost: { baseline: number | null; current: number | null; delta: number | null; comparable: boolean };
+  pairs: ComparePair[];
+}
+
+export type CompareReason = "no_baseline" | "no_checks" | "different_project" | "same_run";
+
+/** `GET /api/runs/:id/compare`. */
+export interface CompareResponse {
+  comparison: RunComparison | null;
+  reason: CompareReason | null;
+  reasonText: string | null;
+}
+
+export interface BaselineCandidate {
+  run: RunView;
+  suggested: boolean;
+  group: "suggested" | "branch" | "base" | "test" | "other";
+  platformMismatch: boolean;
+  reason: string | null;
+}
+
+export interface CheckHistoryEntry {
+  runId: string;
+  runTitle: string;
+  checkId: string;
+  title: string;
+  status: CheckStatus;
+  note: string | null;
+  screenshotUrl: string | null;
+  createdAt: string;
+  platform: Platform;
+  deviceName: string | null;
+  commit: string | null;
+  dirty: boolean | null;
+  branch: string | null;
+  build: string | null;
+  harness: HarnessId;
+  model: string | null;
+  verdict: Verdict | null;
+  keyKind: KeyKind | null;
+  flip: boolean;
+  flippedOnSameCode: boolean;
+}
+
+export interface CheckHistory {
+  projectId: string;
+  checkKey: string;
+  keyKind: KeyKind;
+  title: string;
+  flaky: "flaky" | "suspect" | null;
+  deviceSensitive: boolean;
+  unstable: boolean;
+  flips: number;
+  window: number;
+  passRate: number | null;
+  /** Newest first. */
+  entries: CheckHistoryEntry[];
+  hasMore: boolean;
+}
+
+export interface FlakyCheck {
+  checkKey: string;
+  keyKind: KeyKind;
+  title: string;
+  confidence: "flaky" | "suspect";
+  flips: number;
+  window: number;
+  passRate: number | null;
+  /** Oldest → newest. */
+  recent: (CheckStatus | null)[];
+  lastFlipAt: string;
+  lastFlipBranch: string | null;
+}
+
+export interface FlakyResponse {
+  checks: FlakyCheck[];
+  trackedKeys: number;
+  repeatedKeys: number;
+}
+
+export interface RunRegression {
+  baselineId: string;
+  baselineTitle: string;
+  baselineBranch: string | null;
+  baselineCreatedAt: string;
+  newlyFailing: number;
+  fixed: number;
+  flaky: number;
+}
+
+export interface CheckRef {
+  runId: string;
+  checkId: string;
+}
+
+export interface HistoryQuery {
+  limit?: number;
+  before?: string;
+  branch?: string;
+  platform?: Platform;
 }
 
 export interface RunScreenshot {
@@ -201,6 +371,8 @@ export interface StartRunInput {
   model?: string;
   harness?: HarnessId;
   thinking?: string;
+  /** false = the agent writes a fresh plan instead of getting the previous checks of this test as hints (default true). */
+  reuseChecks?: boolean;
   suiteId?: string;
   install?: { path: string };
 }
@@ -216,6 +388,8 @@ export interface StartBatchInput {
   thinking?: string;
   source?: StartRunSource;
   requestedBy?: string;
+  /** false = fresh test plan instead of the previous checks as hints (default true). */
+  reuseChecks?: boolean;
 }
 
 export interface RunListParams {
@@ -228,6 +402,8 @@ export interface RunListParams {
   pr?: number;
   ticket?: string;
   commit?: string;
+  /** Only runs with newly failing checks against their baseline. */
+  regressed?: boolean;
   limit?: number;
   /** `createdAt` cursor: only runs created before it. */
   before?: string;
@@ -284,6 +460,34 @@ function post<T>(path: string, body?: unknown): Promise<T> {
   });
 }
 
+function parseCompareReason(body: unknown): CompareResponse | null {
+  if (!body || typeof body !== "object" || !("reason" in body)) return null;
+  const { reason } = body;
+  if (reason !== "same_run" && reason !== "different_project") return null;
+  const reasonText = "reasonText" in body && typeof body.reasonText === "string" ? body.reasonText : null;
+  return { comparison: null, reason, reasonText };
+}
+
+function historyQuery(query: HistoryQuery): string {
+  const q = new URLSearchParams();
+  if (query.limit !== undefined) q.set("limit", String(query.limit));
+  if (query.before) q.set("before", query.before);
+  if (query.branch) q.set("branch", query.branch);
+  if (query.platform) q.set("platform", query.platform);
+  const qs = q.toString();
+  return qs ? `?${qs}` : "";
+}
+
+async function sendCheckLink(method: "POST" | "DELETE", projectId: string, a: CheckRef, b: CheckRef): Promise<void> {
+  await ensureOk(
+    await fetch("/api/check-links", {
+      method,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ projectId, a, b }),
+    }),
+  );
+}
+
 export const api = {
   projects: () => request<ProjectStatus[]>("/api/projects"),
   createProject: (input: ProjectInput) => post<ProjectStatus>("/api/projects", input),
@@ -312,12 +516,45 @@ export const api = {
     if (params.pr !== undefined) q.set("pr", String(params.pr));
     if (params.ticket) q.set("ticket", params.ticket);
     if (params.commit) q.set("commit", params.commit);
+    if (params.regressed) q.set("regressed", "1");
     if (params.limit !== undefined) q.set("limit", String(params.limit));
     if (params.before) q.set("before", params.before);
     const qs = q.toString();
     return request<{ runs: RunView[]; hasMore: boolean }>(`/api/runs${qs ? `?${qs}` : ""}`);
   },
   run: (id: string) => request<RunView>(`/api/runs/${encodeURIComponent(id)}`),
+  /** `baseline` = a run id, or "auto". 400 `same_run` / `different_project` bodies still carry the reason. */
+  async compare(id: string, baseline: string = "auto"): Promise<CompareResponse> {
+    const res = await fetch(`/api/runs/${encodeURIComponent(id)}/compare?baseline=${encodeURIComponent(baseline)}`);
+    if (res.status === 400) {
+      const body: unknown = await res.clone().json().catch(() => null);
+      const parsed = parseCompareReason(body);
+      if (parsed) return parsed;
+    }
+    await ensureOk(res);
+    return (await res.json()) as CompareResponse;
+  },
+  baselineCandidates: (id: string, q: string) =>
+    request<{ candidates: BaselineCandidate[] }>(
+      `/api/runs/${encodeURIComponent(id)}/baseline-candidates${q.trim() ? `?q=${encodeURIComponent(q.trim())}` : ""}`,
+    ),
+  projectCheckHistory: (projectId: string, checkKey: string, query: HistoryQuery = {}) =>
+    request<CheckHistory>(
+      `/api/projects/${encodeURIComponent(projectId)}/checks/${encodeURIComponent(checkKey)}/history${historyQuery(query)}`,
+    ),
+  runCheckHistory: (runId: string, checkId: string, query: HistoryQuery = {}) =>
+    request<CheckHistory>(
+      `/api/runs/${encodeURIComponent(runId)}/checks/${encodeURIComponent(checkId)}/history${historyQuery(query)}`,
+    ),
+  flakyChecks: (projectId: string, platform?: Platform) =>
+    request<FlakyResponse>(`/api/projects/${encodeURIComponent(projectId)}/flaky${platform ? `?platform=${platform}` : ""}`),
+  /** Ties check `b` (newer) to check `a` (older): same check from now on. */
+  async linkChecks(projectId: string, a: CheckRef, b: CheckRef) {
+    await sendCheckLink("POST", projectId, a, b);
+  },
+  async unlinkChecks(projectId: string, a: CheckRef, b: CheckRef) {
+    await sendCheckLink("DELETE", projectId, a, b);
+  },
   startRun: (input: StartRunInput) => post<RunView>("/api/runs", input),
   startBatch: (input: StartBatchInput) => post<{ batchId: string; runs: RunView[] }>("/api/batches", input),
   batch: (id: string) => request<BatchView>(`/api/batches/${encodeURIComponent(id)}`),
@@ -421,8 +658,25 @@ export function reportHash(projectId: string, run: Pick<Run, "id" | "storage" | 
   return reportEntryHash(projectId, name);
 }
 
-export function runHash(id: string, checkId?: string): string {
-  return `#/runs/${encodeURIComponent(id)}${checkId ? `?check=${encodeURIComponent(checkId)}` : ""}`;
+export function runHash(id: string, checkId?: string, baseline?: string): string {
+  const q = new URLSearchParams();
+  if (checkId) q.set("check", checkId);
+  if (baseline) q.set("baseline", baseline);
+  const qs = q.toString();
+  return `#/runs/${encodeURIComponent(id)}${qs ? `?${qs}` : ""}`;
+}
+
+/** Hash route of the comparison of run `id` against `baselineId`; `show` filters one transition, `pair` selects a row. */
+export function compareHash(id: string, baselineId: string, opts: { show?: Transition; pair?: string } = {}): string {
+  const q = new URLSearchParams();
+  if (opts.show) q.set("show", opts.show);
+  if (opts.pair) q.set("pair", opts.pair);
+  const qs = q.toString();
+  return `#/runs/${encodeURIComponent(id)}/compare/${encodeURIComponent(baselineId)}${qs ? `?${qs}` : ""}`;
+}
+
+export function flakyHash(projectId: string): string {
+  return `#/p/${encodeURIComponent(projectId)}/flaky`;
 }
 
 export function batchHash(id: string): string {

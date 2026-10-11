@@ -1,6 +1,8 @@
 import { Copy, ExternalLink, FileText, Loader2, MoreHorizontal, RotateCcw, Trash2, XCircle } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
+import { RegressionCount } from "@/components/regression/transition";
+import { rerunWithChangesPrefill } from "@/components/run/use-run-actions";
 import { RunStatusIcon } from "@/components/run-status-icon";
 import { SegmentedProgress } from "@/components/segmented-progress";
 import { StatusBadge } from "@/components/status-badge";
@@ -22,9 +24,9 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { VerdictBadge } from "@/components/verdict-badge";
-import { api, batchHash, isActive, reportHash, runHash, type RunStatus, type RunView, type Verdict } from "@/lib/api";
+import { api, batchHash, compareHash, isActive, reportHash, runHash, type RunStatus, type RunView, type Verdict } from "@/lib/api";
 import { formatCost, formatDuration, formatRelative, formatTime } from "@/lib/format";
-import { navigate } from "@/lib/hooks";
+import { navigate, useNewRun } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 
 const VERDICT_SEVERITY: Verdict[] = ["FAIL", "BLOCKED", "PARTIAL", "PASS WITH ISSUES", "PASS"];
@@ -105,6 +107,20 @@ function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** `↓ n` chip linking to the newly failing checks of a run; null when the run has no regression against its baseline. */
+export function RunRegressionChip({ run, now }: { run: RunView; now: number }) {
+  const reg = run.regression;
+  if (!reg || reg.newlyFailing <= 0) return null;
+  const where = reg.baselineBranch ? `${reg.baselineBranch} · ` : "";
+  return (
+    <RegressionCount
+      count={reg.newlyFailing}
+      href={compareHash(run.id, "auto", { show: "newly_failing" })}
+      tooltip={`${reg.newlyFailing} newly failing vs “${reg.baselineTitle}” (${where}${formatRelative(reg.baselineCreatedAt, now)})`}
+    />
+  );
+}
+
 /** One muted segment of a row's second line; `className` carries the container-query rule that hides it at narrow widths. */
 interface MetaPart {
   text: string | null | undefined;
@@ -149,6 +165,7 @@ function RelativeTime({ iso, now, className }: { iso: string; now: number; class
 export function RunActions({ run, onChanged }: { run: RunView; onChanged(): void }) {
   const [busy, setBusy] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const { openNewRun } = useNewRun();
   const active = isActive(run.status);
   const hasFailed = !active && run.checks.some((c) => c.status !== "pass" && c.status !== "skipped");
 
@@ -221,6 +238,10 @@ export function RunActions({ run, onChanged }: { run: RunView; onChanged(): void
               <DropdownMenuItem disabled={!hasFailed} onSelect={() => void rerun("failed")}>
                 <RotateCcw />
                 Re-run failed
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => openNewRun(rerunWithChangesPrefill(run))}>
+                <RotateCcw />
+                Re-run with changes…
               </DropdownMenuItem>
             </>
           )}
@@ -302,6 +323,7 @@ export function RunRow({ run, projectName, deviceName, now, onChanged, nested }:
             {run.title}
           </a>
           {run.verdict ? <VerdictBadge verdict={run.verdict} className="shrink-0" /> : <StatusBadge status={run.status} className="shrink-0" />}
+          <RunRegressionChip run={run} now={now} />
           {run.attempt > 1 && (
             <span className="shrink-0 rounded border px-1 text-[10px] leading-4 text-muted-foreground">attempt {run.attempt}</span>
           )}
@@ -341,6 +363,8 @@ export function BatchRow({ batchId, runs, projectName, now, onChanged }: BatchRo
   const [busy, setBusy] = useState(false);
   const summary = summarizeBatch(runs);
   const failedLanes = runs.some(isFailedLane);
+  const laneRegressions = runs.filter((r) => (r.regression?.newlyFailing ?? 0) > 0);
+  const regressionTotal = laneRegressions.reduce((sum, r) => sum + (r.regression?.newlyFailing ?? 0), 0);
 
   async function rerunFailed() {
     setBusy(true);
@@ -376,6 +400,13 @@ export function BatchRow({ batchId, runs, projectName, now, onChanged }: BatchRo
           ) : (
             <StatusBadge status={summary.status} className="shrink-0" />
           )}
+          {regressionTotal > 0 ? (
+            <RegressionCount
+              count={regressionTotal}
+              href={laneRegressions.length === 1 ? compareHash(laneRegressions[0]?.id ?? "", "auto", { show: "newly_failing" }) : batchHash(batchId)}
+              tooltip={laneRegressions.map((r) => `${r.deviceName ?? r.title}: ↓ ${r.regression?.newlyFailing ?? 0}`).join("\n")}
+            />
+          ) : null}
         </div>
         <MetaLine
           parts={[

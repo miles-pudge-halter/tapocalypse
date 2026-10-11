@@ -4,6 +4,7 @@ import {
   ACTIVE_STATUSES,
   type Activity,
   api,
+  ApiError,
   type BatchView,
   type Device,
   type DoctorReport,
@@ -23,8 +24,14 @@ import {
   type LeaseView,
   type HarnessInfo,
   type HarnessId,
+  type BaselineCandidate,
+  type CheckHistory,
+  type CompareResponse,
+  type FlakyResponse,
+  type Transition,
 } from "./api";
 import { createLeaseCache, parseWatched } from "./leases";
+import { GROUP_ORDER } from "./regression";
 import { readStorage, writeStorage } from "./storage";
 
 // --- routing ---
@@ -38,16 +45,20 @@ export interface RunFilters {
   project?: string;
   q?: string;
   group?: RunGroup;
+  /** Only finished runs with newly failing checks versus their baseline (`regressed=1`). */
+  regressed?: boolean;
 }
 
 export type Route =
   | { name: "runs"; filters: RunFilters }
-  | { name: "run"; id: string; check?: string }
+  | { name: "run"; id: string; check?: string; baseline?: string }
+  | { name: "compare"; id: string; baselineId: string; show?: Transition; pair?: string }
   | { name: "batch"; id: string }
   | { name: "devices" }
   | { name: "setup" }
   | { name: "projects"; openNew: boolean }
   | { name: "reports"; projectId: string }
+  | { name: "flaky"; projectId: string }
   | { name: "report"; projectId: string; reportName: string };
 
 const RUN_STATUSES: readonly RunStatus[] = [
@@ -85,6 +96,7 @@ function parseFilters(params: URLSearchParams): RunFilters {
   if (q) filters.q = q;
   const group = params.get("group");
   if (group && (GROUPS as readonly string[]).includes(group)) filters.group = group as RunGroup;
+  if (params.get("regressed") === "1") filters.regressed = true;
   return filters;
 }
 
@@ -96,6 +108,7 @@ export function runsHash(filters: RunFilters): string {
   if (filters.project) q.set("project", filters.project);
   if (filters.q) q.set("q", filters.q);
   if (filters.group) q.set("group", filters.group);
+  if (filters.regressed) q.set("regressed", "1");
   const qs = q.toString();
   return qs ? `#/runs?${qs}` : "#/";
 }
@@ -106,11 +119,24 @@ function parseHash(hash: string): Route {
   const parts = pathPart.split("/").filter(Boolean);
   try {
     const seg = parts.map(decodeURIComponent);
-    if (seg[0] === "runs" && seg[1]) return { name: "run", id: seg[1], check: params.get("check") ?? undefined };
+    if (seg[0] === "runs" && seg[1] && seg[2] === "compare" && seg[3]) {
+      const show = params.get("show");
+      return {
+        name: "compare",
+        id: seg[1],
+        baselineId: seg[3],
+        show: show && (GROUP_ORDER as readonly string[]).includes(show) ? (show as Transition) : undefined,
+        pair: params.get("pair") ?? undefined,
+      };
+    }
+    if (seg[0] === "runs" && seg[1]) {
+      return { name: "run", id: seg[1], check: params.get("check") ?? undefined, baseline: params.get("baseline") ?? undefined };
+    }
     if ((seg[0] === "batches" || seg[0] === "batch") && seg[1]) return { name: "batch", id: seg[1] };
     if (seg[0] === "devices") return { name: "devices" };
     if (seg[0] === "setup") return { name: "setup" };
     if (seg[0] === "projects") return { name: "projects", openNew: params.get("new") === "1" };
+    if (seg[0] === "p" && seg[1] && seg[2] === "flaky") return { name: "flaky", projectId: seg[1] };
     if (seg[0] === "p" && seg[1] && seg[2] === "reports") {
       return seg[3] ? { name: "report", projectId: seg[1], reportName: seg[3] } : { name: "reports", projectId: seg[1] };
     }
@@ -511,7 +537,7 @@ interface RunsState {
 }
 
 function runQueryKey(f: RunQuery): string {
-  return JSON.stringify([f.status, f.verdict, f.project, f.q, f.batch, f.branch, f.pr, f.ticket, f.commit, f.limit]);
+  return JSON.stringify([f.status, f.verdict, f.project, f.q, f.batch, f.branch, f.pr, f.ticket, f.commit, f.limit, f.regressed]);
 }
 
 function mergeRun(existing: RunView, incoming: RunView): RunView {
@@ -729,6 +755,8 @@ export interface NewRunPrefill {
   effort?: string;
   suiteId?: string;
   sourcePath?: string;
+  /** A finished run whose checks the sheet offers to reuse (the "previous checks will be reused" hint). */
+  reuseChecksFrom?: string;
 }
 
 interface NewRunState {
@@ -763,6 +791,193 @@ export function useNewRun(): { open: boolean; prefill: NewRunPrefill | null; ope
     () => newRunState,
   );
   return { ...state, openNewRun, close: closeNewRun };
+}
+
+// --- regression intelligence ---
+
+export interface ComparisonState {
+  comparison: CompareResponse["comparison"];
+  reason: CompareResponse["reason"];
+  reasonText: string | null;
+  loading: boolean;
+  error: string | null;
+  refresh(): void;
+}
+
+/**
+ * Comparison of run `runId` with `baselineId` (null = the server's automatic pick). Refetches 1.5 s (debounced) after
+ * every `run` event of either run, so an active run's counts follow it live.
+ */
+export function useComparison(runId: string, baselineId: string | null): ComparisonState {
+  const { data, loading, error, refresh } = useAsync(() => api.compare(runId, baselineId ?? "auto"), `compare:${runId}:${baselineId ?? "auto"}`);
+  useRunsChanged((run) => {
+    if (!run || run.id === runId || run.id === baselineId) refresh();
+  }, 1500);
+  return { comparison: data?.comparison ?? null, reason: data?.reason ?? null, reasonText: data?.reasonText ?? null, loading, error, refresh };
+}
+
+/** One run for context around a comparison that could not load; fetches only while `enabled`. */
+export function useRunSummary(runId: string, enabled: boolean): { run: RunView | null; loading: boolean; error: string | null } {
+  const { data, loading, error } = useAsync(() => (enabled ? api.run(runId) : Promise.resolve<RunView | null>(null)), `run-summary:${runId}:${enabled}`);
+  return { run: data, loading: enabled && loading, error };
+}
+
+/** Runs that could serve as the baseline of `runId`; fetches only while `enabled` (the picker is open). */
+export function useBaselineCandidates(
+  runId: string,
+  q: string,
+  enabled: boolean,
+): { candidates: BaselineCandidate[]; loading: boolean; error: string | null } {
+  const { data, loading, error } = useAsync(
+    () => (enabled ? api.baselineCandidates(runId, q).then((r) => r.candidates) : Promise.resolve<BaselineCandidate[]>([])),
+    `baseline-candidates:${runId}:${enabled ? q : "closed"}`,
+  );
+  return { candidates: data ?? [], loading: enabled && loading, error };
+}
+
+/** What the check-history sheet is about: a stored key, or (key unknown) one check of one run. */
+export interface CheckHistoryTarget {
+  projectId: string;
+  checkKey: string | null;
+  /** The run the sheet was opened from, with its check: highlights that entry and enables "Compare with this run". */
+  runId?: string;
+  checkId?: string;
+  title: string;
+}
+
+const HISTORY_PAGE = 30;
+
+interface HistoryState {
+  history: CheckHistory | null;
+  loading: boolean;
+  loadingMore: boolean;
+  /** The first page failed; `history` still holds the previous page set when only a filter changed. */
+  error: string | null;
+  /** Loading an older page failed; the pages already shown stay. */
+  moreError: string | null;
+  /** The server has no history for this check (404). */
+  notFound: boolean;
+}
+
+/** Pages of one check's history; `filters` change refetches from the newest entry. */
+export function useCheckHistory(
+  target: CheckHistoryTarget | null,
+  filters: { branch?: string; platform?: Platform },
+): HistoryState & { loadMore(): Promise<void>; refresh(): void } {
+  const [state, setState] = useState<HistoryState>({ history: null, loading: true, loadingMore: false, error: null, moreError: null, notFound: false });
+  const [tick, setTick] = useState(0);
+  const generation = useRef(0);
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const targetRef = useRef(target);
+  targetRef.current = target;
+  const filtersRef = useRef(filters);
+  filtersRef.current = filters;
+  const targetKey = JSON.stringify([target?.projectId, target?.checkKey, target?.runId, target?.checkId]);
+  const lastTargetKey = useRef(targetKey);
+  const key = JSON.stringify([targetKey, filters.branch, filters.platform, tick]);
+
+  const fetchPage = useCallback((before?: string): Promise<CheckHistory> | null => {
+    const t = targetRef.current;
+    if (!t) return null;
+    const query = { limit: HISTORY_PAGE, before, branch: filtersRef.current.branch, platform: filtersRef.current.platform };
+    if (t.checkKey) return api.projectCheckHistory(t.projectId, t.checkKey, query);
+    if (t.runId && t.checkId) return api.runCheckHistory(t.runId, t.checkId, query);
+    return null;
+  }, []);
+
+  useEffect(() => {
+    const gen = ++generation.current;
+    // A filter change keeps the shown entries until the new page arrives; another check never shows this one's.
+    const sameTarget = lastTargetKey.current === targetKey;
+    lastTargetKey.current = targetKey;
+    const first = fetchPage();
+    if (!first) {
+      setState({ history: null, loading: false, loadingMore: false, error: null, moreError: null, notFound: false });
+      return;
+    }
+    setState((s) => ({ history: sameTarget ? s.history : null, loading: true, loadingMore: false, error: null, moreError: null, notFound: false }));
+    first.then(
+      (history) => gen === generation.current && setState({ history, loading: false, loadingMore: false, error: null, moreError: null, notFound: false }),
+      (e: unknown) =>
+        gen === generation.current &&
+        setState((s) => ({
+          history: sameTarget ? s.history : null,
+          loading: false,
+          loadingMore: false,
+          error: errorMessage(e),
+          moreError: null,
+          notFound: e instanceof ApiError && e.status === 404,
+        })),
+    );
+  }, [key, fetchPage]);
+
+  const loadMore = useCallback(async () => {
+    const { history, loadingMore } = stateRef.current;
+    const last = history?.entries.at(-1);
+    if (!history || !history.hasMore || loadingMore || !last) return;
+    const gen = generation.current;
+    setState((s) => ({ ...s, loadingMore: true, moreError: null }));
+    try {
+      const page = await fetchPage(last.createdAt);
+      if (!page || gen !== generation.current) return;
+      setState((s) => {
+        if (!s.history) return s;
+        const seen = new Set(s.history.entries.map((e) => `${e.runId}:${e.checkId}`));
+        const more = page.entries.filter((e) => !seen.has(`${e.runId}:${e.checkId}`));
+        return { ...s, loadingMore: false, history: { ...s.history, entries: [...s.history.entries, ...more], hasMore: page.hasMore } };
+      });
+    } catch (e) {
+      if (gen === generation.current) setState((s) => ({ ...s, loadingMore: false, moreError: errorMessage(e) }));
+    }
+  }, [fetchPage]);
+
+  return { ...state, loadMore, refresh: () => setTick((t) => t + 1) };
+}
+
+/** Flaky and suspect checks of a project (optionally one platform). */
+export function useFlakyChecks(
+  projectId: string,
+  platform: Platform | null,
+): { data: FlakyResponse | null; loading: boolean; error: string | null; refresh(): void } {
+  const { data, loading, error, refresh } = useAsync(() => api.flakyChecks(projectId, platform ?? undefined), `flaky:${projectId}:${platform ?? "all"}`);
+  return { data, loading, error, refresh };
+}
+
+// --- check history sheet store ---
+
+interface HistorySheetState {
+  open: boolean;
+  target: CheckHistoryTarget | null;
+}
+
+const historySheetListeners = new Set<() => void>();
+let historySheetState: HistorySheetState = { open: false, target: null };
+
+function setHistorySheetState(next: HistorySheetState): void {
+  historySheetState = next;
+  for (const l of historySheetListeners) l();
+}
+
+function openHistory(target: CheckHistoryTarget): void {
+  setHistorySheetState({ open: true, target });
+}
+
+function closeHistory(): void {
+  // Keep the target until the exit animation is done; the next open replaces it.
+  setHistorySheetState({ open: false, target: historySheetState.target });
+}
+
+/** Global store behind the check-history sheet; any view can open it. */
+export function useCheckHistorySheet(): { open: boolean; target: CheckHistoryTarget | null; openHistory(target: CheckHistoryTarget): void; close(): void } {
+  const state = useSyncExternalStore(
+    (listener) => {
+      historySheetListeners.add(listener);
+      return () => void historySheetListeners.delete(listener);
+    },
+    () => historySheetState,
+  );
+  return { ...state, openHistory, close: closeHistory };
 }
 
 // --- a release this tab confirmed, so its own `revoked` event does not toast a second time ---

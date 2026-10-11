@@ -2,6 +2,7 @@ import { AlertCircle, ChevronsUpDown, Clock, FileText, Layers, Loader2, Minus, P
 import { type FormEvent, type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { DeviceName } from "@/components/device-name";
+import { ReuseHint, useReuseSeed } from "@/components/regression/reuse-hint";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -283,6 +284,9 @@ function RunFormBody({
   const [dirty, setDirty] = useState(false);
   const [suite, setSuite] = useState<Suite | null>(null);
   const [source, setSource] = useState<Source | null>(null);
+  /** Finished run whose check titles the agent is offered (re-run with changes, or a Recent chip); null = none. */
+  const [reuseSeedId, setReuseSeedId] = useState<string | null>(prefill?.reuseChecksFrom ?? null);
+  const [reuseChecks, setReuseChecks] = useState(true);
   const [saveAsSuite, setSaveAsSuite] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -292,6 +296,7 @@ function RunFormBody({
 
   const { suites } = useSuites(projectId);
   const { runs: recentRuns } = useRuns({ project: projectId, limit: 50 });
+  const reuseSeed = useReuseSeed(reuseSeedId, recentRuns);
   const recentBriefs = useMemo(() => {
     const seen = new Set<string>();
     const out: { id: string; title: string; brief: string }[] = [];
@@ -355,6 +360,8 @@ function RunFormBody({
     setBrief(next.brief);
     setSuite(nextSuite);
     setSource(from);
+    setReuseSeedId(from.kind === "recent" ? from.id : null);
+    setReuseChecks(true);
     setDraftRestored(false);
     setDirty(true);
     if (nextSuite?.model) setModel(nextSuite.model);
@@ -372,6 +379,7 @@ function RunFormBody({
     setPackageId(next.defaultPackage);
     setSuite(null);
     setSource(null);
+    setReuseSeedId(null);
     setTargets((t) =>
       t.serials.length === 0 && total === 1
         ? { anyAndroid: next.defaultPlatform === "android" ? 1 : 0, anyIos: next.defaultPlatform === "ios" ? 1 : 0, serials: [] }
@@ -432,6 +440,7 @@ function RunFormBody({
       model: model.trim() || undefined,
       thinking: effort || undefined,
       ...(Object.keys(runSource).length > 0 ? { source: runSource } : {}),
+      ...(reuseSeed.state === "ready" && !activeSuite && !reuseChecks ? { reuseChecks: false } : {}),
     };
     submittingRef.current = true;
     setSubmitting(true);
@@ -566,6 +575,13 @@ function RunFormBody({
           <p className="text-xs text-muted-foreground">
             One check per sentence works best — the agent turns them into C1, C2… <kbd className="rounded border px-1 font-mono text-[10px]">⌘↵</kbd> starts the run.
           </p>
+          <ReuseHint
+            seed={reuseSeed}
+            suiteTitle={activeSuite?.title ?? null}
+            briefEdited={reuseSeed.state === "ready" && brief.trim() !== reuseSeed.run.brief.trim()}
+            reuse={reuseChecks}
+            onReuseChange={setReuseChecks}
+          />
           <div className="flex min-w-0 items-center gap-2 text-sm">
             <span className="shrink-0 text-muted-foreground">Title</span>
             {editingTitle ? (

@@ -10,6 +10,15 @@ const STYLES: Record<Verdict, string> = {
   PARTIAL: "border-orange-400 bg-transparent text-orange-700 dark:text-orange-400",
 };
 
+/** Solid dot per verdict (filters, baseline chip, picker rows). */
+export const VERDICT_DOT: Record<Verdict, string> = {
+  PASS: "bg-emerald-500",
+  "PASS WITH ISSUES": "bg-orange-400",
+  FAIL: "bg-red-500",
+  BLOCKED: "bg-rose-800",
+  PARTIAL: "bg-orange-400/40 ring-1 ring-orange-400",
+};
+
 export function VerdictBadge({ verdict, className }: { verdict: Verdict | null; className?: string }) {
   if (!verdict) return null;
   return <Badge className={cn("font-semibold", STYLES[verdict], className)}>{verdict}</Badge>;

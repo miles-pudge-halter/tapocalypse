@@ -12,6 +12,7 @@ import { HARNESS_IDS } from "../src/harness/types";
 import { getProject } from "../src/projects/registry";
 import { appendStderr, runDir } from "../src/runs/store";
 import type { Run } from "../src/runs/types";
+import { cleanupRuns as cleanupKeyedRuns, makeRun as makeKeyedRun, uniqueTest, updateRun as updateKeyedRun } from "./support/regression";
 
 const HOST = `127.0.0.1:${config.port}`;
 /** Smallest valid PNG header bytes; enough for the magic-byte checks. */
@@ -750,5 +751,324 @@ describe("device leases", () => {
       expect(neither.text).toStartWith("invalid_argument: ");
       expect((await tool("device_acquire", { serial: "emulator-5001", holder: HOLDER })).text).toStartWith("device_not_found: ");
     });
+  });
+});
+
+/** A persisted, keyed, finished run of the test `testKey` (see test/support/regression.ts). */
+function keyedRun(testKey: string, at: number, status: "pass" | "fail", over: Partial<Parameters<typeof makeKeyedRun>[0]> = {}): Run {
+  return makeKeyedRun({
+    testKey,
+    at,
+    verdict: status === "pass" ? "PASS" : "FAIL",
+    checks: [{ id: "C1", title: "Checkout total updates", status, ...(status === "fail" ? { note: "total stayed 0" } : {}) }],
+    ...over,
+  });
+}
+
+/** Adds a screenshot file to the run's C1 check and returns its absolute (symlink-resolved, as the API reports it) path. */
+function withScreenshot(run: Run): string {
+  const file = path.join(runDir(run.id), "screenshots", "01-total.png");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, PNG);
+  updateKeyedRun(run, (r) => {
+    r.checks[0]!.screenshot = "screenshots/01-total.png";
+  });
+  return fs.realpathSync(file);
+}
+
+afterAll(() => cleanupKeyedRuns());
+
+describe("regression routes", () => {
+  const getJson = async (pathname: string) => {
+    const res = await call(pathname);
+    return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+  };
+  type Compare = {
+    comparison: { pairs: { transition: string; checkKey: string | null; baseline: { runId: string } | null; current: { note: string | null } | null }[] } | null;
+    reason: string | null;
+  };
+
+  test("compare against an explicit baseline reports the newly failing check", async () => {
+    const test = uniqueTest();
+    const base = keyedRun(test, 1, "pass");
+    const head = keyedRun(test, 2, "fail");
+    const res = await getJson(`/api/runs/${head.id}/compare?baseline=${base.id}`);
+    expect(res.status).toBe(200);
+    const body = res.body as unknown as Compare;
+    expect(body.reason).toBeNull();
+    expect(body.comparison?.pairs).toHaveLength(1);
+    expect(body.comparison?.pairs[0]).toMatchObject({ transition: "newly_failing", baseline: { runId: base.id }, current: { note: "total stayed 0" } });
+  });
+
+  test("a run with nothing to compare with answers 200 with the reason; the run itself and another project's run are 400 with the reason in the body", async () => {
+    const test = uniqueTest();
+    const solo = keyedRun(test, 1, "pass");
+    const none = await getJson(`/api/runs/${solo.id}/compare`);
+    expect(none.status).toBe(200);
+    expect(none.body).toMatchObject({ comparison: null, reason: "no_baseline" });
+
+    const same = await getJson(`/api/runs/${solo.id}/compare?baseline=${solo.id}`);
+    expect(same.status).toBe(400);
+    expect(same.body).toMatchObject({ comparison: null, reason: "same_run" });
+    expect(typeof same.body.reasonText).toBe("string");
+    expect(typeof same.body.error).toBe("string");
+
+    const foreign = keyedRun(test, 2, "pass", { projectId: "other-proj" });
+    const other = await getJson(`/api/runs/${solo.id}/compare?baseline=${foreign.id}`);
+    expect(other.status).toBe(400);
+    expect(other.body).toMatchObject({ comparison: null, reason: "different_project" });
+    expect(typeof other.body.reasonText).toBe("string");
+  });
+
+  test("compare rejects an unknown run or baseline (404) and a malformed includeFlaky (400)", async () => {
+    const solo = keyedRun(uniqueTest(), 1, "pass");
+    expect((await call("/api/runs/nope-run/compare")).status).toBe(404);
+    expect((await call(`/api/runs/${solo.id}/compare?baseline=nope-run`)).status).toBe(404);
+    expect((await call(`/api/runs/${solo.id}/compare?includeFlaky=maybe`)).status).toBe(400);
+    expect((await call(`/api/runs/${solo.id}/compare?includeFlaky=1`)).status).toBe(200);
+  });
+
+  test("GET /api/runs?regressed=1 lists only runs with newly failing checks and rejects other values", async () => {
+    const token = `rg${Date.now()}`;
+    const test = uniqueTest();
+    const base = keyedRun(test, 1, "pass", { title: `${token} base` });
+    const head = keyedRun(test, 2, "fail", { title: `${token} head` });
+    const fine = keyedRun(uniqueTest(), 3, "pass", { title: `${token} fine` });
+    const ids = async (query: string) => ((await (await call(`/api/runs?${query}`)).json()) as { runs: { id: string }[] }).runs.map((r) => r.id);
+    expect(await ids(`q=${token}&regressed=1`)).toEqual([head.id]);
+    expect((await ids(`q=${token}`)).sort()).toEqual([base.id, head.id, fine.id].sort());
+    expect(await ids(`q=${token}&regressed=0`)).toContain(fine.id);
+    expect((await call("/api/runs?regressed=maybe")).status).toBe(400);
+  });
+
+  test("baseline candidates, check history and flaky list validate their input and 404 on unknown ids", async () => {
+    const test = uniqueTest();
+    const base = keyedRun(test, 1, "pass");
+    const head = keyedRun(test, 2, "fail");
+    const candidates = await getJson(`/api/runs/${head.id}/baseline-candidates?limit=5`);
+    expect(candidates.status).toBe(200);
+    expect((candidates.body.candidates as { run: { id: string } }[]).map((c) => c.run.id)).toContain(base.id);
+    expect((await call(`/api/runs/${head.id}/baseline-candidates?limit=0`)).status).toBe(400);
+    expect((await call(`/api/runs/${head.id}/baseline-candidates?limit=101`)).status).toBe(400);
+    expect((await call("/api/runs/nope-run/baseline-candidates")).status).toBe(404);
+
+    const history = await getJson(`/api/runs/${head.id}/checks/C1/history`);
+    expect(history.status).toBe(200);
+    const checkKey = history.body.checkKey as string;
+    expect(history.body.projectId).toBe("test-proj");
+    expect((history.body.entries as { runId: string; status: string }[]).map((e) => [e.runId, e.status])).toEqual([
+      [head.id, "fail"],
+      [base.id, "pass"],
+    ]);
+    const byKey = await getJson(`/api/projects/test-proj/checks/${encodeURIComponent(checkKey)}/history?limit=1`);
+    expect(byKey.status).toBe(200);
+    expect((byKey.body.entries as unknown[]).length).toBe(1);
+    expect(byKey.body.hasMore).toBe(true);
+    expect((await call("/api/projects/test-proj/checks/no-such-key/history")).status).toBe(404);
+    expect((await call(`/api/runs/${head.id}/checks/C9/history`)).status).toBe(404);
+    expect((await call(`/api/runs/${head.id}/checks/C1/history?platform=windows`)).status).toBe(400);
+    expect((await call(`/api/runs/${head.id}/checks/C1/history?limit=201`)).status).toBe(400);
+
+    const flaky = await getJson("/api/projects/test-proj/flaky?window=20");
+    expect(flaky.status).toBe(200);
+    expect(Array.isArray(flaky.body.checks)).toBe(true);
+    expect((await call("/api/projects/test-proj/flaky?window=3")).status).toBe(400);
+    expect((await call("/api/projects/nope-proj/flaky")).status).toBe(404);
+  });
+});
+
+describe("check links", () => {
+  const link = (method: "POST" | "DELETE", json: unknown) => call("/api/check-links", { method, json });
+  const side = (runId: string, checkId = "C1") => ({ runId, checkId });
+
+  test("a non-JSON write is 415, a malformed body 400, an unknown project or run 404", async () => {
+    for (const method of ["POST", "DELETE"] as const) {
+      expect((await call("/api/check-links", { method, headers: { "content-type": "text/plain" }, body: "{}" })).status).toBe(415);
+      expect((await link(method, { projectId: "test-proj" })).status).toBe(400);
+    }
+    const a = keyedRun(uniqueTest(), 1, "pass");
+    expect((await link("POST", { projectId: "nope-proj", a: side(a.id), b: side(a.id) })).status).toBe(404);
+    expect((await link("POST", { projectId: "test-proj", a: side(a.id), b: side("nope-run") })).status).toBe(404);
+    expect((await link("DELETE", { projectId: "test-proj", b: side("nope-run") })).status).toBe(404);
+  });
+
+  test("linking a renamed check puts both on one history, unlinking splits them again", async () => {
+    const test = uniqueTest();
+    const older = keyedRun(test, 1, "pass", { checks: [{ id: "C1", title: "Checkout total updates", status: "pass", key: `${test}/old` }] });
+    const newer = keyedRun(test, 2, "pass", { checks: [{ id: "C1", title: "Order summary shows the new total", status: "pass", key: `${test}/new` }] });
+    const keyOf = async (runId: string) => ((await (await call(`/api/runs/${runId}/checks/C1/history`)).json()) as { checkKey: string }).checkKey;
+    expect(await keyOf(older.id)).not.toBe(await keyOf(newer.id));
+
+    expect((await link("POST", { projectId: "test-proj", a: side(older.id), b: side(newer.id) })).status).toBe(204);
+    expect(await keyOf(newer.id)).toBe(await keyOf(older.id));
+
+    expect((await link("DELETE", { projectId: "test-proj", a: side(older.id), b: side(newer.id) })).status).toBe(204);
+    expect(await keyOf(newer.id)).not.toBe(await keyOf(older.id));
+  });
+
+  test("confirming a likely match makes the next compare report it as exact", async () => {
+    const test = uniqueTest();
+    const key = `${test}/total`;
+    const older = keyedRun(test, 1, "pass", { checks: [{ id: "C1", title: "Checkout total updates", status: "pass", key, keyKind: "title" }] });
+    const newer = keyedRun(test, 2, "pass", { checks: [{ id: "C1", title: "Order summary shows the new total", status: "pass", key, keyKind: "inferred" }] });
+    const confidence = async () => {
+      const body = (await (await call(`/api/runs/${newer.id}/compare?baseline=${older.id}`)).json()) as { comparison: { pairs: { confidence: string | null }[] } };
+      return body.comparison.pairs.map((p) => p.confidence);
+    };
+    expect(await confidence()).toEqual(["inferred"]);
+    expect((await link("POST", { projectId: "test-proj", a: side(older.id), b: side(newer.id) })).status).toBe(204);
+    expect(await confidence()).toEqual(["exact"]);
+  });
+
+  test("linking a check to itself, or two checks of one run, is refused with 400 and changes nothing", async () => {
+    const test = uniqueTest();
+    const run = keyedRun(test, 1, "pass", {
+      checks: [
+        { id: "C1", title: "Checkout total updates", status: "pass", key: `${test}/one` },
+        { id: "C2", title: "Order summary shows the new total", status: "pass", key: `${test}/two` },
+      ],
+    });
+    const keyOf = async (checkId: string) => ((await (await call(`/api/runs/${run.id}/checks/${checkId}/history`)).json()) as { checkKey: string }).checkKey;
+    const before = [await keyOf("C1"), await keyOf("C2")];
+    expect((await link("POST", { projectId: "test-proj", a: side(run.id, "C1"), b: side(run.id, "C1") })).status).toBe(400);
+    expect((await link("POST", { projectId: "test-proj", a: side(run.id, "C1"), b: side(run.id, "C2") })).status).toBe(400);
+    expect([await keyOf("C1"), await keyOf("C2")]).toEqual(before);
+  });
+
+  test("linking checks whose keys already co-exist in one run is refused with 400", async () => {
+    const test = uniqueTest();
+    const older = keyedRun(test, 1, "pass", {
+      checks: [
+        { id: "C1", title: "Checkout total updates", status: "pass", key: `${test}/one` },
+        { id: "C2", title: "Order summary shows the new total", status: "pass", key: `${test}/two` },
+      ],
+    });
+    const newer = keyedRun(test, 2, "pass", { checks: [{ id: "C1", title: "Checkout total updates", status: "pass", key: `${test}/one` }] });
+    expect((await link("POST", { projectId: "test-proj", a: side(newer.id, "C1"), b: side(older.id, "C2") })).status).toBe(400);
+  });
+});
+
+describe("reuseChecks on start routes", () => {
+  test("a non-boolean value is a 400 on runs and batches; a boolean is accepted", async () => {
+    const run = { projectId: "test-proj", title: "reuse", brief: "reuse ok" };
+    expect((await call("/api/runs", { method: "POST", json: { ...run, reuseChecks: "yes" } })).status).toBe(400);
+    expect((await call("/api/batches", { method: "POST", json: { ...run, devices: [{ platform: "android" }], reuseChecks: 1 } })).status).toBe(400);
+    expect((await call("/api/runs", { method: "POST", json: { ...run, reuseChecks: true } })).status).toBe(201);
+  });
+});
+
+describe("regression MCP tools", () => {
+  async function mcpRpc(method: string, params?: Record<string, unknown>) {
+    const res = await call("/mcp", {
+      method: "POST",
+      headers: { accept: "application/json, text/event-stream" },
+      json: { jsonrpc: "2.0", id: 1, method, params },
+    });
+    const text = await res.text();
+    const raw = text.startsWith("event:") ? text.split("\n").find((l) => l.startsWith("data: "))!.slice("data: ".length) : text;
+    return (JSON.parse(raw) as { result: { isError?: boolean; content?: { text: string }[]; tools?: { name: string; inputSchema: { properties: Record<string, unknown> } }[] } }).result;
+  }
+  const mcpTool = async (name: string, args: Record<string, unknown>) => {
+    const result = await mcpRpc("tools/call", { name, arguments: args });
+    return { isError: result.isError === true, text: result.content?.[0]?.text ?? "" };
+  };
+  const mcpJson = async <T>(name: string, args: Record<string, unknown>): Promise<T> => {
+    const res = await mcpTool(name, args);
+    expect(res.isError).toBe(false);
+    return JSON.parse(res.text) as T;
+  };
+
+  test("the tools are listed, and the start and project tools take the new options", async () => {
+    const tools = (await mcpRpc("tools/list")).tools!;
+    const props = (name: string) => Object.keys(tools.find((t) => t.name === name)?.inputSchema.properties ?? {});
+    for (const name of ["qa_compare_runs", "qa_check_history", "qa_find_regressions"]) expect(tools.some((t) => t.name === name)).toBe(true);
+    for (const name of ["qa_start_run", "qa_start_batch"]) expect(props(name)).toContain("reuseChecks");
+    for (const name of ["qa_create_project", "qa_update_project"]) expect(props(name)).toContain("defaultBranch");
+  });
+
+  test("qa_compare_runs returns changed rows with absolute screenshot paths; includeUnchanged adds the rest", async () => {
+    const test = uniqueTest();
+    const checks = (status: "pass" | "fail") => [
+      { id: "C1", title: "Checkout total updates", status, ...(status === "fail" ? { note: "total stayed 0" } : {}) },
+      { id: "C2", title: "Launch screen shows", status: "pass" as const },
+    ];
+    const base = keyedRun(test, 1, "pass", { checks: checks("pass"), branch: "main" });
+    const head = keyedRun(test, 2, "fail", { checks: checks("fail"), branch: "feat-x" });
+    const baseShot = withScreenshot(base);
+    const headShot = withScreenshot(head);
+    type Slim = { transition: string; checkKey: string | null; baseline: { runId: string; screenshotPath: string | null } | null; current: { runId: string; note: string | null; screenshotPath: string | null; screenshotUrl?: unknown } | null };
+    const out = await mcpJson<{ baseline: { primaryRunId: string }; counts: Record<string, number>; pairs: Slim[] }>("qa_compare_runs", { runId: head.id, baselineRunId: base.id });
+    expect(out.baseline.primaryRunId).toBe(base.id);
+    expect(out.counts.newly_failing).toBe(1);
+    expect(out.pairs).toHaveLength(1);
+    const changed = out.pairs[0]!;
+    expect(changed).toMatchObject({ transition: "newly_failing", current: { runId: head.id, note: "total stayed 0" }, baseline: { runId: base.id } });
+    expect(changed.checkKey).toEqual(expect.any(String));
+    expect(changed.current!.screenshotPath).toBe(headShot);
+    expect(changed.baseline!.screenshotPath).toBe(baseShot);
+    expect("screenshotUrl" in changed.current!).toBe(false);
+
+    const all = await mcpJson<{ pairs: Slim[] }>("qa_compare_runs", { runId: head.id, baselineRunId: base.id, includeUnchanged: true });
+    expect(all.pairs.map((p) => p.transition).sort()).toEqual(["newly_failing", "unchanged"]);
+
+    const auto = await mcpJson<{ baseline: { primaryRunId: string } }>("qa_compare_runs", { runId: head.id });
+    expect(auto.baseline.primaryRunId).toBe(base.id);
+    expect((await mcpTool("qa_compare_runs", { runId: "nope-run" })).isError).toBe(true);
+    const same = await mcpTool("qa_compare_runs", { runId: head.id, baselineRunId: head.id });
+    expect(same.isError).toBe(true);
+    expect(same.text).toStartWith("same_run: ");
+  });
+
+  test("qa_compare_runs says so when there is no baseline", async () => {
+    const solo = keyedRun(uniqueTest(), 1, "pass");
+    const res = await mcpTool("qa_compare_runs", { runId: solo.id });
+    expect(res.isError).toBe(false);
+    expect(JSON.parse(res.text)).toMatchObject({ comparison: null, reason: "no_baseline" });
+  });
+
+  test("qa_check_history needs projectId+checkKey or runId+checkId and returns absolute screenshot paths", async () => {
+    const test = uniqueTest();
+    const base = keyedRun(test, 1, "pass");
+    const head = keyedRun(test, 2, "fail");
+    withScreenshot(base);
+    const headShot = withScreenshot(head);
+    for (const args of [{}, { projectId: "test-proj" }, { runId: head.id }, { projectId: "test-proj", checkId: "C1" }]) {
+      const res = await mcpTool("qa_check_history", args);
+      expect(res.isError).toBe(true);
+      expect(res.text).toStartWith("invalid_argument: ");
+    }
+    type History = { checkKey: string; entries: { runId: string; status: string; screenshotPath: string | null; screenshotUrl?: unknown }[] };
+    const byRun = await mcpJson<History>("qa_check_history", { runId: head.id, checkId: "C1" });
+    expect(byRun.entries.map((e) => [e.runId, e.status])).toEqual([
+      [head.id, "fail"],
+      [base.id, "pass"],
+    ]);
+    expect(byRun.entries[0]!.screenshotPath).toBe(headShot);
+    expect("screenshotUrl" in byRun.entries[0]!).toBe(false);
+    const byKey = await mcpJson<History>("qa_check_history", { projectId: "test-proj", checkKey: byRun.checkKey, limit: 1 });
+    expect(byKey.entries).toHaveLength(1);
+    expect((await mcpTool("qa_check_history", { projectId: "test-proj", checkKey: "no-such-key" })).isError).toBe(true);
+  });
+
+  test("qa_find_regressions needs a source filter, reports a newly failing check with its paths, and says no_runs otherwise", async () => {
+    const test = uniqueTest();
+    const none = await mcpTool("qa_find_regressions", { projectId: "test-proj" });
+    expect(none.isError).toBe(true);
+    expect(none.text).toStartWith("invalid_argument: ");
+
+    const branch = `feat-${test.slice(5)}`;
+    const base = keyedRun(test, 1, "pass", { branch: "main" });
+    const head = keyedRun(test, 2, "fail", { branch });
+    const headShot = withScreenshot(head);
+    type Found = { status: string; summary: string; tests: { headRunIds: string[]; newlyFailing: { checkKey: string; current: { runId: string; screenshotPath: string | null }; baseline: { runId: string } | null }[] }[] };
+    const found = await mcpJson<Found>("qa_find_regressions", { projectId: "test-proj", branch });
+    expect(found.status).toBe("regressions");
+    expect(found.summary.length).toBeGreaterThan(0);
+    expect(found.tests).toHaveLength(1);
+    expect(found.tests[0]!.headRunIds).toEqual([head.id]);
+    expect(found.tests[0]!.newlyFailing[0]).toMatchObject({ current: { runId: head.id, screenshotPath: headShot }, baseline: { runId: base.id } });
+
+    expect((await mcpJson<Found>("qa_find_regressions", { projectId: "test-proj", branch: `nobody-${branch}` })).status).toBe("no_runs");
+    expect((await mcpTool("qa_find_regressions", { projectId: "nope-proj", branch: "main" })).isError).toBe(true);
   });
 });

@@ -56,6 +56,8 @@ export interface GatewayDeps {
   probeTimeoutMs?: number;
   /** After a failed or timed-out cold-start probe, `tools()` answers an empty list for this long before probing again (default 30 s). */
   probeRetryMs?: number;
+  /** How long shutdown waits for a probe child that is still starting before leaving it behind (default 3 s). */
+  stopGraceMs?: number;
   /** Where the tool list is cached across restarts; null (default) keeps it in memory only. */
   cacheFile?: string | null;
 }
@@ -427,8 +429,13 @@ export class Gateway {
   /** Shutdown: refuses new calls and probes, then stops every child (also one that is still starting) and a probe child in flight. */
   async stopAll(): Promise<void> {
     this.closing = true;
-    while (this.pool.size > 0) await Promise.all([...this.pool.keys()].map((key) => this.stop(key)));
-    await Promise.all([...this.probeSpawns].map((spawned) => spawned.then((client) => client.close()).catch(() => {})));
+    // A child whose close or handshake never settles must not hang shutdown: give everything one grace period, then return.
+    // When this process exits, the children's stdio closes and they end with it.
+    const drain = async (): Promise<void> => {
+      while (this.pool.size > 0) await Promise.all([...this.pool.keys()].map((key) => this.stop(key)));
+      await Promise.all([...this.probeSpawns].map((spawned) => spawned.then((client) => client.close()).catch(() => {})));
+    };
+    await Promise.race([drain(), Bun.sleep(this.deps.stopGraceMs ?? 3_000)]);
   }
 }
 

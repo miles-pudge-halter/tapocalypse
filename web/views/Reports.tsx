@@ -2,6 +2,7 @@ import { AlertCircle, ArrowLeft, FileText, Search } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
 import { EmptyState } from "@/components/empty-state";
 import { PageHeader } from "@/components/page-header";
+import { ProjectPicker, ReportsTabs, reportsHref } from "@/components/reports-nav";
 import { ReadingProgress } from "@/components/report/reading-progress";
 import { ReportArticle } from "@/components/report/report-article";
 import { ReportGroups, matchesVerdict, type VerdictFilter } from "@/components/report/report-groups";
@@ -10,13 +11,12 @@ import { ReportToc } from "@/components/report/report-toc";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { VerdictBadge } from "@/components/verdict-badge";
 import { formatTime } from "@/lib/format";
-import { navigate, useNow, useProjectScope, useProjects, useReport, useReports } from "@/lib/hooks";
+import { useNow, useProjectScope, useProjects, useReport, useReports } from "@/lib/hooks";
 
 function ErrorAlert({ message }: { message: string }) {
   return (
@@ -28,12 +28,8 @@ function ErrorAlert({ message }: { message: string }) {
   );
 }
 
-function reportsHref(projectId: string): string {
-  return `#/p/${encodeURIComponent(projectId)}/reports`;
-}
-
 /** Route project, else the sidebar project scope, else the first registered project. */
-function useReportsProject(routeProjectId: string | null | undefined) {
+export function useReportsProject(routeProjectId: string | null | undefined) {
   const { projects, loading, error } = useProjects();
   const { projectId: scopeProjectId } = useProjectScope();
   const projectId = routeProjectId || scopeProjectId || projects[0]?.id || null;
@@ -113,25 +109,12 @@ export function ReportList({ projectId: routeProjectId }: { projectId?: string |
   const { projects, projectId, loading, error } = useReportsProject(routeProjectId);
   const projectName = projects.find((p) => p.id === projectId)?.name ?? projectId;
 
-  const picker =
-    projects.length > 1 && projectId ? (
-      <Select value={projectId} onValueChange={(id) => navigate(reportsHref(id))}>
-        <SelectTrigger className="w-48" aria-label="Project">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          {projects.map((p) => (
-            <SelectItem key={p.id} value={p.id}>
-              {p.name}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
-    ) : undefined;
+  const picker = <ProjectPicker projects={projects} projectId={projectId} hrefFor={reportsHref} />;
 
   return (
     <div>
       <PageHeader title="Reports" description={projectName ?? undefined} actions={picker} />
+      <ReportsTabs projectId={projectId} value="reports" />
       {error ? (
         <ErrorAlert message={error} />
       ) : loading ? (

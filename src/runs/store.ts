@@ -49,6 +49,9 @@ const RUN_DEFAULTS = {
   install: null,
   storage: "repo",
   gated: false,
+  testKey: null,
+  checkHints: null,
+  reuseChecks: true,
 } satisfies Partial<Run>;
 
 type RunDefaultKey = keyof typeof RUN_DEFAULTS;
@@ -73,6 +76,25 @@ let index: Map<string, Run> | null = null;
 let sorted: Run[] | null = null;
 /** Number of frames in each run's events.jsonl, i.e. the next `seq`. */
 const eventCounts = new Map<string, number>();
+
+export type RunChange = { saved: Run } | { deleted: string };
+const subscribers = new Set<(change: RunChange) => void>();
+
+/** Calls `fn` after every `saveRun` (with the stored snapshot, read-only) and `deleteRun`; returns the unsubscribe function. */
+export function subscribeRuns(fn: (change: RunChange) => void): () => void {
+  subscribers.add(fn);
+  return () => subscribers.delete(fn);
+}
+
+function notify(change: RunChange): void {
+  for (const fn of subscribers) {
+    try {
+      fn(change);
+    } catch (e) {
+      console.error("run subscriber failed:", e);
+    }
+  }
+}
 
 function loadIndex(): Map<string, Run> {
   if (index) return index;
@@ -111,8 +133,10 @@ export function saveRun(run: Run): void {
     throw err;
   }
   // A snapshot: callers keep mutating their live object between saves.
-  loadIndex().set(run.id, structuredClone(run));
+  const snapshot = structuredClone(run);
+  loadIndex().set(run.id, snapshot);
   sorted = null;
+  notify({ saved: snapshot });
 }
 
 export function getRun(id: string): Run | null {
@@ -134,6 +158,7 @@ export function deleteRun(id: string): void {
   eventCounts.delete(id);
   replayStarts.delete(id);
   sorted = null;
+  notify({ deleted: id });
 }
 
 /**

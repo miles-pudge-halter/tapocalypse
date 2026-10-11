@@ -280,6 +280,47 @@ describe("buildPrompt", () => {
     expect(suite).toContain('Use exactly these check ids and titles in qa_plan: C1 "Launch", C2 "Say \\"hi\\""');
     expect(buildPrompt(run(), toolName, { runMaxTime: "60m" })).not.toContain("Use exactly these check ids");
   });
+
+  describe("previous-check hints", () => {
+    const hints = (n: number, title = (i: number) => `Check number ${i}`) => ({
+      fromRunIds: ["20260101-000000-abcd-earlier", "20251231-000000-abcd-oldest"],
+      checks: Array.from({ length: n }, (_, i) => ({ id: `W${i + 1}`, title: title(i + 1), checkKey: `t:k${i}` })),
+    });
+    const prompt = (n: number, title?: (i: number) => string) => buildPrompt(run({ checkHints: hints(n, title) }), toolName, { runMaxTime: "60m" });
+
+    test("lists the previous ids and titles after the driving rules and before the brief, and asks for `was` without anchoring a verdict", () => {
+      const text = prompt(2, (i) => `Title "${i}"\nsecond line`);
+      const block = text.slice(text.indexOf("Previous checks of this test"), text.indexOf("Brief:"));
+      expect(text.indexOf("Previous checks of this test")).toBeGreaterThan(text.indexOf("Progress reporting"));
+      expect(block).toContain("20260101-000000-abcd-earlier");
+      expect(block).toContain('- W1 "Title \\"1\\"\\nsecond line"');
+      expect(block).toContain('- W2 "Title \\"2\\"\\nsecond line"');
+      expect(block).toContain('was: "<previous id>"');
+      expect(block).toContain("qa_plan");
+      expect(block).toContain("these are not expected results");
+      expect(block).not.toMatch(/pass|fail|blocked|skipped/i);
+    });
+
+    test("shows at most 40 checks, then says how many more there are", () => {
+      const block = prompt(55);
+      expect(block).toContain("- W40 ");
+      expect(block).not.toContain("- W41 ");
+      expect(block).toContain("- … and 15 more");
+    });
+
+    test("stays under 6,000 characters of listed checks whatever the titles are", () => {
+      const text = prompt(40, () => "x".repeat(160));
+      const listed = text.split("\n").filter((l) => /^- W\d+ /.test(l));
+      expect(listed.length).toBeLessThan(40);
+      expect(listed.join("\n").length).toBeLessThanOrEqual(6000);
+      expect(text).toMatch(/- … and \d+ more/);
+    });
+
+    test("a run without hints has no block", () => {
+      expect(buildPrompt(run({ checkHints: null }), toolName, { runMaxTime: "60m" })).not.toContain("Previous checks of this test");
+      expect(buildPrompt(run(), toolName, { runMaxTime: "60m" })).not.toContain("Previous checks of this test");
+    });
+  });
 });
 
 describe("buildPrompt harness neutrality", () => {
