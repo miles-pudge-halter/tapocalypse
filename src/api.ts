@@ -40,6 +40,7 @@ import {
 import { suggestProjectFolders } from "./projects/suggest";
 import { relink, unlink } from "./regression/index";
 import { listReports, renderReport, reportFilePath } from "./reports/reports";
+import { CSP as STANDALONE_CSP, renderStandaloneReport, shareRun, shareStatus } from "./reports/share";
 import { exportRun, reportFile, screenshotFile } from "./runs/artefacts";
 import { readActivity, listRuns, runDir } from "./runs/store";
 import type { Activity, Platform, Run } from "./runs/types";
@@ -113,7 +114,7 @@ function hasJsonBody(method: string, parts: string[]): boolean {
     );
   }
   if (parts.length === 4) {
-    return (a === "projects" && c === "suites") || (a === "runs" && (c === "steer" || c === "rerun" || c === "export")) || (a === "devices" && c === "release");
+    return (a === "projects" && c === "suites") || (a === "runs" && (c === "steer" || c === "rerun" || c === "export" || c === "share")) || (a === "devices" && c === "release");
   }
   return false;
 }
@@ -506,6 +507,7 @@ async function route(req: Request, url: URL): Promise<Response> {
     }
     if (pathname === "/api/templates") return json(listTemplates());
     if (pathname === "/api/mcp/status") return json(mcpStatus());
+    if (pathname === "/api/share/status") return json(shareStatus(config.share));
     if (pathname === "/api/stats") {
       const days = intParam(url, "days") ?? 7;
       if (days < 1 || days > MAX_STATS_DAYS) throw new HttpError(400, `days must be between 1 and ${MAX_STATS_DAYS}`);
@@ -616,6 +618,23 @@ async function route(req: Request, url: URL): Promise<Response> {
           const file = reportFile(r, getProject(r.projectId) ?? null);
           if (!file || !existsSync(file)) throw new HttpError(404, `run ${id} has no report`);
           return json({ markdown: readFileSync(file, "utf8") });
+        }
+        if (action === "report.html" && method === "GET") {
+          const r = run(id);
+          const { html } = await renderStandaloneReport(r, getProject(r.projectId) ?? null);
+          return new Response(html, {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Content-Security-Policy": STANDALONE_CSP,
+              "Cache-Control": "no-store",
+              ...NOSNIFF,
+              ...(url.searchParams.get("download") === "1" ? { "Content-Disposition": `attachment; filename="QA-REPORT-${r.id.replace(/[^\w.-]/g, "_")}.html"` } : {}),
+            },
+          });
+        }
+        if (action === "share" && method === "POST") {
+          run(id);
+          return json(await shareRun(id));
         }
         if (action === "export" && method === "POST") {
           const r = run(id);

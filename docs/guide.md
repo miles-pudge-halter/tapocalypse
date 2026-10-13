@@ -21,6 +21,7 @@ Back to the [README](../README.md). This is the long-form reference: every page 
 - [Regressions, history and flaky checks](#regressions-history-and-flaky-checks)
 - [CLI and CI](#cli-and-ci)
 - [Reading reports and screenshots](#reading-reports-and-screenshots)
+- [Sharing a report](#sharing-a-report)
 - [Running as a service](#running-as-a-service)
 - [Brief templates and suites](#brief-templates-and-suites)
 - [Configuration](#configuration)
@@ -513,6 +514,21 @@ To keep a copy outside Tapocalypse, for example in the repo or as a CI artefact,
 
 **Older runs.** Runs from before this change wrote `QA-REPORT-<run-id>.md` and `screenshots/<run-id>/` into `<repo>/<reportsDir>` (default `qa/`). They keep rendering from there, and a project's legacy `reportsDir` is still read so those reports stay in the Reports list, but nothing new is written to it. Delete those files from your repo whenever you like.
 
+## Sharing a report
+
+A stakeholder does not need Tapocalypse to read a run. Every finished run can be turned into **one self-contained HTML file**: the verdict, the run's facts, the agent's summary, the checks table, the report and every screenshot, with the images inlined and no scripts or external requests (a Content-Security-Policy meta tag forbids them). It follows the system's light or dark setting, reads well at phone width and prints cleanly. Runs without a report still produce a file with the checks and summary.
+
+| You want | How |
+| --- | --- |
+| A file to attach or archive | **Share → Download HTML report** on the run page or a report page; `GET /api/runs/:id/report.html?download=1`; `tapocalypse report <runId> --html <file>`; `qa_share_report { runId }` (writes `<data dir>/runs/<run-id>/QA-REPORT-<run-id>.html` and returns its path) |
+| A link to paste in chat or a ticket | **Share → Copy share link**; `tapocalypse share <runId>`; `POST /api/runs/:id/share`; `qa_share_report { runId }` once [`share.s3`](configuration.md#sharing) is configured |
+
+Both are disabled while the run is still active, because its report is not final. The file embeds at most 25 MB of images in total; screenshots past that limit are replaced by a visible "screenshot omitted (size limit)" placeholder, and the share result tells you how many were left out.
+
+**How a link works.** Tapocalypse uploads the HTML file to an S3-compatible bucket (AWS S3, Cloudflare R2, MinIO…) under `<prefix><project id>/<run id>-<random>.html` and returns a presigned URL that expires after `expiresInDays` (1 to 7, default 7). The bucket stays **private**: nothing is made public, and there is no listing. **Anyone who holds the link can open the report until it expires**, with no login, so treat it like a password-reset link: share it only with the people who should see the run. A link cannot be revoked early, only outlived (delete the object in the bucket to pull it sooner). Access keys are never stored in the config file: set `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` (or `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`) in the environment of the server, for a key that may write and read only the share prefix (a presigned link carries the signer's read permission). Each share uploads a new copy, so a new link shows the run as it is now while earlier links keep showing the earlier file.
+
+Without `share.s3` the UI offers only the download, `tapocalypse share` exits 2 with a hint, and `qa_share_report` returns the file path and a note that links need `share.s3`.
+
 ## Running as a service
 
 `tapocalypse service install` keeps Tapocalypse running in the background and starts it at login, so your coding agent's MCP calls always find it. On macOS it installs a launchd agent (`~/Library/LaunchAgents/dev.tapocalypse.server.plist`); on Linux a systemd user unit (`~/.config/systemd/user/tapocalypse.service`). Both run `<bun> <checkout>/src/cli.ts serve`, restart it if it exits with an error (a clean exit stays stopped), and write its output to `<data dir>/logs/service.log` (Linux: `journalctl --user -u tapocalypse`). The unit records your `PATH`, `HOME`, `NODE_ENV=production` and any `TAPOCALYPSE_*`, `ANDROID_HOME` / `ANDROID_SDK_ROOT` and harness binary variables (`OMP_BIN`, `CLAUDE_BIN`, `CODEX_BIN`, `ADB_BIN`, `XCRUN_BIN`, `EMULATOR_BIN`) set when you install, so run it from the shell that works with `bun start`; run `install` again after you change them.
@@ -624,6 +640,7 @@ Tapocalypse is a local developer tool with no login.
 - **Request guards.** Every request's `Host` must be `127.0.0.1:<port>` or `localhost:<port>` (blocks DNS rebinding). Writes carrying an `Origin` must come from those same origins, and JSON endpoints require `Content-Type: application/json` (blocks cross-site form posts). Clients without an `Origin`, such as `curl` and MCP clients, are allowed. Request bodies are capped at 1 MiB, and `/mcp` accepts only `POST`.
 - **Agents are trusted code.** Runs start the harness in its non-interactive, no-prompt mode: omp with `--auto-approve`, Claude Code with `--permission-mode bypassPermissions` (or, with `permissions: "allowlist"`, `dontAsk` plus an allowlist), Codex CLI with `--sandbox danger-full-access` and `approval_policy="never"`. The agent runs shell commands (`adb`, `xcrun`, anything else it decides to) as your user, in your repo, without asking. A brief is effectively a program you execute. Anyone or anything that can reach the port, including every local process and every MCP client you register, can start runs, so treat them as having your shell. Review third-party personas before using them.
 - **Reports are sanitized.** Markdown reports are rendered to HTML on the server and then sanitized: scripts, event handlers, iframes, styles, forms and `javascript:`-style links are stripped, and only `http`, `https`, `mailto`, relative and `#` links survive. External images are dropped and replaced by their alt text, so opening a report never contacts a third party. Task-list checkboxes are rendered disabled. Transcripts, which omp exports, are served with a `sandbox` Content-Security-Policy.
+- **Shared reports.** A standalone HTML report contains no script and may only load `data:` images, and agent text goes through the same sanitizer as the UI. A share link is an unguessable presigned URL to an object in a private bucket; whoever has the link can read that report until it expires (at most 7 days). Credentials come only from the server's environment, never from the config file or the UI. See [Sharing a report](#sharing-a-report).
 - **Content-Security-Policy.** The UI page allows only same-origin scripts, styles and connections, images from itself or `data:`/`blob:`, fonts from itself or `data:` (the bundled monospace font is inlined), and no plugins, base tags or foreign form targets.
 - **Frame protection.** Every API and file response carries `X-Frame-Options: DENY` and `frame-ancestors 'none'`; the UI page itself refuses to render inside another page. This stops clickjacking of a running instance.
 - **Guards on destructive actions.** Only finished runs can be deleted, only devices Tapocalypse booted (and no run or agent lease is using) can be shut down from the UI, projects with active runs cannot be removed, and retention only deletes run folders inside the data directory.
@@ -653,7 +670,7 @@ Start with `bun run doctor` (or the **Setup** page): it checks every prerequisit
 Roadmap, in no particular order. None of these exist today:
 
 - Scheduled comparisons and trend charts across many runs, and a named-test parameter that would pin a test's identity by hand (a test is inferred from the brief, suite or run title today).
-- Webhooks and other outbound notifications; exporting a run as a zip or HTML bundle; tags on runs.
+- Webhooks and other outbound notifications; exporting a run as a zip bundle; tags on runs.
 - Scheduled and recurring runs (use cron plus the [CLI](#cli-and-ci) for now).
 - A Settings page with hot reload: the config file is edited by hand and read once at startup (projects are the exception).
 - A demo mode that works without devices or a model provider.

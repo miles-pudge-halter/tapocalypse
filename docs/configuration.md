@@ -31,6 +31,12 @@ The config file is created with the defaults below when it does not exist. It is
 | `retry.infra` | `1` | Automatic retries of a run that failed on infrastructure (boot failure, agent crash, MCP tools missing) before any check resolved. `0` disables retries |
 | `retention.days` | unset | Delete finished runs that ended more than this many days ago. Unset keeps them |
 | `retention.maxRuns` | unset | Keep only the newest this-many runs, deleting older finished ones. Unset keeps them |
+| `share.s3.bucket` | unset | Bucket that receives shared single-file HTML reports; setting `share.s3` turns on **Copy share link** and `tapocalypse share`. See [Sharing](#sharing) |
+| `share.s3.endpoint` | unset (AWS) | S3-compatible endpoint URL, for example a Cloudflare R2 or MinIO endpoint |
+| `share.s3.region` | unset | Signing region (R2 uses `auto`) |
+| `share.s3.credentialsFile` | `share-credentials.json` next to the config file | JSON file with the S3 credentials, used when no credentials are set in the environment. Absolute path or `~/...`. See [Sharing](#sharing) |
+| `share.s3.prefix` | `"tapocalypse/"` | Key prefix; reports are stored as `<prefix><project id>/<run id>-<random>.html` |
+| `share.s3.expiresInDays` | `7` | How long a share link works, 1 to 7 days (the SigV4 maximum) |
 | `devicePool.android.avds` | `[]` | AVD names (`emulator -list-avds`) Tapocalypse may boot on demand. Wear OS, TV and Automotive AVDs are never booted automatically |
 | `devicePool.android.basePort` | `5560` | First emulator console port; booted emulators get even ports from here |
 | `devicePool.android.maxBooted` | `1` | Max emulators Tapocalypse keeps booted at once; `0` disables auto-boot |
@@ -46,6 +52,39 @@ The config file is created with the defaults below when it does not exist. It is
 A fresh config file contains the defaults above for `port`, `maxConcurrentRuns`, `runMaxTime`, `projects` and `devicePool`; `agent`, `retry` and `retention` are optional and can be added by hand.
 
 **Ignored keys.** Keys the schema does not know, including those of removed features, are ignored. Runs no longer take a `backend`; old runs that recorded one still load. [Device leases](guide.md#sharing-devices-between-agents) have no settings: the TTL (default 30 min, 5-120) is chosen per lease by the agent, and agent leases are stored in `<data dir>/leases.json`.
+
+## Sharing
+
+Every finished run can be downloaded as one self-contained HTML file with no setup. To also hand out **links**, point Tapocalypse at a private S3-compatible bucket:
+
+```json
+{
+  "share": {
+    "s3": {
+      "bucket": "team-qa-reports",
+      "endpoint": "https://<account-id>.r2.cloudflarestorage.com",
+      "region": "auto",
+      "prefix": "tapocalypse/",
+      "expiresInDays": 7
+    }
+  }
+}
+```
+
+Only `bucket` is required. Credentials are **never** read from the config file. Tapocalypse looks for them, in this order, every time you share (no restart needed):
+
+1. **Environment variables** of the server: `S3_ACCESS_KEY_ID` + `S3_SECRET_ACCESS_KEY`, or `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (both of a pair are needed).
+2. **A credentials file**, by default `share-credentials.json` in the same folder as the active config file (or the path in `share.s3.credentialsFile`):
+
+   ```json
+   { "accessKeyId": "...", "secretAccessKey": "...", "sessionToken": "optional" }
+   ```
+
+   Create it with `chmod 600`: like an SSH key, a file that group or other users can read is refused, and the **Copy share link** button and `tapocalypse share` report why (`GET /api/share/status` returns `configured: false` and a `problem`).
+
+Use the file when Tapocalypse runs under `tapocalypse service`: the launchd/systemd unit carries no secrets, so environment variables you export in your shell do not reach it, but the file does.
+
+ The bucket must stay private: Tapocalypse uploads the file and returns a presigned URL, so **anyone holding the link can open that report until it expires**, and nobody else can list or read the bucket. The key needs permission to write and read objects under the prefix. Links cannot be revoked before they expire; delete the object to pull one early. How it looks in use: [Sharing a report](guide.md#sharing-a-report).
 
 ## Agent harnesses
 
@@ -94,6 +133,7 @@ A *harness* is the headless coding-agent CLI that plays the QA agent: `omp`, `cl
 | `TAPOCALYPSE_URL` | Server URL for `tapocalypse run` / `status` / `report` (default `http://127.0.0.1:<port>`); `--url` wins |
 | `XDG_CONFIG_HOME`, `XDG_DATA_HOME` | Base directories for the default config and data locations |
 | `OMP_BIN`, `CLAUDE_BIN`, `CODEX_BIN`, `ADB_BIN`, `XCRUN_BIN`, `GIT_BIN`, `GH_BIN` | Binaries to use instead of `omp`, `claude`, `codex`, `adb`, `xcrun`, `git`, `gh` from `PATH`. The harness variables override `agent.harnesses.<id>.bin` |
+| `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | Credentials for `share.s3` (`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` work too, as Bun's S3 client reads them). They win over the credentials file. Never put them in the config file; under `tapocalypse service` use the [credentials file](#sharing) instead |
 | `MOBILE_MCP_BIN` | Command line that starts the mobile-mcp children of the `/mcp` device gateway instead of `npx -y @mobilenext/mobile-mcp@latest` (a pinned install, or a stand-in in tests). It is split on spaces, so a path that contains spaces cannot be used |
 | `EMULATOR_BIN` | Android emulator binary. Otherwise looked up (not on `PATH`) at `$ANDROID_HOME/emulator/emulator`, `$ANDROID_SDK_ROOT/emulator/emulator`, `~/Library/Android/sdk/emulator/emulator` (macOS), then `~/Android/Sdk/emulator/emulator` (Linux) |
 | `ANDROID_HOME`, `ANDROID_SDK_ROOT` | Android SDK location used for the emulator lookup |
@@ -109,6 +149,8 @@ bun run dev                               # server with hot reload
 bun src/cli.ts serve [--port 4311] [--dev]
 bun src/cli.ts service install|uninstall|start|stop|restart|status|logs
 bun src/cli.ts report <runId> [--export <dir>] [--json]
+bun src/cli.ts report <runId> --html <file>              # write the standalone HTML report to <file>
+bun src/cli.ts share <runId>                              # upload it and print a presigned link (exit 2 when share.s3 is not configured)
 bun src/cli.ts compare <runId|batchId> [--baseline <runId|auto>] [--include-flaky] [--json] [--junit <file>]
 bun run doctor
 ```
@@ -118,3 +160,5 @@ bun run doctor
 `service` keeps the server running in the background and starts it at login: `install` writes a launchd agent (macOS, `~/Library/LaunchAgents/dev.tapocalypse.server.plist`) or a systemd user unit (Linux, `~/.config/systemd/user/tapocalypse.service`) and starts it; `status` shows whether it is installed, running and answering; `logs` prints the end of `<data dir>/logs/service.log` (Linux: the journal); `start`, `stop` and `restart` control it; `uninstall` stops it and removes the unit. The unit stores the environment it was installed from (`PATH`, `HOME`, `TAPOCALYPSE_*`, `ANDROID_HOME`, `ANDROID_SDK_ROOT` and the `*_BIN` variables above), so run `install` again after changing it. It only touches its own unit and is not supported on Windows. Details: [Running as a service](guide.md#running-as-a-service).
 
 `report <runId>` prints a run's markdown report; `--export <dir>` copies the report (as `QA-REPORT-<runId>.md`) and its screenshots into `<dir>` instead, and `--json` prints `{ runId, reportPath, markdown }`. Details: [Reading reports and screenshots](guide.md#reading-reports-and-screenshots).
+
+`report <runId> --html <file>` writes the run's [standalone HTML report](guide.md#sharing-a-report), and `share <runId>` uploads it to the bucket from [`share.s3`](#sharing) and prints the presigned link (exit code 2 when sharing is not configured).

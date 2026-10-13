@@ -7,6 +7,7 @@ import { fetchHandler } from "../src/api";
 import { scheduler } from "../src/app";
 import { config, DATA_DIR, MAX_STEER_CHARS } from "../src/config";
 import { gateway } from "../src/devices/gateway";
+import { shareReport } from "../src/mcp/server";
 import { deviceOwner, grantAgent, grantRun, releaseRun, revoke } from "../src/devices/leases";
 import { HARNESS_IDS } from "../src/harness/types";
 import { getProject } from "../src/projects/registry";
@@ -487,6 +488,55 @@ describe("run-management MCP artefact tools", () => {
     expect((await callTool("qa_get_screenshots", { runId: `nope-${run.id}` })).isError).toBe(true);
   });
 
+  test("qa_share_report without share config writes the standalone HTML into the run folder and says links need share.s3", async () => {
+    expect((await rpc("tools/list")).tools!.map((t) => t.name)).toContain("qa_share_report");
+    const run = await makeDataRun({ title: "MCP share run" });
+    const ok = await callTool("qa_share_report", { runId: run.id });
+    expect(ok.isError).toBe(false);
+    const out = JSON.parse(ok.text) as { file: string; note: string; url?: string };
+    expect(path.basename(out.file)).toBe(`QA-REPORT-${run.id}.html`);
+    expect(fs.realpathSync(path.dirname(out.file))).toBe(fs.realpathSync(runDir(run.id)));
+    expect(fs.readFileSync(out.file, "utf8")).toContain("MCP share run");
+    expect(out.note).toContain("share.s3");
+    expect(out.url).toBeUndefined();
+    expect((await callTool("qa_share_report", { runId: `nope-${run.id}` })).isError).toBe(true);
+    const live = await makeDataRun({ status: "running" });
+    expect((await callTool("qa_share_report", { runId: live.id })).isError).toBe(true);
+  });
+
+  test("shareReport with share config uploads and returns only the link and its expiry", async () => {
+    const run = await makeDataRun();
+    const uploads: string[] = [];
+    const out = await shareReport(run.id, {
+      share: { s3: { bucket: "b", prefix: "p/", expiresInDays: 2 } },
+      client: {
+        async write(key) {
+          uploads.push(key);
+          return 1;
+        },
+        presign: (key) => `https://bucket.example/${key}?sig`,
+      },
+      env: { S3_ACCESS_KEY_ID: "id", S3_SECRET_ACCESS_KEY: "secret" },
+      now: () => Date.parse("2026-03-01T00:00:00.000Z"),
+    });
+    expect(uploads).toHaveLength(1);
+    expect(out).toEqual({ url: `https://bucket.example/${uploads[0]}?sig`, expiresAt: "2026-03-03T00:00:00.000Z" });
+    expect(fs.existsSync(path.join(runDir(run.id), `QA-REPORT-${run.id}.html`))).toBe(false);
+  });
+
+  test("shareReport with share config but no credentials falls back to the file and explains what is missing", async () => {
+    const run = await makeDataRun();
+    const empty = fs.mkdtempSync(path.join(os.tmpdir(), "tapocalypse-share-nocreds-"));
+    try {
+      const out = (await shareReport(run.id, { share: { s3: { bucket: "b", prefix: "p/", expiresInDays: 7 } }, env: {}, configDir: empty })) as { file: string; note: string };
+      expect(fs.existsSync(out.file)).toBe(true);
+      expect(out.note).toContain("no S3 credentials");
+      expect(out.note).toContain(path.join(empty, "share-credentials.json"));
+    } finally {
+      fs.rmSync(empty, { recursive: true, force: true });
+    }
+  });
+
   test("qa_export copies the artefacts into an absolute directory and refuses a relative one", async () => {
     const run = await makeDataRun();
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tapocalypse-mcp-export-"));
@@ -503,6 +553,40 @@ describe("run-management MCP artefact tools", () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("report sharing routes", () => {
+  test("GET /api/runs/:id/report.html serves the standalone report locked down; ?download=1 saves it as a file", async () => {
+    const run = await makeDataRun({ title: "Share route run" });
+    const res = await call(`/api/runs/${run.id}/report.html`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(res.headers.get("content-security-policy")).toStartWith("default-src 'none'; img-src data:; style-src 'unsafe-inline'");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("content-disposition")).toBeNull();
+    const html = await res.text();
+    expect(html).toContain("Share route run");
+    expect(html).toContain("data:image/png;base64,");
+    expect(html.toLowerCase()).not.toContain("<script");
+
+    const download = await call(`/api/runs/${run.id}/report.html?download=1`);
+    expect(download.headers.get("content-disposition")).toBe(`attachment; filename="QA-REPORT-${run.id}.html"`);
+    expect((await call(`/api/runs/nope-${run.id}/report.html`)).status).toBe(404);
+  });
+
+  test("GET /api/share/status reports that sharing is off without share.s3 config", async () => {
+    expect(await (await call("/api/share/status")).json()).toEqual({ configured: false, provider: null, expiresInDays: null, problem: null });
+  });
+
+  test("POST /api/runs/:id/share needs a JSON body, a known run and share config", async () => {
+    const run = await makeDataRun();
+    const plain = await call(`/api/runs/${run.id}/share`, { method: "POST", headers: { "content-type": "text/plain" }, body: "{}" });
+    expect(plain.status).toBe(415);
+    const off = await call(`/api/runs/${run.id}/share`, { method: "POST", json: {} });
+    expect(off.status).toBe(400);
+    expect(await off.json()).toEqual({ error: "sharing is not configured" });
+    expect((await call(`/api/runs/nope-${run.id}/share`, { method: "POST", json: {} })).status).toBe(404);
   });
 });
 

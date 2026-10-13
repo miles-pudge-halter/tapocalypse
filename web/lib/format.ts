@@ -45,6 +45,16 @@ export function leaseFraction(lease: { renewedAt: string; expiresAt: string }, n
   return Math.min(1, Math.max(0, (Date.parse(lease.expiresAt) - now) / span));
 }
 
+/** Time until a share link expires, rounded up: `7 days`, `1 day`, `5 hours`, `1 hour`, or `expired` once past. */
+export function formatExpiresIn(expiresAt: string, now: number): string {
+  const ms = Date.parse(expiresAt) - now;
+  if (ms <= 0) return "expired";
+  const hours = Math.ceil(ms / 3_600_000);
+  if (hours < 24) return `${hours} ${hours === 1 ? "hour" : "hours"}`;
+  const days = Math.ceil(hours / 24);
+  return `${days} ${days === 1 ? "day" : "days"}`;
+}
+
 export function formatRelative(iso: string, now: number): string {
   const sec = Math.max(0, Math.floor((now - Date.parse(iso)) / 1000));
   if (sec < 5) return "just now";

@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-// Command line entry: `tapocalypse serve | service | doctor | run | status | report`.
+// Command line entry: `tapocalypse serve | service | doctor | run | status | report | share`.
 // Everything except `serve`/`service`/`doctor` talks to a running server over HTTP. This module must not import config
 // (or anything that does) at load time: the config reads TAPOCALYPSE_PORT when first imported, and `--help`
 // has to work without a config file.
@@ -72,7 +72,8 @@ export type Command =
   | { name: "doctor" }
   | { name: "run"; options: RunOptions }
   | { name: "status"; id: string; json: boolean; url: string }
-  | { name: "report"; id: string; exportDir: string | null; json: boolean; url: string }
+  | { name: "report"; id: string; exportDir: string | null; htmlFile: string | null; json: boolean; url: string }
+  | { name: "share"; id: string; json: boolean; url: string }
   | { name: "compare"; id: string; baseline: string; includeFlaky: boolean; json: boolean; junit: string | null; url: string }
   | { name: "service"; action: ServiceAction };
 
@@ -89,9 +90,13 @@ Usage:
       Start a QA run (or a batch) on a running server.
   tapocalypse status <runId|batchId> [--json] [--url <url>]
       Show the state of a run or batch, including the absolute path of its report.
-  tapocalypse report <runId> [--export <dir>] [--json] [--url <url>]
+  tapocalypse report <runId> [--export <dir> | --html <file>] [--json] [--url <url>]
       Print a run's markdown report. Reports and screenshots live in Tapocalypse's data dir, not in your repository;
       --export copies them (QA-REPORT-<runId>.md + screenshots/) into <dir>. --json prints { runId, reportPath, markdown }.
+      --html writes one self-contained HTML file (screenshots inlined, no scripts) that anyone can open.
+  tapocalypse share <runId> [--json] [--url <url>]
+      Upload the run's self-contained HTML report to the configured private bucket (share.s3) and print a presigned link
+      that works until it expires. Exits 2 when sharing is not configured, 3 for an unknown or still-active run.
   tapocalypse compare <runId|batchId> [--baseline <runId|auto>] [--include-flaky] [--json] [--junit <file>] [--url <url>]
       Compare a finished run with its baseline (the automatic one, or a run id): newly failing, fixed and flaky checks.
       A batch compares every lane against its own automatic baseline. Exits 1 on non-flaky newly failing checks,
@@ -194,15 +199,22 @@ export function parseCli(argv: string[], env: Record<string, string | undefined>
       return { name: "status", id: positionals[0]!, json: values.json === true, url: baseUrl(values.url, env) };
     }
     case "report": {
-      const { values, positionals } = tokenize(rest, { export: { type: "string" }, json: { type: "boolean" }, url: { type: "string" } });
-      if (positionals.length !== 1) throw new UsageError("usage: tapocalypse report <runId> [--export <dir>] [--json] [--url <url>]");
+      const { values, positionals } = tokenize(rest, { export: { type: "string" }, html: { type: "string" }, json: { type: "boolean" }, url: { type: "string" } });
+      if (positionals.length !== 1) throw new UsageError("usage: tapocalypse report <runId> [--export <dir> | --html <file>] [--json] [--url <url>]");
+      if (values.export !== undefined && values.html !== undefined) throw new UsageError("--export and --html cannot be combined");
       return {
         name: "report",
         id: positionals[0]!,
         exportDir: values.export === undefined ? null : path.resolve(values.export),
+        htmlFile: values.html === undefined ? null : path.resolve(values.html),
         json: values.json === true,
         url: baseUrl(values.url, env),
       };
+    }
+    case "share": {
+      const { values, positionals } = tokenize(rest, { json: { type: "boolean" }, url: { type: "string" } });
+      if (positionals.length !== 1) throw new UsageError("usage: tapocalypse share <runId> [--json] [--url <url>]");
+      return { name: "share", id: positionals[0]!, json: values.json === true, url: baseUrl(values.url, env) };
     }
     case "compare": {
       const { values, positionals } = tokenize(rest, {
@@ -814,6 +826,15 @@ export class ApiClient {
   ) {}
 
   async request<T>(method: "GET" | "POST", pathname: string, body?: unknown): Promise<T> {
+    return (await this.exchange(method, pathname, body)).data as T;
+  }
+
+  /** The raw body of a GET, for non-JSON responses such as the standalone HTML report. */
+  async text(pathname: string): Promise<string> {
+    return (await this.exchange("GET", pathname)).text;
+  }
+
+  private async exchange(method: "GET" | "POST", pathname: string, body?: unknown): Promise<{ text: string; data: unknown }> {
     let res: Response;
     try {
       res = await this.fetchFn(`${this.base}${pathname}`, {
@@ -836,7 +857,7 @@ export class ApiClient {
       const message = data && typeof data === "object" && "error" in data ? String((data as { error: unknown }).error) : text || res.statusText;
       throw new ApiError(res.status, message);
     }
-    return data as T;
+    return { text, data };
   }
 }
 
@@ -1139,11 +1160,16 @@ export async function executeStatus(id: string, json: boolean, deps: Pick<RunDep
 
 /** `tapocalypse report <runId>`: markdown to stdout, or (with --export) copy the artefacts into a directory. */
 export async function executeReport(
-  options: { id: string; exportDir: string | null; json: boolean },
-  deps: Pick<RunDeps, "api" | "io">,
+  options: { id: string; exportDir: string | null; htmlFile: string | null; json: boolean },
+  deps: Pick<RunDeps, "api" | "io" | "writeFile">,
 ): Promise<number> {
   const { api, io } = deps;
   const id = encodeURIComponent(options.id);
+  if (options.htmlFile !== null) {
+    await deps.writeFile(options.htmlFile, await api.text(`/api/runs/${id}/report.html`));
+    io.out(options.json ? JSON.stringify({ runId: options.id, file: options.htmlFile }, null, 2) : `report: ${options.htmlFile}`);
+    return EXIT.OK;
+  }
   if (options.exportDir !== null) {
     const result = await api.request<{ report: string | null; screenshots: string[] }>("POST", `/api/runs/${id}/export`, { dir: options.exportDir });
     if (options.json) io.out(JSON.stringify(result, null, 2));
@@ -1159,6 +1185,26 @@ export async function executeReport(
     io.out(JSON.stringify({ runId: options.id, reportPath: run.reportFile ?? null, markdown }, null, 2));
   } else {
     io.out(markdown);
+  }
+  return EXIT.OK;
+}
+
+/** `tapocalypse share <runId>`: prints the presigned link; exits 2 when the server has no share config. */
+export async function executeShare(options: { id: string; json: boolean }, deps: Pick<RunDeps, "api" | "io">): Promise<number> {
+  const { api, io } = deps;
+  const status = await api.request<{ configured: boolean; problem?: string | null }>("GET", "/api/share/status");
+  if (!status.configured) {
+    io.err(
+      status.problem ??
+        "sharing is not configured: add share.s3 (bucket, endpoint, region) to the Tapocalypse config and provide S3 credentials (S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY, or share-credentials.json next to the config, mode 600), or write a file with `tapocalypse report <runId> --html <file>`",
+    );
+    return EXIT.ERROR;
+  }
+  const shared = await api.request<{ url: string; expiresAt: string; key: string; omitted: number }>("POST", `/api/runs/${encodeURIComponent(options.id)}/share`, {});
+  if (options.json) io.out(JSON.stringify(shared, null, 2));
+  else {
+    io.out(shared.url);
+    io.err(`link expires ${shared.expiresAt}; anyone with it can open the report${shared.omitted > 0 ? `; ${shared.omitted} screenshot(s) left out (size limit)` : ""}`);
   }
   return EXIT.OK;
 }
@@ -1229,12 +1275,14 @@ export async function main(argv: string[], env: Record<string, string | undefine
     }
     case "run":
     case "status":
-    case "report": {
+    case "report":
+    case "share": {
       const base = command.name === "run" ? command.options.url : command.url;
       const deps = defaultRunDeps(base, env);
       try {
         if (command.name === "run") return await executeRun(command.options, deps);
         if (command.name === "status") return await executeStatus(command.id, command.json, deps);
+        if (command.name === "share") return await executeShare(command, deps);
         return await executeReport(command, deps);
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);

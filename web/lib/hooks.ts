@@ -9,6 +9,7 @@ import {
   type Device,
   type DoctorReport,
   type McpStatus,
+  type ShareStatus,
   type Platform,
   type PoolView,
   type ProjectStatus,
@@ -739,6 +740,12 @@ export function useSuites(projectId: string): { suites: Suite[]; loading: boolea
 export function useMcpStatus(intervalMs = 5_000): { status: McpStatus | null; loading: boolean; error: string | null } {
   const { data, loading, error } = useAsync(api.mcpStatus, "mcp-status", intervalMs);
   return { status: data, loading, error };
+}
+
+/** Whether report links can be uploaded (`share.s3` configured on the server); the download needs no setup. */
+export function useShareStatus(): { status: ShareStatus | null; loading: boolean; error: string | null; refresh(): void } {
+  const { data, loading, error, refresh } = useAsync(api.shareStatus, "share-status");
+  return { status: data, loading, error, refresh };
 }
 
 // --- New run sheet store ---

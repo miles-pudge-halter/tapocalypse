@@ -409,6 +409,24 @@ export interface RunListParams {
   before?: string;
 }
 
+/** `GET /api/share/status`: whether uploading a report to the team's private bucket is set up. */
+export interface ShareStatus {
+  configured: boolean;
+  provider: "s3" | null;
+  expiresInDays: number | null;
+  /** Why link sharing is unusable although `share.s3` is set (e.g. missing or world-readable credentials); null when fine. */
+  problem: string | null;
+}
+
+/** `POST /api/runs/:id/share`: a presigned link to the uploaded single-file report. */
+export interface ShareResult {
+  url: string;
+  expiresAt: string;
+  key: string;
+  /** Screenshots left out of the file because it hit the size limit. */
+  omitted: number;
+}
+
 export class ApiError extends Error {
   status: number;
   /** The server's machine-readable `code` (e.g. `held_by_run`), when the error body carries one. */
@@ -613,6 +631,8 @@ export const api = {
     );
   },
   reports: (projectId: string) => request<ReportEntry[]>(`/api/projects/${encodeURIComponent(projectId)}/reports`),
+  shareStatus: () => request<ShareStatus>("/api/share/status"),
+  shareRun: (id: string) => post<ShareResult>(`/api/runs/${encodeURIComponent(id)}/share`, {}),
   report: (projectId: string, name: string) =>
     request<ReportDoc>(`/api/projects/${encodeURIComponent(projectId)}/reports/${encodeURIComponent(name)}`),
 };
@@ -645,6 +665,11 @@ export function screenshotUrl(run: ArtefactRun, rel: string): string {
 
 export function transcriptUrl(runId: string): string {
   return `/api/runs/${encodeURIComponent(runId)}/transcript`;
+}
+
+/** The run's standalone single-file HTML report; `download` asks for an attachment instead of opening it in the tab. */
+export function reportHtmlUrl(runId: string, opts: { download?: boolean } = {}): string {
+  return `/api/runs/${encodeURIComponent(runId)}/report.html${opts.download ? "?download=1" : ""}`;
 }
 
 /** Hash route of a report by the name the server lists it under (a run id for data runs, a file name for legacy ones). */

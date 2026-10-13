@@ -20,6 +20,7 @@ import { batchHash, isActive, reportHash, transcriptUrl, type Device, type RunVi
 import { deviceDisplayName } from "@/lib/format";
 import { useHarness, useNow } from "@/lib/hooks";
 import { DetailsSheet } from "./details-sheet";
+import { ShareButton } from "./share-button";
 import { failedChecks, type RunActions } from "./use-run-actions";
 
 /** Dense one-strip header: breadcrumb, identity, status/verdict, key facts and the run's actions. */
@@ -123,6 +124,7 @@ export function RunHeader({
               </a>
             </Button>
           ) : null}
+          <ShareButton runId={run.id} disabled={active} />
           <Button variant="outline" size="sm" onClick={() => setDetailsOpen(true)}>
             <Info />
             Details

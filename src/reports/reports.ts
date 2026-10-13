@@ -59,7 +59,7 @@ export interface RenderedReport {
  * Reports are agent-written and rendered into the app origin, so raw HTML in them is reduced to what markdown itself produces.
  * Author `id`s are dropped (they could shadow the app's own element ids); heading ids are generated afterwards.
  */
-const SANITIZE_OPTIONS: sanitizeHtml.IOptions = {
+export const SANITIZE_OPTIONS: sanitizeHtml.IOptions = {
   allowedTags: [
     "h1", "h2", "h3", "h4", "h5", "h6", "p", "ul", "ol", "li", "a", "img", "table", "thead", "tbody", "tr", "th", "td",
     "code", "pre", "blockquote", "em", "strong", "del", "hr", "br", "details", "summary", "span", "sup", "sub", "input",
@@ -129,7 +129,7 @@ export function extractVerdict(md: string): Verdict | null {
 
 const ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " };
 
-function decodeEntities(s: string): string {
+export function decodeEntities(s: string): string {
   return s.replace(/&(?:#(\d+)|#x([0-9a-f]+)|([a-z]+));/gi, (whole, dec?: string, hex?: string, name?: string) => {
     if (name) return ENTITIES[name.toLowerCase()] ?? whole;
     const code = dec ? Number(dec) : Number.parseInt(hex!, 16);

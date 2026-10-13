@@ -12,6 +12,7 @@ import {
   exitCodeForRuns,
   executeCompare,
   executeReport,
+  executeShare,
   executeRun,
   executeService,
   formatRun,
@@ -110,13 +111,23 @@ describe("parseCli", () => {
   });
 
   test("report takes one run id, an optional --export dir (resolved absolute) and --json", () => {
-    expect(parseCli(["report", "r1"])).toEqual({ name: "report", id: "r1", exportDir: null, json: false, url: "http://127.0.0.1:4310" });
+    expect(parseCli(["report", "r1"])).toEqual({ name: "report", id: "r1", exportDir: null, htmlFile: null, json: false, url: "http://127.0.0.1:4310" });
     expect(parseCli(["report", "r1", "--json", "--url", "http://localhost:4400/"])).toMatchObject({ json: true, url: "http://localhost:4400" });
     expect(parseCli(["report", "r1", "--export", "out/qa"])).toMatchObject({ exportDir: path.resolve("out/qa") });
     expect(parseCli(["report", "r1", "--export", "/abs/qa"])).toMatchObject({ exportDir: "/abs/qa" });
     expect(() => parseCli(["report"])).toThrow(UsageError);
     expect(() => parseCli(["report", "a", "b"])).toThrow(UsageError);
     expect(() => parseCli(["report", "r1", "--export"])).toThrow(UsageError);
+  });
+
+  test("report --html resolves the output file; share takes one run id", () => {
+    expect(parseCli(["report", "r1", "--html", "out/r1.html"])).toMatchObject({ name: "report", htmlFile: path.resolve("out/r1.html") });
+    expect(() => parseCli(["report", "r1", "--html"])).toThrow(UsageError);
+    expect(() => parseCli(["report", "r1", "--html", "a.html", "--export", "d"])).toThrow(UsageError);
+    expect(parseCli(["share", "r1"])).toEqual({ name: "share", id: "r1", json: false, url: "http://127.0.0.1:4310" });
+    expect(parseCli(["share", "r1", "--json", "--url", "http://localhost:4400/"])).toMatchObject({ json: true, url: "http://localhost:4400" });
+    expect(() => parseCli(["share"])).toThrow(UsageError);
+    expect(() => parseCli(["share", "a", "b"])).toThrow(UsageError);
   });
 
   test("service takes exactly one known action", () => {
@@ -348,7 +359,13 @@ describe("executeReport", () => {
     const out: string[] = [];
     return { out, io: { out: (t: string) => out.push(t), err: (t: string) => out.push(`ERR ${t}`) } };
   };
-  const client = () => ({ api: new ApiClient(`http://127.0.0.1:${server.port}`) });
+  const written: { file: string; text: string }[] = [];
+  const client = () => ({
+    api: new ApiClient(`http://127.0.0.1:${server.port}`),
+    writeFile: async (file: string, text: string) => {
+      written.push({ file, text });
+    },
+  });
 
   beforeAll(() => {
     server = Bun.serve({
@@ -356,6 +373,7 @@ describe("executeReport", () => {
       hostname: "127.0.0.1",
       async fetch(req) {
         const url = new URL(req.url);
+        if (url.pathname === "/api/runs/r1/report.html") return new Response("<!doctype html><title>r1</title>", { headers: { "content-type": "text/html" } });
         if (url.pathname === "/api/runs/r1") return Response.json(run({ id: "r1", reportFile: "/data/runs/r1/report.md" }));
         if (url.pathname === "/api/runs/r1/report") return Response.json({ markdown: "# Report\n\nAll good.\n" });
         if (url.pathname === "/api/runs/r1/export" && req.method === "POST") {
@@ -372,26 +390,108 @@ describe("executeReport", () => {
 
   test("prints the markdown, or the JSON triple with --json", async () => {
     const text = io();
-    expect(await executeReport({ id: "r1", exportDir: null, json: false }, { ...client(), io: text.io })).toBe(EXIT.OK);
+    expect(await executeReport({ id: "r1", exportDir: null, htmlFile: null, json: false }, { ...client(), io: text.io })).toBe(EXIT.OK);
     expect(text.out).toEqual(["# Report\n\nAll good.\n"]);
     const json = io();
-    expect(await executeReport({ id: "r1", exportDir: null, json: true }, { ...client(), io: json.io })).toBe(EXIT.OK);
+    expect(await executeReport({ id: "r1", exportDir: null, htmlFile: null, json: true }, { ...client(), io: json.io })).toBe(EXIT.OK);
     expect(JSON.parse(json.out[0]!)).toEqual({ runId: "r1", reportPath: "/data/runs/r1/report.md", markdown: "# Report\n\nAll good.\n" });
   });
 
   test("--export posts the absolute directory and lists what was written", async () => {
     const text = io();
-    expect(await executeReport({ id: "r1", exportDir: "/out", json: false }, { ...client(), io: text.io })).toBe(EXIT.OK);
+    expect(await executeReport({ id: "r1", exportDir: "/out", htmlFile: null, json: false }, { ...client(), io: text.io })).toBe(EXIT.OK);
     expect(exported).toEqual([{ dir: "/out" }]);
     expect(text.out.join("\n")).toContain("/out/QA-REPORT-r1.md");
     expect(text.out.join("\n")).toContain("2 screenshots");
     const json = io();
-    await executeReport({ id: "r1", exportDir: "/out", json: true }, { ...client(), io: json.io });
+    await executeReport({ id: "r1", exportDir: "/out", htmlFile: null, json: true }, { ...client(), io: json.io });
     expect(JSON.parse(json.out[0]!)).toEqual({ report: "/out/QA-REPORT-r1.md", screenshots: ["/out/screenshots/01.png", "/out/screenshots/02.png"] });
   });
 
+  test("--html writes the server's standalone HTML to the file and prints where it went", async () => {
+    const text = io();
+    expect(await executeReport({ id: "r1", exportDir: null, htmlFile: "/out/r1.html", json: false }, { ...client(), io: text.io })).toBe(EXIT.OK);
+    expect(written).toEqual([{ file: "/out/r1.html", text: "<!doctype html><title>r1</title>" }]);
+    expect(text.out).toEqual(["report: /out/r1.html"]);
+    const json = io();
+    await executeReport({ id: "r1", exportDir: null, htmlFile: "/out/r1.html", json: true }, { ...client(), io: json.io });
+    expect(JSON.parse(json.out[0]!)).toEqual({ runId: "r1", file: "/out/r1.html" });
+    await expect(executeReport({ id: "none", exportDir: null, htmlFile: "/out/none.html", json: false }, { ...client(), io: io().io })).rejects.toThrow();
+  });
+
   test("a run without a report fails with the server's message", async () => {
-    await expect(executeReport({ id: "none", exportDir: null, json: false }, { ...client(), io: io().io })).rejects.toThrow("has no report");
+    await expect(executeReport({ id: "none", exportDir: null, htmlFile: null, json: false }, { ...client(), io: io().io })).rejects.toThrow("has no report");
+  });
+});
+
+describe("executeShare", () => {
+  let server: Server<undefined>;
+  let configured = true;
+  let problem: string | null = null;
+  const posted: string[] = [];
+  const io = () => {
+    const out: string[] = [];
+    const err: string[] = [];
+    return { out, err, io: { out: (t: string) => out.push(t), err: (t: string) => err.push(t) } };
+  };
+  const api = () => ({ api: new ApiClient(`http://127.0.0.1:${server.port}`) });
+
+  beforeAll(() => {
+    server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        const url = new URL(req.url);
+        if (url.pathname === "/api/share/status") return Response.json({ configured, provider: configured ? "s3" : null, expiresInDays: configured ? 7 : null, problem });
+        if (url.pathname === "/api/runs/r1/share" && req.method === "POST") {
+          posted.push(url.pathname);
+          return Response.json({ url: "https://bucket.example/r1.html?sig=1", expiresAt: "2026-03-08T00:00:00.000Z", key: "p/r1.html", omitted: 2 });
+        }
+        if (url.pathname === "/api/runs/live/share") return Response.json({ error: "run live is still running; share it once it has finished" }, { status: 409 });
+        return Response.json({ error: "unknown run" }, { status: 404 });
+      },
+    });
+  });
+  afterAll(() => server.stop(true));
+
+  test("prints the presigned link on stdout and the expiry on stderr", async () => {
+    configured = true;
+    const text = io();
+    expect(await executeShare({ id: "r1", json: false }, { ...api(), io: text.io })).toBe(EXIT.OK);
+    expect(text.out).toEqual(["https://bucket.example/r1.html?sig=1"]);
+    expect(text.err.join("\n")).toContain("2026-03-08T00:00:00.000Z");
+    expect(text.err.join("\n")).toContain("2 screenshot");
+    const json = io();
+    await executeShare({ id: "r1", json: true }, { ...api(), io: json.io });
+    expect(JSON.parse(json.out[0]!)).toMatchObject({ url: "https://bucket.example/r1.html?sig=1", key: "p/r1.html" });
+  });
+
+  test("exits 2 with a hint, without uploading, when sharing is not configured", async () => {
+    configured = false;
+    posted.length = 0;
+    const text = io();
+    expect(await executeShare({ id: "r1", json: false }, { ...api(), io: text.io })).toBe(EXIT.ERROR);
+    expect(text.out).toEqual([]);
+    expect(text.err.join("\n")).toContain("share.s3");
+    expect(posted).toEqual([]);
+  });
+
+  test("a credentials problem reported by the server is what the user is told", async () => {
+    configured = false;
+    problem = "S3 credentials file /x/share-credentials.json is accessible by other users (mode 644); run: chmod 600 /x/share-credentials.json";
+    const text = io();
+    expect(await executeShare({ id: "r1", json: false }, { ...api(), io: text.io })).toBe(EXIT.ERROR);
+    expect(text.err.join("\n")).toContain("chmod 600");
+    problem = null;
+  });
+
+  test("an unknown or still-active run surfaces the server's error (usage exit)", async () => {
+    configured = true;
+    const live = await executeShare({ id: "live", json: false }, { ...api(), io: io().io }).catch((e: unknown) => e);
+    expect(live).toBeInstanceOf(ApiError);
+    expect(exitCodeForError(live)).toBe(EXIT.USAGE);
+    expect((live as ApiError).message).toContain("still running");
+    await expect(executeShare({ id: "zzz", json: false }, { ...api(), io: io().io })).rejects.toBeInstanceOf(ApiError);
   });
 });
 

@@ -11,8 +11,9 @@ import { leaseKey, release as releaseLease, renew as renewLease, touch, TTL } fr
 import { HARNESS_IDS, type HarnessId } from "../harness/types";
 import { detectProject } from "../projects/detect";
 import { createProject, deleteProject, getProject, listProjects, PACKAGE_RE, updateProject } from "../projects/registry";
-import { exportRun, LEGACY_REPORTS_DIR, reportFile, screenshotFile, screenshotsDir } from "../runs/artefacts";
+import { exportRun, LEGACY_REPORTS_DIR, reportFile, runArtefactDir, screenshotFile, screenshotsDir } from "../runs/artefacts";
 import { realpathLoose } from "../reports/reports";
+import { renderStandaloneReport, shareRun, shareStatus, type ShareDeps } from "../reports/share";
 import { runMatches } from "../runs/source";
 import { listRuns } from "../runs/store";
 import type { ComparePair, CompareSide } from "../regression/types";
@@ -305,6 +306,24 @@ export function renewDevice(input: unknown): { serial: string; expiresAt: string
 export function releaseDevice(input: unknown): { released: true; serial: string } {
   const { leaseId } = parseArgs(DeviceReleaseArgs, input);
   return { released: true, serial: releaseLease(leaseId).serial };
+}
+
+/**
+ * `qa_share_report`: with `share.s3` configured, uploads the run's standalone HTML report and returns a presigned link; without it,
+ * writes the same file into the run's folder and returns its path. Only finished runs can be shared.
+ */
+export async function shareReport(runId: string, deps: ShareDeps = {}): Promise<{ url: string; expiresAt: string } | { file: string; note: string }> {
+  const run = requireRun(runId);
+  const status = shareStatus("share" in deps ? deps.share : config.share, deps);
+  if (status.configured) {
+    const { url, expiresAt } = await shareRun(runId, deps);
+    return { url, expiresAt };
+  }
+  if (ACTIVE.includes(run.status)) throw new HttpError(409, `run ${runId} is still ${run.status}; share it once it has finished`);
+  const { html } = await renderStandaloneReport(run, getProject(run.projectId) ?? null);
+  const file = path.join(runArtefactDir(run.id), `QA-REPORT-${run.id}.html`);
+  await Bun.write(file, html);
+  return { file, note: status.problem ?? "Sharing links are not configured: add share.s3 (bucket, optional endpoint/region/prefix/expiresInDays) to the Tapocalypse config and set S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY (or create share-credentials.json next to the config, mode 600) to get a presigned link. This file is self-contained: attach or send it as is." };
 }
 
 function buildServer(): McpServer {
@@ -637,6 +656,17 @@ function buildServer(): McpServer {
         if (!path.isAbsolute(dir)) throw new HttpError(400, "dir must be an absolute path");
         return exportRun(run, getProject(run.projectId) ?? null, dir);
       }),
+  );
+
+  server.registerTool(
+    "qa_share_report",
+    {
+      title: "Share a run's report",
+      description:
+        "Make a finished run's report shareable with people who do not have Tapocalypse. When sharing is configured (share.s3) it uploads one self-contained HTML file (screenshots inlined, no scripts) to the team's private bucket and returns { url, expiresAt }: anyone with the link can open it until it expires. Otherwise it writes the same file to <run folder>/QA-REPORT-<runId>.html and returns { file, note }. Errors while the run is still active.",
+      inputSchema: z.object({ runId: z.string() }),
+    },
+    ({ runId }) => respond(() => shareReport(runId)),
   );
 
   server.registerTool(

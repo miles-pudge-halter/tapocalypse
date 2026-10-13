@@ -16,7 +16,9 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { VerdictBadge } from "@/components/verdict-badge";
 import { formatTime } from "@/lib/format";
-import { useNow, useProjectScope, useProjects, useReport, useReports } from "@/lib/hooks";
+import { useNow, useProjectScope, useProjects, useReport, useReports, useRunSummary } from "@/lib/hooks";
+import { isActive } from "@/lib/api";
+import { ShareButton } from "@/components/run/share-button";
 
 function ErrorAlert({ message }: { message: string }) {
   return (
@@ -141,6 +143,13 @@ export function ReportList({ projectId: routeProjectId }: { projectId?: string |
   );
 }
 
+/** Share menu for the run behind a report: a skeleton while the run loads, absent when it is gone (nothing left to render). */
+function ReportShare({ runId }: { runId: string }) {
+  const { run, loading } = useRunSummary(runId, true);
+  if (loading) return <Skeleton className="h-8 w-24" />;
+  return run ? <ShareButton runId={run.id} disabled={isActive(run.status)} align="start" /> : null;
+}
+
 function ReportViewBody({ projectId, name }: { projectId: string; name: string }) {
   const { report, loading, error } = useReport(projectId, name);
   const { reports } = useReports(projectId);
@@ -163,13 +172,16 @@ function ReportViewBody({ projectId, name }: { projectId: string; name: string }
       ) : (
         <>
           <ReadingProgress anchor={articleRef} resetKey={documentKey} />
-          <div className="space-y-2">
-            <h1 className="text-2xl font-semibold tracking-tight">{report.title || report.name}</h1>
-            <div className="flex flex-wrap items-center gap-3">
-              <VerdictBadge verdict={report.verdict} />
-              <span className="font-mono text-xs text-muted-foreground">{report.name}</span>
-              {entry ? <span className="text-xs text-muted-foreground">Modified {formatTime(entry.mtime)}</span> : null}
+          <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
+            <div className="min-w-0 space-y-2">
+              <h1 className="text-2xl font-semibold tracking-tight">{report.title || report.name}</h1>
+              <div className="flex flex-wrap items-center gap-3">
+                <VerdictBadge verdict={report.verdict} />
+                <span className="font-mono text-xs text-muted-foreground">{report.name}</span>
+                {entry ? <span className="text-xs text-muted-foreground">Modified {formatTime(entry.mtime)}</span> : null}
+              </div>
             </div>
+            {report.runId ? <ReportShare runId={report.runId} /> : null}
           </div>
           <div className="grid gap-8 xl:grid-cols-[minmax(0,1fr)_20rem]">
             <div className="min-w-0">

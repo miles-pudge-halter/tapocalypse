@@ -43,6 +43,29 @@ export const ConfigSchema = z.object({
   retention: z
     .object({ days: z.number().positive().optional(), maxRuns: z.number().int().positive().optional() })
     .default({}),
+  /**
+   * Optional report sharing: finished runs are uploaded as one HTML file to a private S3-compatible bucket and handed out as
+   * presigned links. Strict on purpose: credentials come from the environment (`S3_ACCESS_KEY_ID`/`S3_SECRET_ACCESS_KEY` or the
+   * `AWS_*` pair) and are rejected here so they never land in a config file.
+   */
+  share: z
+    .strictObject({
+      s3: z.strictObject({
+        bucket: z.string().min(1),
+        endpoint: z.url().optional(),
+        region: z.string().min(1).optional(),
+        /** JSON `{accessKeyId, secretAccessKey, sessionToken?}` (mode 600) used when no S3 or AWS credentials are set in the environment; default `share-credentials.json` next to the config file. */
+        credentialsFile: z
+          .string()
+          .min(1)
+          .refine((p) => path.isAbsolute(p) || p.startsWith("~/"), "must be an absolute path or start with ~/")
+          .optional(),
+        prefix: z.string().default("tapocalypse/"),
+        /** SigV4 presigned URLs last 7 days at most. */
+        expiresInDays: z.number().int().min(1).max(7).default(7),
+      }),
+    })
+    .optional(),
   devicePool: z.object({
     android: z.object({
       avds: z.array(z.string()),

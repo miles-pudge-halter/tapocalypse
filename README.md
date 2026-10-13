@@ -45,6 +45,7 @@ flowchart LR
 3. **Agent.** A headless QA agent starts inside your repo (reading only: it is told never to write there) and drives the app through [mobile-mcp](https://github.com/mobile-next/mobile-mcp), served by Tapocalypse and pinned to the run's device: taps, typing, screenshots, `adb` and `simctl`.
 4. **Checks.** The agent declares its checks up front and reports each one as it goes. You watch them turn pending → running → pass/fail next to a live device screen and the agent's activity feed. Cancel at any time; steer it on omp and Claude Code.
 5. **Verdict.** The agent hands in a markdown report; with its screenshots it is stored in `<data dir>/runs/<run-id>/` (`report.md`, `screenshots/`), and the run ends with `PASS`, `PASS WITH ISSUES`, `FAIL`, `BLOCKED` or `PARTIAL`, plus a summary and what it cost. Read it in the UI, with `qa_get_report` / `qa_get_screenshots`, or `tapocalypse report <run-id>`; copy it anywhere with `qa_export` or `tapocalypse report <run-id> --export <dir>`.
+6. **Share.** Any finished run becomes one self-contained HTML file for stakeholders (no Tapocalypse needed), or a presigned link to a private bucket once `share.s3` is configured: [sharing a report](docs/guide.md#sharing-a-report).
 
 Details: [run outcomes](docs/guide.md#run-outcomes), [devices](docs/guide.md#devices) and [what happens under the hood](docs/guide.md#how-it-works).
 
