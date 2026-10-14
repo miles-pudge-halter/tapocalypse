@@ -465,7 +465,8 @@ If your proxy lets machines through with static headers (for example a service t
 
 **Redacted before upload** (counted per kind in `hub push --dry-run` and in the upload itself):
 
-- **Paths:** your home folder becomes `~`; the project's repo, the run's source folder and any git worktree become `<repo>`; Tapocalypse's data folder becomes `<data>`; temp folders become `<tmp>`.
+- **Paths:** your home folder becomes `~`, other people's (`/Users/<name>`, `/home/<name>`) `~other`; the project's repo, the run's source folder and any git worktree become `<repo>`; Tapocalypse's data folder becomes `<data>`; temp folders become `<tmp>`.
+- **Your account name:** command output such as `ls -l` or `lsof` prints it; as a whole word it becomes `<user>`. Email addresses keep it, and generic accounts (`root`, `runner`, `ubuntu`, …) and names shorter than 3 characters are left alone.
 - **Secret shapes:** `Bearer …` tokens, JWTs, `sk-…`, `sk-ant-…`, `ghp_…` and other GitHub tokens, `AKIA…` AWS keys, `AIza…` Google keys, Slack `xox…` tokens, private-key blocks, and JSON fields named `token`, `secret`, `password`, `authorization` or `api_key`, become `«redacted:<kind>»`.
 
 Pattern redaction is a backstop, not a guarantee: an agent could write a secret in a shape that is not on the list into a check note or the report. Look at `hub pack` output for a run you are unsure about, and keep the hub's viewers to people who may see your QA evidence.
