@@ -92,13 +92,26 @@ export const SANITIZE_OPTIONS: sanitizeHtml.IOptions = {
   exclusiveFilter: (frame) => frame.tag === "input" && frame.attribs.type !== "checkbox",
 };
 
+/**
+ * `fs.realpathSync`, except that a regular file is resolved through its directory. A file with several hard links (the hub
+ * stores every artefact as a link of its content-addressed blob) has no single path, and macOS answers a realpath of it with
+ * any of its links, so the answer could name another run's file or the blob. A symlink is followed to its target the same way.
+ */
+function realpathOf(p: string, hops = 0): string {
+  const st = fs.lstatSync(p);
+  if (st.isDirectory()) return fs.realpathSync(p);
+  if (!st.isSymbolicLink()) return path.join(fs.realpathSync(path.dirname(p)), path.basename(p));
+  if (hops >= 40) throw Object.assign(new Error(`ELOOP: too many symbolic links, ${p}`), { code: "ELOOP" });
+  return realpathOf(path.resolve(fs.realpathSync(path.dirname(p)), fs.readlinkSync(p)), hops + 1);
+}
+
 /** Realpath of the deepest existing ancestor of `p`, with the non-existent remainder re-appended. */
 export function realpathLoose(p: string): string {
   const rest: string[] = [];
   let cur = p;
   for (;;) {
     try {
-      return path.join(fs.realpathSync(cur), ...rest.reverse());
+      return path.join(realpathOf(cur), ...rest.reverse());
     } catch {
       const parent = path.dirname(cur);
       if (parent === cur) return p;

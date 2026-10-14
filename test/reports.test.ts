@@ -99,6 +99,25 @@ describe("resolveUnder", () => {
     expect(resolveUnder(root, "qa/link/secret.txt")).toBeNull();
     expect(resolveUnder(root, "qa/link")).toBeNull();
   });
+
+  test("a file with several hard links stays at the path asked for, whichever link the OS names", () => {
+    // The hub stores uploaded artefacts as hard links of one blob: macOS answers a realpath of such a file with any of its links.
+    const dir = path.join(tmp, "hard");
+    fs.mkdirSync(path.join(dir, "run"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "blob"), "blob");
+    for (let i = 0; i < 100; i++) fs.linkSync(path.join(dir, "blob"), path.join(dir, "run", `r${i}.md`));
+    for (let i = 0; i < 100; i++) expect(resolveUnder(path.join(dir, "run"), `r${i}.md`)).toBe(path.join(dir, "run", `r${i}.md`));
+  });
+
+  test("a symlink to a file is judged by its target", () => {
+    const dir = path.join(tmp, "links");
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, "inside.png"), "png");
+    fs.symlinkSync(path.join(outside, "secret.txt"), path.join(dir, "to-outside.txt"));
+    fs.symlinkSync(path.join(dir, "inside.png"), path.join(dir, "to-inside.png"));
+    expect(resolveUnder(dir, "to-outside.txt")).toBeNull();
+    expect(resolveUnder(dir, "to-inside.png")).toBe(path.join(dir, "inside.png"));
+  });
 });
 
 describe("extractVerdict", () => {
