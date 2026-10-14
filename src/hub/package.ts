@@ -149,6 +149,7 @@ export async function packageRun(run: Run, project: Project, opts: PackageOption
   const [worktrees] = await Promise.all([git ? worktreePaths(project.repoPath, git) : Promise.resolve([])]);
   const redact = createRedactor({
     home: os.homedir(),
+    user: os.userInfo().username,
     repos: [project.repoPath, run.source?.path, ...worktrees].filter((p): p is string => Boolean(p)).flatMap(withRealpath),
     dataDir: DATA_DIR,
     tmpDirs: [...withRealpath(os.tmpdir()), "/tmp", "/private/tmp"],

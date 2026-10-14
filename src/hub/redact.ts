@@ -10,6 +10,8 @@ export interface RedactContext {
   dataDir?: string;
   /** Temp dirs; become `<tmp>` (macOS per-user `/var/folders/…` temp dirs always do). */
   tmpDirs?: string[];
+  /** The local account name (`ls -l` and `lsof` print it); becomes `<user>`. Generic accounts and names under 3 chars are kept. */
+  user?: string;
 }
 
 export interface Redactor {
@@ -37,6 +39,16 @@ const MAC_TEMP = new RegExp(
 );
 /** Somebody else's home directory (`/Users/<name>`, `/home/<name>`): the user is a stranger to the hub's viewers. */
 const OTHER_HOME = new RegExp(`${PATH_CHAR_BEFORE}${SEP}(?:Users|home)${SEP}[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*`, "g");
+/** Shared service accounts: not personal, and replacing them would mangle ordinary words ("root cause", "test runner"). */
+const GENERIC_ACCOUNTS: Record<string, true> = Object.fromEntries(
+  ["root", "admin", "administrator", "user", "runner", "ubuntu", "debian", "ec2-user", "vagrant", "docker", "bun", "node", "app", "ci", "build", "jenkins", "github", "gitlab-runner"].map((name) => [name, true]),
+);
+
+/** The account name as a whole word: not part of a longer name, a path segment, or the local part of an email address. */
+function accountName(user: string | undefined): RegExp | null {
+  if (!user || user.length < 3 || GENERIC_ACCOUNTS[user.toLowerCase()]) return null;
+  return new RegExp(`(?<![A-Za-z0-9_.@/-])${escapeRegExp(user)}(?![A-Za-z0-9_@-])`, "g");
+}
 
 /** Words that make a name a secret's name: `token`, `API_TOKEN`, `x-api-key`, `client_secret`, `DB_PASSWORD`, `Authorization`. */
 const SECRET_WORDS = "token|secret|password|passwd|authorization|api[_-]?key|access[_-]?key|private[_-]?key|credentials?";
@@ -92,6 +104,7 @@ export function createRedactor(ctx: RedactContext): Redactor {
   const prefixRe = prefixes.length
     ? new RegExp(`${PATH_CHAR_BEFORE}(?:${prefixes.map((p) => pathSource(p.dir)).join("|")})${PATH_CHAR_AFTER}`, "g")
     : null;
+  const userRe = accountName(ctx.user);
 
   function text(input: string): string {
     let s = input;
@@ -105,6 +118,7 @@ export function createRedactor(ctx: RedactContext): Redactor {
     }
     s = s.replace(MAC_TEMP, () => (count("tmp"), "<tmp>"));
     s = s.replace(OTHER_HOME, () => (count("home-other"), "~other"));
+    if (userRe) s = s.replace(userRe, () => (count("user"), "<user>"));
     for (const [kind, re, keep] of SECRET_PATTERNS) {
       s = s.replace(re, (_whole, g1: string, g2: string) => {
         count(kind);

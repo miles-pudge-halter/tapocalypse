@@ -59,6 +59,29 @@ describe("path redaction", () => {
   });
 });
 
+describe("account name", () => {
+  test("the local account name in command output becomes <user>, as a whole word only", () => {
+    const r = createRedactor({ ...ctx, user: "jdoe42" });
+    const ls = "drwxr-xr-x@   3 jdoe42  wheel     96 Oct 14 15:57 .";
+    const lsof = "devicekit 47687 jdoe42    5u  IPv4 0x7d19      0t0  TCP *:8100 (LISTEN)";
+    expect(r.text(ls)).toBe("drwxr-xr-x@   3 <user>  wheel     96 Oct 14 15:57 .");
+    expect(r.text(lsof)).toBe("devicekit 47687 <user>    5u  IPv4 0x7d19      0t0  TCP *:8100 (LISTEN)");
+    expect(r.text("jdoe42x and xjdoe42 and jdoe42_build stay")).toBe("jdoe42x and xjdoe42 and jdoe42_build stay");
+    expect(r.replaced.user).toBe(2);
+  });
+
+  test("an email address keeps its local part, and the home path still becomes ~", () => {
+    const r = createRedactor({ ...ctx, home: "/Users/jdoe42", user: "jdoe42" });
+    expect(r.text("mail jdoe42@example.com about /Users/jdoe42/notes.md")).toBe("mail jdoe42@example.com about ~/notes.md");
+  });
+
+  test("generic system accounts and very short names are not treated as personal", () => {
+    expect(createRedactor({ ...ctx, user: "root" }).text("the root cause, owned by root")).toBe("the root cause, owned by root");
+    expect(createRedactor({ ...ctx, user: "runner" }).text("test runner")).toBe("test runner");
+    expect(createRedactor({ ...ctx, user: "jo" }).text("jo said hi")).toBe("jo said hi");
+  });
+});
+
 describe("secret patterns", () => {
   test("each kind is replaced and counted, tokens vanish from the output", () => {
     const input = [
