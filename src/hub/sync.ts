@@ -1,5 +1,6 @@
 // The laptop's team-hub sync worker (research §3.5): finished runs of projects with `share: true` are packaged, their blobs
-// and then the run document are uploaded to the hub, one run at a time, from a persisted outbox.
+// and then the run document are uploaded to the hub, one run at a time, from a persisted outbox. Runs still in progress are
+// sent to the hub as live progress (contract 13): throttled, best effort, never through the outbox.
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -10,14 +11,16 @@ import { getRun, listRuns, type RunChange, subscribeRuns } from "../runs/store";
 import type { Run } from "../runs/types";
 import { hubCredentialsPath, hubPaths, readHubConfig, type ResolvedHubCredentials, resolveHubCredentials } from "./credentials";
 import { derivedHubKey, hubKeyFor } from "./identity";
-import { packageRun, type PackagedRun } from "./package";
-import { type BlobTypeT, BlobCheckResult, HUB_PROTOCOL, HubInfo, RunState, RunUploadResult, Sha256 } from "./protocol";
+import { packageLive, packageRun, type PackagedRun } from "./package";
+import { type BlobTypeT, BlobCheckResult, HUB_PROTOCOL, HubInfo, LIVE_HEARTBEAT_MS, type LiveRunBodyT, LiveRunResult, RunState, RunUploadResult, Sha256 } from "./protocol";
 
 export interface HubSettings {
   url: string;
   screenshots: "webp" | "original";
   /** Static request headers from the config (the credentials file and environment add to them). */
   headers: Record<string, string>;
+  /** `share.hub.live`: send progress of runs in progress. Unset means on. */
+  live?: boolean;
 }
 
 export interface HubSyncOptions {
@@ -28,6 +31,7 @@ export interface HubSyncOptions {
   fetch: (req: Request) => Promise<Response>;
   getProject: (id: string) => Project | undefined;
   packageRun: (run: Run, project: Project, opts: { screenshots: "webp" | "original" }) => Promise<PackagedRun>;
+  packageLive: (run: Run, project: Project) => Promise<LiveRunBodyT>;
   getRun: (id: string) => Run | null;
   /** Every stored run, newest first. */
   listRuns: () => Run[];
@@ -37,6 +41,12 @@ export interface HubSyncOptions {
   debounceMs: number;
   /** While paused the worker looks again this often for changed credentials (a `hub login` run from the CLI). */
   pausePollMs: number;
+  /** Live progress: at most one request per run in this interval; changes in between go out together when it ends. */
+  liveThrottleMs: number;
+  /** While a run is in progress its latest state is resent this often, so the hub keeps it alive. */
+  liveHeartbeatMs: number;
+  /** Starts a timer (unref'd) and returns its canceller; a test seam. */
+  liveTimers: (fn: () => void, ms: number) => () => void;
 }
 
 const TERMINAL: readonly Run["status"][] = ["done", "error", "cancelled", "interrupted"];
@@ -123,18 +133,26 @@ function defaultOptions(): HubSyncOptions {
     stateFile: path.join(DATA_DIR, "hub-outbox.json"),
     settings: () => {
       const hub = activeHubConfig();
-      return hub ? { url: hub.url, screenshots: hub.screenshots ?? "webp", headers: hub.headers ?? {} } : null;
+      return hub ? { url: hub.url, screenshots: hub.screenshots ?? "webp", headers: hub.headers ?? {}, live: hub.live } : null;
     },
     credentials: () => resolveHubCredentials({ configHeaders: activeHubConfig()?.headers }),
     fetch: (req) => fetch(req),
     getProject,
     packageRun,
+    packageLive,
     getRun,
     listRuns,
     subscribe: subscribeRuns,
     now: () => Date.now(),
     debounceMs: 5000,
     pausePollMs: 30_000,
+    liveThrottleMs: 3000,
+    liveHeartbeatMs: LIVE_HEARTBEAT_MS,
+    liveTimers: (fn, ms) => {
+      const timer = setTimeout(fn, ms);
+      timer.unref();
+      return () => clearTimeout(timer);
+    },
   };
 }
 
@@ -268,6 +286,20 @@ const BACKOFF_BASE_MS = 30_000;
 const BACKOFF_CAP_MS = 3_600_000;
 const backoffMs = (attempts: number): number => Math.min(BACKOFF_BASE_MS * 2 ** (attempts - 1), BACKOFF_CAP_MS);
 
+/** What the worker keeps of a run in progress it sends live. */
+interface LiveRunState {
+  /** The latest save: what the next request carries. */
+  run: Run;
+  /** Armed after each request for the throttle interval; saves arriving meanwhile only mark the run dirty. */
+  cancelCooldown: (() => void) | null;
+  /** Armed after each request: when it fires with no save in between, the latest state is sent again. */
+  cancelHeartbeat: (() => void) | null;
+  dirty: boolean;
+  sending: boolean;
+  /** The hub holds the finished run or another machine owns the id: nothing more for this run. */
+  stopped: boolean;
+}
+
 export class HubSyncWorker {
   private readonly opts: HubSyncOptions;
   private state: OutboxState;
@@ -284,6 +316,11 @@ export class HubSyncWorker {
   private readonly idleWaiters: (() => void)[] = [];
   private readonly listeners = new Set<(runId: string | null) => void>();
   private backfill: { ids: Set<string>; total: number; done: number } | null = null;
+  /** Runs in progress being sent live, by id. */
+  private readonly live = new Map<string, LiveRunState>();
+  private liveInFlight = 0;
+  /** The credentials digest at the hub's 404 for the live route: no live progress for that connection until it changes. */
+  private liveOff: string | null = null;
   private connection: HubConnection = { state: "unknown", machine: null, hubVersion: null, minProtocol: null, checkedAt: null, detail: null };
 
   constructor(opts: Partial<HubSyncOptions> = {}) {
@@ -424,6 +461,7 @@ export class HubSyncWorker {
   }
 
   async stop(): Promise<void> {
+    this.liveStopAll();
     this.unsubscribe?.();
     this.unsubscribe = null;
     // A save still waiting out its debounce is queued now (not uploaded: the process is going away), so the next start sends it.
@@ -464,7 +502,12 @@ export class HubSyncWorker {
   }
 
   private onSaved(run: Run): void {
-    if (!isTerminal(run.status) || !this.opts.getProject(run.projectId)?.share || !this.opts.settings()) return;
+    if (!isTerminal(run.status)) {
+      this.liveSaved(run);
+      return;
+    }
+    this.liveStop(run.id);
+    if (!this.opts.getProject(run.projectId)?.share || !this.opts.settings()) return;
     const pending = this.debounce.get(run.id);
     if (pending) clearTimeout(pending);
     this.debounce.set(
@@ -479,6 +522,7 @@ export class HubSyncWorker {
 
   /** A run deleted locally leaves the outbox; the hub copy is untouched (the hub is the team record). */
   forget(runId: string): void {
+    this.liveStop(runId);
     const timer = this.debounce.get(runId);
     if (timer) clearTimeout(timer);
     this.debounce.delete(runId);
@@ -502,17 +546,120 @@ export class HubSyncWorker {
     this.retryTimer.unref();
   }
 
-  /** Resolves once no debounce is pending and no upload pass is running (retries waiting on a backoff do not count). */
+  /** Resolves once no debounce is pending, no upload pass is running and no live request is in flight (retries waiting on a backoff do not count). */
   idle(): Promise<void> {
-    if (this.debounce.size === 0 && !this.draining) return Promise.resolve();
+    if (this.debounce.size === 0 && !this.draining && this.liveInFlight === 0) return Promise.resolve();
     const { promise, resolve } = Promise.withResolvers<void>();
     this.idleWaiters.push(resolve);
     return promise;
   }
 
   private settle(): void {
-    if (this.debounce.size > 0 || this.draining) return;
+    if (this.debounce.size > 0 || this.draining || this.liveInFlight > 0) return;
     for (const resolve of this.idleWaiters.splice(0)) resolve();
+  }
+
+  // -------------------------------------------------------------------------------------------------------------
+  // Live progress: the state of runs in progress, sent best effort (never queued, never retried but by the next
+  // change or heartbeat). It shares the connection, the pause and the credentials with uploads and nothing else.
+
+  /** A save of a run in progress: send it now, or when the throttle interval of its last request ends. */
+  private liveSaved(run: Run): void {
+    const settings = this.opts.settings();
+    if (!settings || settings.live === false || !this.opts.getProject(run.projectId)?.share) {
+      this.liveStop(run.id);
+      return;
+    }
+    let state = this.live.get(run.id);
+    if (!state) {
+      state = { run, cancelCooldown: null, cancelHeartbeat: null, dirty: false, sending: false, stopped: false };
+      this.live.set(run.id, state);
+    }
+    state.run = run;
+    if (state.stopped) return;
+    if (state.cancelCooldown || state.sending) state.dirty = true;
+    else this.liveSend(state);
+  }
+
+  /** Sends the run's latest state if one is waiting and the last request is done and its interval over. */
+  private livePump(state: LiveRunState): void {
+    if (state.dirty && !state.sending && !state.cancelCooldown && !state.stopped && this.live.get(state.run.id) === state) this.liveSend(state);
+  }
+
+  private liveSend(state: LiveRunState): void {
+    state.dirty = false;
+    state.sending = true;
+    state.cancelCooldown?.();
+    state.cancelHeartbeat?.();
+    state.cancelCooldown = this.opts.liveTimers(() => {
+      state.cancelCooldown = null;
+      this.livePump(state);
+    }, this.opts.liveThrottleMs);
+    state.cancelHeartbeat = this.opts.liveTimers(() => {
+      state.cancelHeartbeat = null;
+      state.dirty = true;
+      this.livePump(state);
+    }, this.opts.liveHeartbeatMs);
+    this.liveInFlight++;
+    void this.liveRequest(state).finally(() => {
+      state.sending = false;
+      this.liveInFlight--;
+      this.livePump(state);
+      this.settle();
+    });
+  }
+
+  /** Whether live progress may go out now: uploads not paused (a fixed cause lifts the pause here too) and the hub has not refused live progress for the connection in force. */
+  private liveReady(): boolean {
+    this.resumeIfFixed();
+    if (this.state.paused) return false;
+    if (this.liveOff === null) return true;
+    if (this.liveOff === this.fingerprint()) return false;
+    this.liveOff = null;
+    return true;
+  }
+
+  /**
+   * One live request. Never rejects and never pauses uploads: an access proxy may let uploads through and not the live route,
+   * so a 401, a login page, a 426 or a 404 only turn live off until the settings or credentials change (uploads find a real
+   * token, proxy or protocol problem themselves). 409, `final` and 413 end that run's live progress; anything else waits for the next send.
+   */
+  private async liveRequest(state: LiveRunState): Promise<void> {
+    const { run } = state;
+    try {
+      const project = this.opts.getProject(run.projectId);
+      const settings = this.opts.settings();
+      if (!project?.share || !settings || settings.live === false || !this.liveReady()) return;
+      const { call, host } = this.connect();
+      const body = await this.opts.packageLive(run, project);
+      const res = await call(`/api/hub/v1/runs/${run.id}/live`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      if (this.live.get(run.id) !== state) return; // finished, deleted or the worker stopped meanwhile
+      if (res.status === 404) {
+        this.liveOff = this.fingerprint();
+        return;
+      }
+      if (res.status === 409 || res.status === 413) {
+        state.stopped = true;
+        return;
+      }
+      if (!res.ok) throw await failureOf(res, host);
+      const result = LiveRunResult.safeParse(await res.json().catch(() => null));
+      if (result.success && result.data.status === "final") state.stopped = true;
+    } catch (e) {
+      if (this.live.get(run.id) !== state || !(e instanceof HubCallError)) return;
+      if (e.code === "unauthorized" || e.code === "proxy_login" || e.code === "protocol_unsupported") this.liveOff = this.fingerprint();
+    }
+  }
+
+  private liveStop(runId: string): void {
+    const state = this.live.get(runId);
+    state?.cancelCooldown?.();
+    state?.cancelHeartbeat?.();
+    this.live.delete(runId);
+  }
+
+  private liveStopAll(): void {
+    for (const runId of [...this.live.keys()]) this.liveStop(runId);
   }
 
   /** Queue state for the status route, the CLI and the doctor. */

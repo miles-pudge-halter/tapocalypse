@@ -20,6 +20,7 @@ Use it when more than one person runs QA and somebody else (a PM, a lead, a clie
 - [Connect a laptop](#connect-a-laptop)
   - [What is uploaded, and what never is](#what-is-uploaded-and-what-never-is)
   - [Projects that merge across machines](#projects-that-merge-across-machines)
+  - [Live progress](#live-progress)
 - [What stakeholders see](#what-stakeholders-see)
 - [Retention](#retention)
 - [Backups](#backups)
@@ -143,6 +144,7 @@ The upload routes are exactly these (nothing else under `/api/hub/v1/` has to be
 | `POST /api/hub/v1/blobs/check` | Which files does the hub still need |
 | `PUT /api/hub/v1/blobs/<sha256>` | Upload one screenshot, report or activity file |
 | `PUT /api/hub/v1/runs/<id>` | Upload (or update) a run |
+| `PUT /api/hub/v1/runs/<id>/live` | Progress of a run still in progress (memory only, see [Live progress](#live-progress)) |
 | `GET /api/hub/v1/runs/<id>/state` | `hub push --verify` after a restore |
 | `DELETE /api/hub/v1/runs/<id>` | Remove a run the machine uploaded (`hub unpublish`) |
 
@@ -151,7 +153,7 @@ The upload routes are exactly these (nothing else under `/api/hub/v1/` has to be
 The allowlist used in the recipes is one anchored regular expression on the path (it does not constrain the method; the hub itself only accepts the methods in the table):
 
 ```text
-^/api/hub/v1/(info|blobs/check|blobs/[0-9a-f]{64}|runs/[A-Za-z0-9-]+(/state)?)$
+^/api/hub/v1/(info|blobs/check|blobs/[0-9a-f]{64}|runs/[A-Za-z0-9-]+(/state|/live)?)$
 ```
 
 Keep it anchored and narrow. Do not widen it to `^/api/hub/v1/.*`: that would also let anonymous callers read `GET /api/hub/v1/machines`.
@@ -168,7 +170,7 @@ server {
   client_body_timeout 60s;
 
   # Machines: no login, the hub checks the upload token. Quote the expression: nginx reads an unquoted "{" as the start of a block.
-  location ~ "^/api/hub/v1/(info|blobs/check|blobs/[0-9a-f]{64}|runs/[A-Za-z0-9-]+(/state)?)$" {
+  location ~ "^/api/hub/v1/(info|blobs/check|blobs/[0-9a-f]{64}|runs/[A-Za-z0-9-]+(/state|/live)?)$" {
     proxy_pass http://hub:4310;
     proxy_set_header Host $http_host;
     proxy_set_header X-Forwarded-Email "";  # an empty value drops the header: a machine cannot claim to be a person
@@ -261,7 +263,7 @@ services:
       OAUTH2_PROXY_TRUSTED_PROXY_IPS: 172.16.0.0/12         # … so trust ONLY that proxy's address (your Docker network). Never leave it unset
       # Machines: the upload routes skip the login and are protected by the upload token.
       # Comma-separated list, so the regex must not contain a comma.
-      OAUTH2_PROXY_SKIP_AUTH_ROUTES: "^/api/hub/v1/(info|blobs/check|blobs/[0-9a-f]{64}|runs/[A-Za-z0-9-]+(/state)?)$"
+      OAUTH2_PROXY_SKIP_AUTH_ROUTES: "^/api/hub/v1/(info|blobs/check|blobs/[0-9a-f]{64}|runs/[A-Za-z0-9-]+(/state|/live)?)$"
 volumes: { hub-data: {} }
 ```
 
@@ -303,7 +305,7 @@ server {
 
   # Machines: no login, the hub checks the upload token (Authorization is passed through unchanged).
   # Quote the expression: nginx reads an unquoted "{" as the start of a block.
-  location ~ "^/api/hub/v1/(info|blobs/check|blobs/[0-9a-f]{64}|runs/[A-Za-z0-9-]+(/state)?)$" {
+  location ~ "^/api/hub/v1/(info|blobs/check|blobs/[0-9a-f]{64}|runs/[A-Za-z0-9-]+(/state|/live)?)$" {
     proxy_pass http://hub:4310;
     proxy_set_header Host $host;
     proxy_set_header X-Auth-Request-Email "";          # an empty value drops the header: never trust a client-supplied identity here
@@ -481,6 +483,17 @@ Two teammates call the same app `app` and `acme-shop`. The hub merges them by a 
 - **The default branch** (used for baselines) follows the same stability rule: an explicitly set default branch beats one a laptop merely detected, and between equals the machine with the newest run decides, so backfilling an old run never changes it.
 
 Regression identity is **recomputed on the hub** across everybody's runs: a machine's own check keys travel with the run but are only used to translate its manual links and `was` hints. Backfilled runs that are older than ones already on the hub trigger a debounced re-key of the project (oldest first). After an upgrade that changes the key rules, force it with `hub rekey [--project <id>]`. Laptops keep their own local keys; compare and history on a laptop stay "my runs".
+
+### Live progress
+
+While a run of a shared project is still going on a laptop, the hub shows it to viewers: the run appears in the run lists and on the project overview's **Running now** list, and its page reads **Live from `<machine>`** with the checks ticking over as the agent reports them (status, notes, pass/fail counts), then the verdict when the run ends.
+
+- **What is never sent live:** the device screen, the activity feed, screenshots and the report. The run page says so ("The screen, activity and screenshots arrive when the run finishes."); the finished upload brings all of it, exactly as before. The run document sent live goes through the same field selection and redaction as the finished upload.
+- **Memory only.** The hub keeps live runs in memory, never in the run store, so they do not touch stats, the overview, releases, regression history, machines, project run counts or retention, and a hub restart forgets them (the laptop's next change or heartbeat, at most a minute later, brings them back). When the finished run arrives it replaces the live one without a reload.
+- **Stale and expired.** A laptop sends on every change (at most one request per 3 seconds per run) and a heartbeat every minute. After **3 minutes** without an update the run page shows an amber *No update from `<machine>` for N min* (the laptop is asleep or offline); after **30 minutes** the hub drops the run. A run that was cancelled or whose laptop never came back therefore disappears on its own; the finished upload, if it ever happens, still arrives.
+- **Access:** live updates use the machine's upload token like any upload, with their own rate limit (240 a minute per token, apart from the run and file limits). The proxy must let machines through on `/api/hub/v1/runs/<id>/live`: the allowlist expression in [Put an access proxy in front](#put-an-access-proxy-in-front) and every recipe already contain it (a proxy set up before live progress needs `|/live` added after `/state`). **A live failure never stops uploads:** when a live update is refused (a hub without the route answers 404, a proxy that does not let `/live` through answers with its login page, or 401 or 426), the laptop stops sending live progress until its hub settings or token change, and keeps uploading finished runs. A run whose live document is too large (`413`) is not sent live; the brief is shortened to 4,000 characters and each note to 2,000 in live updates only.
+- **Limits:** at most 32 runs live per machine and 512 per hub at once. A new run past that is refused (`429 too_many_live_runs`) and simply appears when it finishes; runs already live keep updating.
+- **Turn it off on a laptop:** set `share.hub.live: false` in the [config file](configuration.md#team-hub-sharing). Finished runs still upload; nothing is sent while a run is going. Live progress is also never sent for a project that does not share.
 
 ## What stakeholders see
 

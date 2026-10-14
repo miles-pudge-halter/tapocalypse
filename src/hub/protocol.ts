@@ -95,6 +95,36 @@ export const RunUploadResult = z.object({
 export const RunState = z.object({ contentHash: Sha256, machine: z.string() });
 // DELETE /api/hub/v1/runs/:id → 204 (owning machine or admin token)
 
+// PUT /api/hub/v1/runs/:id/live (application/json, <= LIVE_MAX_BYTES): progress of a run still in progress on the laptop.
+// No blobs (no screenshots, activity or report). The hub keeps it in memory only: it never enters the run store, so
+// regressions, stats, overview, releases and retention never see it. The finished upload (PUT /runs/:id) replaces it;
+// LIVE_EXPIRE_MS without an update drops it. The laptop sends on every change (throttled) and every LIVE_HEARTBEAT_MS.
+export const LIVE_HEARTBEAT_MS = 60_000;
+/** No update for this long: viewers see "no update from <machine> for N min". */
+export const LIVE_STALE_MS = 3 * 60_000;
+/** No update for this long: the hub forgets the live run. */
+export const LIVE_EXPIRE_MS = 30 * 60_000;
+export const LIVE_MAX_BYTES = 256 * 1024;
+/** Same run fields as an upload (redacted the same way, check screenshots removed), but only in-progress statuses. */
+export const LiveRun = UploadedRun.extend({ status: z.enum(["queued", "preflight", "running", "finishing"]) });
+export const LiveRunBody = z.object({
+  protocol: z.number().int(),
+  clientVersion: z.string().max(40),
+  sentAt: z.string().datetime(),
+  project: HubProjectMeta,
+  run: LiveRun,
+  redaction: z.object({ replaced: z.record(z.string(), z.number().int()) }),
+});
+/**
+ * `live`: stored (or refreshed) in memory. `final`: the hub already has the finished run, so the update was ignored and the
+ * laptop stops sending live progress for it.
+ */
+export const LiveRunResult = z.object({ runId: RunId, status: z.enum(["live", "final"]), url: z.string() });
+// Errors: 401 · 409 {code:"id_conflict"} (another machine owns the id, live or stored) · 413 · 415 · 422 {code:"invalid_run"}
+// (bad body, or a status that is not in progress) · 426 {code:"protocol_unsupported"} · 429 rate_limited ·
+// 429 {code:"too_many_live_runs"} (a new id while the machine already has 32 live runs, or the hub 512).
+// A hub without this route answers 404: the laptop then stops sending live progress to it and uploads finished runs as before.
+
 export type HubInfoT = z.infer<typeof HubInfo>;
 export type BlobRefT = z.infer<typeof BlobRef>;
 export type BlobTypeT = z.infer<typeof BlobType>;
@@ -103,6 +133,8 @@ export type UploadedRunT = z.infer<typeof UploadedRun>;
 export type RunUploadBodyT = z.infer<typeof RunUploadBody>;
 export type RunUploadResultT = z.infer<typeof RunUploadResult>;
 export type RunStateT = z.infer<typeof RunState>;
+export type LiveRunBodyT = z.infer<typeof LiveRunBody>;
+export type LiveRunResultT = z.infer<typeof LiveRunResult>;
 
 /** JSON with object keys sorted at every level, so equal documents serialise to equal bytes. */
 function canonicalJson(value: unknown): string {

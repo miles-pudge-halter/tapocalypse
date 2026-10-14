@@ -69,7 +69,7 @@ function rig(over: Partial<HubSyncOptions> = {}): Rig {
   const stateFile = path.join(dir, "hub-outbox.json");
   const options: Partial<HubSyncOptions> = {
     stateFile,
-    settings: () => ({ url: "https://hub.example.com", screenshots: "webp", headers: {} }),
+    settings: () => ({ url: "https://hub.example.com", screenshots: "webp", headers: {}, live: false }),
     credentials: () => ({ ok: true, token: creds.token, tokenSource: "file", tokenHint: creds.token.slice(-4), headers: {}, headersSource: null }),
     fetch: (req) => hub.fetch(req),
     getProject: (id) => (id === projectId ? ({ id, name: "Acme Shop", repoPath: dir, personaFile: null, defaultPackage: "com.example.app", defaultPlatform: "android", share: share.on } satisfies Project) : undefined),

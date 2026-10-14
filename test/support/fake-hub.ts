@@ -1,7 +1,18 @@
 // An in-process stand-in for a hub's ingest API (research §3.4), strict enough to catch a client that sends a malformed
 // document: bodies are parsed with the real protocol schemas. Used by the laptop sync tests.
 import { createHash } from "node:crypto";
-import { BlobCheckBody, HUB_PROTOCOL, RunUploadBody, type RunUploadBodyT } from "../../src/hub/protocol";
+import { BlobCheckBody, HUB_PROTOCOL, LiveRunBody, type LiveRunBodyT, RunUploadBody, type RunUploadBodyT } from "../../src/hub/protocol";
+
+/** What `PUT …/runs/:id/live` answers: 200 live, 200 final (the hub already holds the finished run), 409 id_conflict, 404 (a hub without the route), 401, a proxy login page or 426 on this route only, 413. */
+export type LiveAnswer = "live" | "final" | "conflict" | "not_found" | "unauthorized" | "proxy_login" | "protocol_unsupported" | "too_large";
+
+export interface LiveRequestLog {
+  runId: string;
+  body: LiveRunBodyT;
+  /** The raw request body: what the laptop put on the wire. */
+  raw: string;
+  contentType: string | null;
+}
 
 export interface HubRequestLog {
   method: string;
@@ -34,7 +45,15 @@ export interface FakeHub {
   forgetBlobsOnce: boolean;
   /** `retentionDays` of GET /info: runs older than this are deleted by the hub; null keeps everything. */
   retentionDays: number | null;
+  /** Every live PUT the hub received, parsed with the real `LiveRunBody` schema. */
+  liveRequests: LiveRequestLog[];
+  /** The answer to live PUTs, unless `liveAnswers` names the run. */
+  liveAnswer: LiveAnswer;
+  liveAnswers: Map<string, LiveAnswer>;
+  /** The PUTs of run documents (not live progress, not blobs). */
   puts(): HubRequestLog[];
+  /** The live PUTs. */
+  livePuts(): HubRequestLog[];
 }
 
 export function createFakeHub(token: string): FakeHub {
@@ -49,7 +68,11 @@ export function createFakeHub(token: string): FakeHub {
     proxyLogin: false,
     forgetBlobsOnce: false,
     retentionDays: null,
-    puts: () => hub.log.filter((l) => l.method === "PUT" && l.path.startsWith("/api/hub/v1/runs/")),
+    liveRequests: [],
+    liveAnswer: "live",
+    liveAnswers: new Map(),
+    puts: () => hub.log.filter((l) => l.method === "PUT" && l.path.startsWith("/api/hub/v1/runs/") && !l.path.endsWith("/live")),
+    livePuts: () => hub.log.filter((l) => l.method === "PUT" && l.path.endsWith("/live")),
     async fetch(req: Request): Promise<Response> {
       if (hub.down) throw new TypeError("Unable to connect. Is the computer able to access the url?");
       const url = new URL(req.url);
@@ -82,6 +105,23 @@ export function createFakeHub(token: string): FakeHub {
         hub.blobs.set(blob[1], { type: req.headers.get("content-type") ?? "", bytes });
         hub.log[hub.log.length - 1].detail = blob[1];
         return new Response(null, { status: existed ? 200 : 201 });
+      }
+      const live = /^\/api\/hub\/v1\/runs\/([A-Za-z0-9-]+)\/live$/.exec(url.pathname);
+      if (live && req.method === "PUT") {
+        const answer = hub.liveAnswers.get(live[1]) ?? hub.liveAnswer;
+        if (answer === "not_found") return json({ error: "not found" }, 404);
+        if (answer === "unauthorized") return json({ error: "unauthorized" }, 401);
+        if (answer === "proxy_login") return new Response("<html>Sign in</html>", { status: 302, headers: { location: "https://login.example.com/", "content-type": "text/html" } });
+        if (answer === "protocol_unsupported") return json({ code: "protocol_unsupported", minProtocol: 99 }, 426);
+        if (!req.headers.get("content-type")?.startsWith("application/json")) return json({ error: "expected json" }, 415);
+        const raw = req.headers.get("content-encoding") === "gzip" ? new TextDecoder().decode(Bun.gunzipSync(new Uint8Array(await req.arrayBuffer()))) : await req.text();
+        const body = LiveRunBody.parse(JSON.parse(raw));
+        hub.liveRequests.push({ runId: live[1], body, raw, contentType: req.headers.get("content-type") });
+        hub.log[hub.log.length - 1].detail = body.run.id;
+        if (answer === "too_large") return json({ error: "too large" }, 413);
+        if (body.protocol < hub.minProtocol) return json({ code: "protocol_unsupported", minProtocol: hub.minProtocol, protocol: body.protocol }, 426);
+        if (body.run.id !== live[1] || answer === "conflict") return json({ code: "id_conflict" }, 409);
+        return json({ runId: body.run.id, status: answer, url: `/#/runs/${body.run.id}` });
       }
       const run = /^\/api\/hub\/v1\/runs\/([A-Za-z0-9-]+)(\/state)?$/.exec(url.pathname);
       if (run && req.method === "PUT") {

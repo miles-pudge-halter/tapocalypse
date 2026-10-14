@@ -61,6 +61,8 @@ export interface HubAttribution {
   uploader: string | null;
   receivedAt: string;
   localProjectId: string;
+  /** Only on a run still in progress on the uploader (the hub holds it in memory): when its last update arrived. Gone once the finished run uploads. */
+  live?: { lastSeenAt: string };
 }
 
 export type RunView = Omit<Run, "hub"> & {

@@ -341,8 +341,11 @@ export function useLiveConnection(): boolean {
   );
 }
 
-/** Calls `cb` (debounced) with the run payload of every global `run` event, and once after each reconnect. */
-function useRunsChanged(cb: (run: RunView | null) => void, delayMs = 400): void {
+/**
+ * Calls `cb` (debounced) with the run payload of every global `run` event, and once after each reconnect.
+ * `onHubProjects`: on the hub also once per burst of `projects` frames (the hub announces an expired or removed live run that way, with no `run` frame).
+ */
+function useRunsChanged(cb: (run: RunView | null) => void, delayMs = 400, onHubProjects = false): void {
   const ref = useRef(cb);
   ref.current = cb;
   useEffect(() => {
@@ -353,12 +356,14 @@ function useRunsChanged(cb: (run: RunView | null) => void, delayMs = 400): void 
     };
     const offRun = listenEvent("run", (e) => fire(parseRunEvent(e)));
     const offOpen = listenEvent("open", () => fire(null));
+    const offProjects = onHubProjects ? listenEvent("projects", () => isHub() && fire(null)) : null;
     return () => {
       clearTimeout(timer);
       offRun();
       offOpen();
+      offProjects?.();
     };
-  }, [delayMs]);
+  }, [delayMs, onHubProjects]);
 }
 
 // --- generic fetch hook ---
@@ -664,7 +669,7 @@ export function useRuns(filters: RunQuery = {}): {
       );
     }
     void fetchList();
-  });
+  }, 400, true);
 
   // A laptop's upload state changes without a run event: patch the row in place.
   useEffect(
@@ -701,10 +706,12 @@ export function useRuns(filters: RunQuery = {}): {
 interface ActiveRunsState {
   runs: RunView[];
   loading: boolean;
+  /** The last list request failed (the runs shown are the ones from before); cleared by the next success or run event. */
+  error: string | null;
 }
 
 const activeListeners = new Set<() => void>();
-let activeState: ActiveRunsState = { runs: [], loading: true };
+let activeState: ActiveRunsState = { runs: [], loading: true, error: null };
 let activeDebounce: ReturnType<typeof setTimeout> | undefined;
 
 function setActiveState(next: ActiveRunsState): void {
@@ -714,8 +721,8 @@ function setActiveState(next: ActiveRunsState): void {
 
 function refreshActiveRuns(): void {
   api.runs({ status: ACTIVE_STATUSES, limit: PAGE_SIZE }).then(
-    ({ runs }) => setActiveState({ runs, loading: false }),
-    () => setActiveState({ runs: activeState.runs, loading: false }),
+    ({ runs }) => setActiveState({ runs, loading: false, error: null }),
+    (e: unknown) => setActiveState({ runs: activeState.runs, loading: false, error: errorMessage(e) }),
   );
 }
 
@@ -724,7 +731,7 @@ function onActiveRunEvent(e: Event): void {
   if (run) {
     const active = ACTIVE_STATUSES.includes(run.status);
     const others = activeState.runs.filter((r) => r.id !== run.id);
-    setActiveState({ runs: active ? [...others, run] : others, loading: false });
+    setActiveState({ runs: active ? [...others, run] : others, loading: false, error: null });
   }
   clearTimeout(activeDebounce);
   activeDebounce = setTimeout(refreshActiveRuns, 800);
@@ -736,10 +743,17 @@ function startActiveFeed(): () => void {
   refreshActiveRuns();
   const offRun = listenEvent("run", onActiveRunEvent);
   const offOpen = listenEvent("open", refreshActiveRuns);
+  // The hub announces a live run that expired or was removed with a `projects` frame and no `run` frame.
+  const offProjects = listenEvent("projects", () => {
+    if (!isHub()) return;
+    clearTimeout(activeDebounce);
+    activeDebounce = setTimeout(refreshActiveRuns, 800);
+  });
   return () => {
     clearTimeout(activeDebounce);
     offRun();
     offOpen();
+    offProjects();
   };
 }
 
@@ -836,6 +850,8 @@ export function useShareStatus(): { status: ShareStatus | null; loading: boolean
 /** Like `useRunsChanged`, but only for events about `projectId` (and reconnects, which may have missed some). */
 function useProjectRunsChanged(projectId: string, cb: () => void, delayMs = 2000): void {
   useRunsChanged((run) => {
+    // A run still in progress on a laptop is in none of the hub's aggregates: only its finished upload changes them.
+    if (run?.hub?.live) return;
     if (!run || run.projectId === projectId) cb();
   }, delayMs);
 }
@@ -873,7 +889,9 @@ export function useRelease(
 /** Machines that upload to this hub; refetched after uploads and every minute. Hub only (no fetch on a laptop). */
 export function useHubMachines(): { machines: HubMachine[]; loading: boolean; error: string | null; fetchedAt: number | null } {
   const { data, loading, error, fetchedAt, refresh } = useAsync(api.hubMachines, "hub-machines", 60_000, isHub());
-  useRunsChanged(refresh, 2000);
+  useRunsChanged((run) => {
+    if (!run?.hub?.live) refresh();
+  }, 2000);
   return { machines: data ?? [], loading: loading && data === null, error, fetchedAt };
 }
 
@@ -1009,6 +1027,7 @@ export function useNewRun(): { open: boolean; prefill: NewRunPrefill | null; ope
       newRunListeners.add(listener);
       return () => void newRunListeners.delete(listener);
     },
+    () => newRunState,
     () => newRunState,
   );
   return { ...state, openNewRun, close: closeNewRun };
@@ -1412,6 +1431,8 @@ export function useShortcut(keys: string, handler: () => void, deps: DependencyL
 
 const ACTIVITY_CAP = 5000;
 const EARLIER_PAGE = 200;
+/** The newest activity a run's `snapshot` frame carries (src/api.ts `SNAPSHOT_ACTIVITY`). */
+const SNAPSHOT_ACTIVITY = 200;
 
 export function useRunEvents(id: string): {
   run: RunView | null;
@@ -1430,6 +1451,7 @@ export function useRunEvents(id: string): {
   const loadingEarlier = useRef(false);
   const idRef = useRef(id);
   idRef.current = id;
+  const liveRef = useRef(false);
 
   const commit = useCallback((next: Activity[]) => {
     activityRef.current = next;
@@ -1450,11 +1472,28 @@ export function useRunEvents(id: string): {
     });
     source.addEventListener("snapshot", (e) => {
       const snap = parse<{ run: RunView; activity: Activity[]; hasMoreActivity?: boolean }>(e);
+      liveRef.current = Boolean(snap.run.hub?.live);
       setRun(snap.run);
       commit(snap.activity);
       setHasMoreActivity(snap.hasMoreActivity ?? false);
     });
-    source.addEventListener("run", (e) => setRun(parse<RunView>(e)));
+    source.addEventListener("run", (e) => {
+      const next = parse<RunView>(e);
+      const wasLive = liveRef.current;
+      liveRef.current = Boolean(next.hub?.live);
+      setRun(next);
+      // The finished upload replaces the live copy and brings its activity, which no `activity` frame carries: load it.
+      if (wasLive && !liveRef.current) {
+        void api.activity(next.id, null, SNAPSHOT_ACTIVITY).then(
+          (page) => {
+            if (idRef.current !== next.id) return;
+            commit(page.items);
+            setHasMoreActivity(page.hasMore);
+          },
+          (err: unknown) => toast.error(`Could not load the run's activity: ${errorMessage(err)}`),
+        );
+      }
+    });
     source.addEventListener("activity", (e) => {
       const a = parse<Activity>(e);
       const prev = activityRef.current;

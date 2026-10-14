@@ -15,7 +15,8 @@ import {
   poolView,
   startIdleReaper,
 } from "./devices/pool";
-import { gcBlobs, hubEvents } from "./hub/ingest";
+import { expireLive, gcBlobs, hubEvents } from "./hub/ingest";
+import { getLiveRun, listLiveRuns } from "./hub/live";
 import { isHub } from "./hub/mode";
 import { installHubProjects } from "./hub/projects";
 import { type HubSync, hubSyncState, startHubSync } from "./hub/sync";
@@ -78,8 +79,8 @@ export async function poolStateView(): Promise<PoolView> {
   return poolView(scheduler.activeCount(), scheduler.waitingView());
 }
 
-/** Who uploaded a hub copy and when (the run's `hub` origin without the uploader's machine-local keys). */
-export type HubAttribution = Pick<HubOrigin, "machine" | "uploader" | "receivedAt" | "localProjectId">;
+/** Who uploaded a hub copy and when (the run's `hub` origin without the uploader's machine-local keys); `live` only while the run is still in progress on the uploader. */
+export type HubAttribution = Pick<HubOrigin, "machine" | "uploader" | "receivedAt" | "localProjectId" | "live">;
 
 export type RunView = Omit<Run, "hub"> & {
   /** Hub copies only: who uploaded the run; null on laptops and for runs that were never uploaded. */
@@ -112,7 +113,7 @@ export function runView(run: Run): RunView {
   return {
     ...rest,
     // The uploader's own keys stay on the server: the UI needs only who sent it and when.
-    hub: hub ? { machine: hub.machine, uploader: hub.uploader, receivedAt: hub.receivedAt, localProjectId: hub.localProjectId } : null,
+    hub: hub ? { machine: hub.machine, uploader: hub.uploader, receivedAt: hub.receivedAt, localProjectId: hub.localProjectId, ...(hub.live ? { live: hub.live } : {}) } : null,
     queuePosition: scheduler.queuePosition(run.id),
     durationMs: runDurationMs(run),
     queueReason: scheduler.queueReason(run.id),
@@ -125,8 +126,9 @@ export function runView(run: Run): RunView {
   };
 }
 
+/** A run by id: the scheduler's live copy, the stored run, or (hub) a run still in progress on a laptop, in that order. */
 export function findRun(id: string): Run | null {
-  return scheduler.getLive(id) ?? getRun(id);
+  return scheduler.getLive(id) ?? getRun(id) ?? getLiveRun(id) ?? null;
 }
 
 export interface RunQuery {
@@ -172,6 +174,23 @@ function matchesText(run: Run, q: string): boolean {
   return q.split(/\s+/).every((word) => haystack.some((h) => h?.toLowerCase().includes(word)));
 }
 
+/** Stored runs newest first, with the hub's in-progress runs (memory only, see `hub/live.ts`) merged in; a stored run wins over a live entry with its id. */
+function runsNewestFirst(projectId: string | undefined): Run[] {
+  const stored = listRuns({ projectId });
+  const live = listLiveRuns()
+    .filter((r) => (projectId === undefined || r.projectId === projectId) && !getRun(r.id))
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  if (live.length === 0) return stored;
+  const merged: Run[] = [];
+  let s = 0;
+  let l = 0;
+  while (s < stored.length || l < live.length) {
+    const next = l >= live.length || (s < stored.length && stored[s]!.createdAt.localeCompare(live[l]!.createdAt) >= 0) ? stored[s++]! : live[l++]!;
+    merged.push(next);
+  }
+  return merged;
+}
+
 /** Newest-first page of runs matching every given filter; live scheduler state wins over the persisted copy. */
 export function queryRuns(query: RunQuery): { runs: RunView[]; hasMore: boolean } {
   const limit = Math.min(MAX_RUN_LIMIT, Math.max(1, query.limit ?? DEFAULT_RUN_LIMIT));
@@ -180,7 +199,7 @@ export function queryRuns(query: RunQuery): { runs: RunView[]; hasMore: boolean 
   const bySource = Object.values(source).some((v) => v !== undefined);
   const matched: Run[] = [];
   let hasMore = false;
-  for (const stored of listRuns({ projectId: query.project })) {
+  for (const stored of runsNewestFirst(query.project)) {
     if (query.before && stored.createdAt >= query.before) continue;
     const run = scheduler.getLive(stored.id) ?? stored;
     if (query.status?.length && !query.status.includes(run.status)) continue;
@@ -587,6 +606,7 @@ export async function init(): Promise<void> {
 }
 
 const BLOB_GC_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const LIVE_SWEEP_INTERVAL_MS = 60_000;
 
 /**
  * Boot for `TAPOCALYPSE_MODE=hub`. Nothing here touches a device, an agent or a repository: the project registry is the hub's,
@@ -600,4 +620,6 @@ export async function initHub(): Promise<void> {
   startRetention(() => false);
   gcBlobs();
   setInterval(() => gcBlobs(), BLOB_GC_INTERVAL_MS).unref();
+  // Runs still in progress on a laptop live in memory only; one that stopped sending is forgotten after LIVE_EXPIRE_MS.
+  setInterval(() => expireLive(), LIVE_SWEEP_INTERVAL_MS).unref();
 }

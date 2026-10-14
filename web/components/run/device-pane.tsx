@@ -3,6 +3,7 @@ import { Download, ExternalLink, ImageOff, Smartphone, Radio } from "lucide-reac
 
 import { DeviceChrome, TYPE_ICON, deviceAspect } from "@/components/device-frame";
 import { DeviceName } from "@/components/device-name";
+import { LivePendingState } from "@/components/hub/live-status";
 import { EmptyState } from "@/components/empty-state";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -129,6 +130,8 @@ export function DevicePane({
   const platform = device?.platform ?? run.deviceRequest.platform;
   const Icon = TYPE_ICON[device?.deviceType ?? "unknown"];
   const holdCopy = run.status === "queued" && run.queueHold ? queueHoldCopy(run.queueHold, run.deviceRequest) : null;
+  // A run still in progress on a teammate's laptop sends no screen and no screenshots until it finishes.
+  const livePending = run.hub?.live ? run.hub.machine : null;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -194,6 +197,10 @@ export function DevicePane({
             ) : null}
           </div>
         </>
+      ) : livePending ? (
+        <div className="flex flex-1 items-center justify-center p-4">
+          <LivePendingState machine={livePending} />
+        </div>
       ) : still ? (
         <FrameShell device={device} platform={platform} aspect={aspect}>
           <StillImage item={still} onOpen={() => onOpenImage(still)} onAspect={setImgAspect} />

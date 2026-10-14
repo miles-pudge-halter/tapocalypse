@@ -168,6 +168,17 @@ describe("PUT /api/hub/connection", () => {
     expect(JSON.parse(fs.readFileSync(credFile, "utf8")).headers).toBeUndefined();
   });
 
+  test("reconnecting keeps the live-progress choice made in the config", async () => {
+    await ok("PUT", "/api/hub/connection", { url: "https://hub.example.com", token: TOKEN });
+    const configFile = path.join(dir, "config.json");
+    const config = z.object({ share: z.object({ hub: z.record(z.string(), z.unknown()) }) }).passthrough().parse(JSON.parse(fs.readFileSync(configFile, "utf8")));
+    fs.writeFileSync(configFile, JSON.stringify({ ...config, share: { ...config.share, hub: { ...config.share.hub, live: false } } }));
+    refreshHubConfig();
+
+    await ok("PUT", "/api/hub/connection", { url: "https://hub.example.com" });
+    expect(readHubConfig(configFile)).toMatchObject({ url: "https://hub.example.com", live: false });
+  });
+
   test("a token set by the environment locks the field", async () => {
     process.env.TAPOCALYPSE_HUB_TOKEN = TOKEN;
     const res = await call("PUT", "/api/hub/connection", { url: "https://hub.example.com", token: "tpu_other" });

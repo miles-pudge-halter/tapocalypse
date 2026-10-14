@@ -1,8 +1,9 @@
 import { ArrowDown, Info, Snowflake, Tag } from "lucide-react";
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 
 import { Lockup } from "@/components/brand";
 import { EmptyState } from "@/components/empty-state";
+import { RunningNowSection } from "@/components/hub/live-status";
 import { PassRateTrend } from "@/components/hub/pass-rate-trend";
 import { PageHeader } from "@/components/page-header";
 import { Button } from "@/components/ui/button";
@@ -89,6 +90,7 @@ export function HubHome() {
   const { projectId: scope } = useProjectScope();
   const { machines } = useHubMachines();
   const target = projects.find((p) => p.id === scope) ?? (projects.length === 1 ? projects[0] : undefined);
+  const projectNames = useMemo(() => new Map(projects.map((p) => [p.id, p.name])), [projects]);
 
   useEffect(() => {
     if (!loading && target) window.location.replace(overviewHash(target.id));
@@ -138,6 +140,9 @@ export function HubHome() {
         title="Team hub"
         description={`QA results uploaded from ${machines.length} ${machines.length === 1 ? "machine" : "machines"} across ${projects.length} projects.`}
       />
+      <div className="mb-4">
+        <RunningNowSection projectNames={projectNames} />
+      </div>
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
         {projects.map((p) => (
           <ProjectCard key={p.id} project={p} />

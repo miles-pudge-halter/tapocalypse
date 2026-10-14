@@ -52,7 +52,7 @@ export function usePageVisible(): boolean {
     document.addEventListener("visibilitychange", cb);
     return () => document.removeEventListener("visibilitychange", cb);
   }, []);
-  return useSyncExternalStore(subscribe, () => !document.hidden);
+  return useSyncExternalStore(subscribe, () => !document.hidden, () => true);
 }
 
 export interface ScreenshotsState {

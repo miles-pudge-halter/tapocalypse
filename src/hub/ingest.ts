@@ -11,7 +11,8 @@ import type { KeyLookup } from "../regression/keys";
 import { deleteRun, getRun, listRuns, normalizeRun, runDir, saveRun } from "../runs/store";
 import { ACTIVE, type Check, type CheckHints, type HubOrigin, type Run, VERDICTS } from "../runs/types";
 import { HUB_PROTOCOL_MIN, hubDir, hubLimits } from "./mode";
-import { touchHubProject } from "./projects";
+import { deleteLiveRun, getLiveRun, listLiveRuns, liveRoomFor, putLiveRun, sweepLiveRuns } from "./live";
+import { hubProjectByKey, touchHubProject } from "./projects";
 import {
   type BlobRefT,
   type BlobTypeT,
@@ -19,11 +20,18 @@ import {
   contentHashOf,
   HUB_PROTOCOL,
   hasImageMagic,
+  type HubProjectMetaT,
+  LiveRunBody,
+  type LiveRunBodyT,
+  type LiveRunResultT,
   RunUploadBody,
   type RunUploadBodyT,
   type RunUploadResultT,
   Sha256,
+  type UploadedRunT,
 } from "./protocol";
+
+type LiveRunT = LiveRunBodyT["run"];
 
 /** An HttpError whose JSON body carries more than `error` and `code` (missing blobs, protocol range). */
 export class HubHttpError extends HttpError {
@@ -318,16 +326,27 @@ interface RunDoc {
   checks: Check[];
 }
 
-/** The whitelisted fields and checks of the uploaded run; 400 when they are malformed. Runs before anything is stored, the project registry included. */
-function parseRunDoc(body: RunUploadBodyT): RunDoc {
-  const parsed = RunFields.safeParse(body.run);
-  if (!parsed.success) throw new HttpError(400, "the run document is malformed", "invalid_run");
-  const checkList = z.array(HubCheck).safeParse(body.run.checks);
-  if (!checkList.success) throw new HttpError(400, "a check in the run document is malformed", "invalid_run");
+/** What `parseRunDoc` and `buildRun` read of an upload or of a live update (which has no batch and no report). */
+interface RunSource {
+  clientVersion: string;
+  sentAt: string;
+  project: HubProjectMetaT;
+  run: UploadedRunT | LiveRunT;
+  batch: RunUploadBodyT["batch"];
+  report: RunUploadBodyT["report"];
+}
+
+/** The whitelisted fields and checks of the sent run; `failStatus` (400 for uploads, 422 for live updates) when they are malformed. Runs before anything is stored, the project registry included. */
+function parseRunDoc(run: UploadedRunT | LiveRunT, failStatus: 400 | 422 = 400): RunDoc {
+  const parsed = RunFields.safeParse(run);
+  if (!parsed.success) throw new HttpError(failStatus, "the run document is malformed", "invalid_run");
+  const checkList = z.array(HubCheck).safeParse(run.checks);
+  if (!checkList.success) throw new HttpError(failStatus, "a check in the run document is malformed", "invalid_run");
   return { fields: parsed.data, checks: checkList.data as unknown as Check[] };
 }
 
-function buildRun(body: RunUploadBodyT, doc: RunDoc, projectId: string, uploader: Uploader, contentHash: string, shots: Set<string>, now: Date): Run {
+/** `live` is set for a run still in progress: it carries when the laptop last sent it and has no content hash. */
+function buildRun(body: RunSource, doc: RunDoc, projectId: string, uploader: Uploader, contentHash: string, shots: Set<string>, now: Date, live?: HubOrigin["live"]): Run {
   const { fields, checks: uploadedChecks } = doc;
   const origin: HubOrigin = {
     machine: uploader.machine,
@@ -337,6 +356,7 @@ function buildRun(body: RunUploadBodyT, doc: RunDoc, projectId: string, uploader
     clockSkewMs: skewOf(body.sentAt, now),
     contentHash,
     clientVersion: body.clientVersion,
+    ...(live ? { live } : {}),
     keys: originKeysOf(uploadedChecks, body.run.testKey, fields.checkHints),
   };
   const checks = uploadedChecks.map((c): Check => {
@@ -596,13 +616,8 @@ export async function rekeyAll(): Promise<number> {
  * is present; only then is anything written. The same document twice is `unchanged` and writes nothing.
  */
 export function ingestRun(id: string, raw: unknown, uploader: Uploader, now: Date = new Date()): { result: RunUploadResultT; run: Run } {
-  const head = (typeof raw === "object" && raw !== null ? raw : {}) as { protocol?: unknown; run?: { status?: unknown } };
-  if (typeof head.protocol !== "number" || head.protocol < HUB_PROTOCOL_MIN || head.protocol > HUB_PROTOCOL) {
-    throw new HubHttpError(426, `protocol ${String(head.protocol)} is not supported; this hub speaks ${HUB_PROTOCOL_MIN}-${HUB_PROTOCOL}`, "protocol_unsupported", {
-      minProtocol: HUB_PROTOCOL_MIN,
-      protocol: HUB_PROTOCOL,
-    });
-  }
+  checkProtocol(raw);
+  const head = (typeof raw === "object" && raw !== null ? raw : {}) as { run?: { status?: unknown } };
   if (typeof head.run?.status === "string" && ACTIVE.includes(head.run.status as Run["status"])) {
     throw new HttpError(422, "only finished runs can be uploaded", "not_terminal");
   }
@@ -618,13 +633,21 @@ export function ingestRun(id: string, raw: unknown, uploader: Uploader, now: Dat
   if (existing && existing.hub?.machine !== uploader.machine) {
     throw new HubHttpError(409, `run ${id} already exists and was uploaded by another machine`, "id_conflict");
   }
+  const prior = getLiveRun(id);
+  if (prior && prior.hub?.machine !== uploader.machine) {
+    throw new HubHttpError(409, `run ${id} is being sent live by another machine`, "id_conflict");
+  }
   validateArtefacts(body);
   verifyBlobs(body);
-  const doc = parseRunDoc(body);
+  const doc = parseRunDoc(body.run);
 
   const contentHash = contentHashOf(body);
   const url = `/#/runs/${encodeURIComponent(id)}`;
-  if (existing?.hub?.contentHash === contentHash) return { result: { runId: id, status: "unchanged", contentHash, url }, run: existing };
+  if (existing?.hub?.contentHash === contentHash) {
+    // The finished run is already here; viewers that listed a stray live entry of it are told it is finished.
+    if (deleteLiveRun(id)) hubEvents.emit("run", existing);
+    return { result: { runId: id, status: "unchanged", contentHash, url }, run: existing };
+  }
 
   const project = touchHubProject(body.project, { machine: uploader.machine, uploader: uploader.identity }, body.run.createdAt, now);
   const shots = new Set(body.screenshots.map((s) => s.path));
@@ -640,8 +663,59 @@ export function ingestRun(id: string, raw: unknown, uploader: Uploader, now: Dat
   // An older run arriving after newer ones changes what "earliest with this brief/title" means; a re-upload may change manual links.
   const keysMoved = existing !== null && JSON.stringify(existing.hub?.keys) !== JSON.stringify(run.hub?.keys);
   if (run.createdAt < newest || keysMoved) scheduleRekey(project.id);
+  // The stored run replaces the live one in every viewer: it is announced just below.
+  deleteLiveRun(id);
   hubEvents.emit("run", run);
   return { result: { runId: id, status: existing ? "updated" : "created", contentHash, url }, run };
+}
+
+/** 426 unless the document names a protocol this hub speaks. */
+function checkProtocol(raw: unknown): void {
+  const protocol = typeof raw === "object" && raw !== null ? (raw as { protocol?: unknown }).protocol : undefined;
+  if (typeof protocol !== "number" || protocol < HUB_PROTOCOL_MIN || protocol > HUB_PROTOCOL) {
+    throw new HubHttpError(426, `protocol ${String(protocol)} is not supported; this hub speaks ${HUB_PROTOCOL_MIN}-${HUB_PROTOCOL}`, "protocol_unsupported", {
+      minProtocol: HUB_PROTOCOL_MIN,
+      protocol: HUB_PROTOCOL,
+    });
+  }
+}
+
+/**
+ * Keeps (or refreshes) the in-memory live copy of a run still in progress on the uploader's laptop. It never touches the run
+ * store: no keys, no artefacts, no batch, and the project registry only learns a project it has never seen (a live update is
+ * neither an upload nor a reason to move `lastUploadAt` or the default branch). A finished copy of the id from the same machine
+ * answers `final` (the laptop stops sending); from another machine, or a live copy from another machine, it is a 409.
+ */
+export function ingestLiveRun(id: string, raw: unknown, uploader: Uploader, now: Date = new Date()): { result: LiveRunResultT; run: Run } {
+  checkProtocol(raw);
+  const parsed = LiveRunBody.safeParse(raw);
+  if (!parsed.success) throw new HttpError(422, `invalid live update: ${parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")}`, "invalid_run");
+  const body = parsed.data;
+  if (body.run.id !== id) throw new HttpError(422, "the run id in the body does not match the URL", "invalid_run");
+  const url = `/#/runs/${encodeURIComponent(id)}`;
+
+  const existing = getRun(id);
+  if (existing) {
+    if (existing.hub?.machine !== uploader.machine) throw new HubHttpError(409, `run ${id} already exists and was uploaded by another machine`, "id_conflict");
+    return { result: { runId: id, status: "final", url }, run: existing };
+  }
+  const prior = getLiveRun(id);
+  if (prior && prior.hub?.machine !== uploader.machine) throw new HubHttpError(409, `run ${id} is already being sent live by another machine`, "id_conflict");
+  if (!liveRoomFor(uploader.machine, id)) throw new HubHttpError(429, "too many runs are being sent live; finished uploads are unaffected", "too_many_live_runs");
+  const doc = parseRunDoc(body.run, 422);
+
+  const project = hubProjectByKey(body.project.hubKey) ?? touchHubProject(body.project, { machine: uploader.machine, uploader: uploader.identity }, body.run.createdAt, now);
+  const run = buildRun({ ...body, batch: null, report: null }, doc, project.id, uploader, "", new Set(), now, { lastSeenAt: now.toISOString() });
+  putLiveRun(run);
+  hubEvents.emit("run", run);
+  return { result: { runId: id, status: "live", url }, run };
+}
+
+/** Drops live runs not updated for `LIVE_EXPIRE_MS` as of `now` and announces it like a removal, so open lists let go of them. Returns the dropped ids. */
+export function expireLive(now: number = Date.now()): string[] {
+  const expired = sweepLiveRuns(now);
+  if (expired.length > 0) projectEvents.emit("change");
+  return expired.map((r) => r.id);
 }
 
 export function runState(id: string): { contentHash: string; machine: string } | null {
@@ -649,12 +723,15 @@ export function runState(id: string): { contentHash: string; machine: string } |
   return run?.hub ? { contentHash: run.hub.contentHash, machine: run.hub.machine } : null;
 }
 
-/** Deletes a run the caller owns (any run for an admin token). 404 for an unknown run, 403 for someone else's. */
+/** Deletes a run the caller owns (any run for an admin token), finished or still live. 404 for an unknown run, 403 for someone else's. */
 export function unpublishRun(id: string, uploader: Uploader): void {
-  const run = getRun(id);
+  const stored = getRun(id);
+  const run = stored ?? getLiveRun(id);
   if (!run?.hub) throw new HttpError(404, `unknown run ${id}`);
   if (run.hub.machine !== uploader.machine && !uploader.admin) throw new HttpError(403, "this run was uploaded by another machine", "not_owner");
-  removeRun(run);
+  deleteLiveRun(id);
+  if (stored) removeRun(stored);
+  else projectEvents.emit("change");
 }
 
 function removeRun(run: Run): void {
@@ -664,12 +741,18 @@ function removeRun(run: Run): void {
   projectEvents.emit("change");
 }
 
-/** Admin: removes uploaded runs by id, project or machine. Returns the removed ids. */
+/** Admin: removes uploaded runs, live ones included, by id, project or machine. Returns the removed ids. */
 export function unpublishRuns(filter: { runId?: string; projectId?: string; machine?: string }): string[] {
-  const targets = listRuns().filter(
-    (r) => r.hub && (filter.runId === undefined || r.id === filter.runId) && (filter.projectId === undefined || r.projectId === filter.projectId) && (filter.machine === undefined || r.hub.machine === filter.machine),
-  );
   if (filter.runId === undefined && filter.projectId === undefined && filter.machine === undefined) return [];
-  for (const run of targets) removeRun(run);
-  return targets.map((r) => r.id);
+  const matches = (r: Run): boolean =>
+    r.hub != null && (filter.runId === undefined || r.id === filter.runId) && (filter.projectId === undefined || r.projectId === filter.projectId) && (filter.machine === undefined || r.hub.machine === filter.machine);
+  const stored = listRuns().filter(matches);
+  for (const run of stored) {
+    deleteLiveRun(run.id);
+    removeRun(run);
+  }
+  const live = listLiveRuns().filter(matches);
+  for (const run of live) deleteLiveRun(run.id);
+  if (live.length > 0) projectEvents.emit("change");
+  return [...stored, ...live].map((r) => r.id);
 }

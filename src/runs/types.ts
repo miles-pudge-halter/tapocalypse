@@ -118,6 +118,8 @@ export interface HubOrigin {
   receivedAt: string;
   /** The uploader's project id; the run's own `projectId` is the hub's. */
   localProjectId: string;
+  /** Only on runs still in progress on the uploader (hub memory, never stored): when the last live update arrived. */
+  live?: { lastSeenAt: string };
   /** Uploader clock minus hub clock in ms, only when it differs by more than 5 minutes. */
   clockSkewMs: number | null;
   /** `contentHashOf` the upload document: equal on re-upload means nothing changed. */

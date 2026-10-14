@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { ChevronDown, ExternalLink, FileText, Info, Loader2, RotateCcw, Trash2, XCircle } from "lucide-react";
 
+import { LiveStatus } from "@/components/hub/live-status";
 import { HubSyncChip } from "@/components/hub/sync-chip";
 import { UploadedBy } from "@/components/hub/uploaded-by";
 import { Badge } from "@/components/ui/badge";
@@ -21,6 +22,8 @@ import { VerdictBadge } from "@/components/verdict-badge";
 import { batchHash, isActive, reportHash, transcriptUrl, type Device, type RunView } from "@/lib/api";
 import { deviceDisplayName } from "@/lib/format";
 import { useHarness, useNow } from "@/lib/hooks";
+import { displayPerson } from "@/lib/hub";
+import { liveState } from "@/lib/live";
 import { isHub } from "@/lib/mode";
 import { DetailsSheet } from "./details-sheet";
 import { ShareButton } from "./share-button";
@@ -50,6 +53,8 @@ export function RunHeader({
   const failed = failedChecks(run.checks).length;
   const statusText = run.status === "queued" && run.queuePosition !== null ? `queued #${run.queuePosition}` : run.status;
   const deviceText = run.deviceName ?? (device ? deviceDisplayName(device) : run.deviceSerial);
+  // A run still in progress on a teammate's laptop: no device of its own here, the header says who is running it and how fresh it is.
+  const live = liveState(run.hub, now);
 
   return (
     <header className="space-y-2">
@@ -148,9 +153,23 @@ export function RunHeader({
       </div>
 
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground">
-        {deviceText ? <span>{deviceText}</span> : <span>no device yet</span>}
-        <span aria-hidden>·</span>
-        {hub && run.hub ? <UploadedBy hub={run.hub} withTime /> : <span>by {run.requestedBy}</span>}
+        {live ? (
+          <>
+            <LiveStatus hub={run.hub} now={now} />
+            {displayPerson(run.hub?.uploader ?? null) ? (
+              <>
+                <span aria-hidden>·</span>
+                <span>by {displayPerson(run.hub?.uploader ?? null)}</span>
+              </>
+            ) : null}
+          </>
+        ) : (
+          <>
+            {deviceText ? <span>{deviceText}</span> : <span>no device yet</span>}
+            <span aria-hidden>·</span>
+            {hub && run.hub ? <UploadedBy hub={run.hub} withTime /> : <span>by {run.requestedBy}</span>}
+          </>
+        )}
         {!hub && run.hubSync ? (
           <>
             <span aria-hidden>·</span>

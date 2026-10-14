@@ -1,12 +1,10 @@
 import { AlertCircle, ArrowDown, ChevronDown, Inbox, Loader2, Plus, Search, SearchX, X } from "lucide-react";
 import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { Lockup } from "@/components/brand";
-import { BatchRow, RunActions, RunRow } from "@/components/run-row";
-import { RunStatusIcon } from "@/components/run-status-icon";
-import { SegmentedProgress } from "@/components/segmented-progress";
+import { BatchRow, RunRow } from "@/components/run-row";
+import { ActiveCard } from "@/components/run/active-card";
 import { VERDICT_DOT } from "@/components/verdict-badge";
 import { SetupBanner } from "@/components/setup-checklist";
-import { DeviceFrame } from "@/components/device-frame";
 import { LeaseRing } from "@/components/lease-ring";
 import { EmptyState } from "@/components/empty-state";
 import { PageHeader } from "@/components/page-header";
@@ -21,8 +19,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Skeleton } from "@/components/ui/skeleton";
 import { Toggle } from "@/components/ui/toggle";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { isActive, runHash, type Device, type RunStatus, type RunView, type Verdict } from "@/lib/api";
-import { deviceDisplayName, formatCost, formatDuration } from "@/lib/format";
+import { isActive, type Device, type RunStatus, type RunView, type Verdict } from "@/lib/api";
+import { deviceDisplayName, formatCost } from "@/lib/format";
 import { deviceCounts, heldSummary } from "@/lib/leases";
 import {
   setRunFilters,
@@ -408,73 +406,6 @@ function LiveStrip({
         </>
       )}
     </div>
-  );
-}
-
-function ActiveCard({
-  run,
-  device,
-  projectName,
-  deviceName,
-  now,
-  onChanged,
-}: {
-  run: RunView;
-  device: Device | undefined;
-  projectName: string;
-  deviceName: string | null;
-  now: number;
-  onChanged(): void;
-}) {
-  const current = run.checks.find((c) => c.status === "running");
-  const queued = run.status === "queued";
-  const reason =
-    run.queueReason ??
-    (run.deviceRequest.serial ? `waiting for ${run.deviceRequest.serial}` : `waiting for a free ${run.deviceRequest.platform} device`);
-
-  return (
-    <Card className="relative flex-row gap-3 p-3">
-      <DeviceFrame serial={run.deviceSerial} live device={device} platform={run.deviceRequest.platform} size="tile" />
-      <div className="flex min-w-0 flex-1 flex-col gap-2">
-        <div className="flex items-start gap-2">
-          <RunStatusIcon status={run.status} verdict={run.verdict} className="mt-0.5 size-4 shrink-0" />
-          <a
-            href={runHash(run.id)}
-            className="min-w-0 flex-1 truncate text-sm font-medium after:absolute after:inset-0 hover:underline focus-visible:outline-none"
-            title={run.title}
-          >
-            {run.title}
-          </a>
-          <RunActions run={run} onChanged={onChanged} />
-        </div>
-        <div className="truncate text-xs text-muted-foreground">
-          {[projectName, deviceName ?? (queued ? null : "assigning device…"), run.requestedBy].filter(Boolean).join(" · ")}
-        </div>
-        {queued ? (
-          <div className="text-xs">
-            <span className="font-medium">Queue #{run.queuePosition ?? "?"}</span>
-            <span className="text-muted-foreground"> · {reason}</span>
-          </div>
-        ) : current ? (
-          <div className="flex min-w-0 items-center gap-1.5 text-xs">
-            <Loader2 className="size-3 shrink-0 animate-spin text-blue-500" />
-            <span className="truncate">
-              <span className="font-mono">{current.id}</span> · {current.title}
-            </span>
-          </div>
-        ) : (
-          <div className="text-xs capitalize text-muted-foreground">{run.status}…</div>
-        )}
-        <div className="mt-auto space-y-1.5">
-          <SegmentedProgress checks={run.checks} size="md" />
-          <div className="text-xs tabular-nums text-muted-foreground">
-            {run.startedAt
-              ? `elapsed ${formatDuration(run.startedAt, null, now)}`
-              : `waiting ${formatDuration(run.createdAt, null, now)}`}
-          </div>
-        </div>
-      </div>
-    </Card>
   );
 }
 

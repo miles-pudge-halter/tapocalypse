@@ -346,6 +346,19 @@ describe("upload API", () => {
     expect(getRun(withHeader)?.hub?.uploader).toBe("dana@example.com");
     expect(await (await get("/api/hub/v1/info")).json()).toMatchObject({ identityHeader: true });
   });
+
+  test("the live route is guarded like every other write and exists only on the hub", async () => {
+    const m = machine("liveguard");
+    const live = `/api/hub/v1/runs/${runId(110)}/live`;
+    const json = { "content-type": "application/json" };
+    expect((await call("PUT", live, { headers: json, body: "{}" })).status).toBe(401);
+    expect((await call("PUT", live, { headers: { ...m.auth, "content-type": "text/plain" }, body: "{}" })).status).toBe(415);
+    expect((await call("PUT", live, { headers: { ...m.auth, ...json, origin: "https://evil.example" }, body: "{}" })).status).toBe(403);
+    expect((await call("GET", live, { headers: m.auth })).status).toBe(405);
+    expect((await call("DELETE", live, { headers: m.auth })).status).toBe(405);
+    setHubMode(false);
+    expect((await call("PUT", live, { headers: { ...m.auth, ...json }, body: "{}" })).status).toBe(404);
+  });
 });
 
 describe("what viewers read", () => {

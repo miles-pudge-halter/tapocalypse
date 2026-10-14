@@ -37,6 +37,8 @@ export const HubConfigSchema = z.strictObject({
   url: HubUrlSchema,
   /** Screenshots upload as WebP q80 by default; `original` keeps the PNGs byte-exact. */
   screenshots: z.enum(["webp", "original"]).optional(),
+  /** Runs in progress show up live on the hub (status and checks, never screens or screenshots). On unless `false`. */
+  live: z.boolean().optional(),
   headers: z.record(z.string().min(1), z.string()).optional(),
 });
 export type HubConfig = z.infer<typeof HubConfigSchema>;

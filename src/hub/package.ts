@@ -10,9 +10,9 @@ import { type GitRunner, refreshDefaultBranch } from "../regression/baseline";
 import { reportFile, runImages, type RunImage } from "../runs/artefacts";
 import { readActivity, runDir } from "../runs/store";
 import { ACTIVE, type Check, type Run } from "../runs/types";
-import { hubIdentityFor, withoutQueryAndFragment } from "./identity";
-import { type BlobRefT, type BlobTypeT, contentHashOf, hasImageMagic, HUB_PROTOCOL, RunUploadBody, type RunUploadBodyT } from "./protocol";
-import { createRedactor } from "./redact";
+import { type HubIdentity, hubIdentityFor, withoutQueryAndFragment } from "./identity";
+import { type BlobRefT, type BlobTypeT, contentHashOf, hasImageMagic, HUB_PROTOCOL, type HubProjectMetaT, LiveRunBody, type LiveRunBodyT, RunUploadBody, type RunUploadBodyT } from "./protocol";
+import { createRedactor, type RedactContext, type Redactor } from "./redact";
 
 export interface PackageOptions {
   /** `webp` (default): re-encode screenshots to WebP q80; `original`: upload the exact bytes. */
@@ -130,6 +130,106 @@ function rewriteLinks(md: string, swap: (link: string) => string | null): string
 
 const clamp = (s: string, max: number): string => (s.length > max ? `${s.slice(0, max - 1)}…` : s);
 
+/** Where a project lives on the hub and what its redactor must know; asked from git, so `packageLive` remembers it per run. */
+interface HubContext {
+  identity: HubIdentity & { hubKey: string };
+  defaultBranch: string | null;
+  defaultBranchSource: "explicit" | "detected";
+  redact: RedactContext;
+}
+
+async function hubContextFor(run: Run, project: Project, git: GitRunner | undefined): Promise<HubContext> {
+  const identity = await hubIdentityFor(project, git);
+  if (!identity.hubKey) {
+    throw new Error(`project ${project.id} has no git remote to name it on the hub: set a hubKey on the project (for example local/${project.id})`);
+  }
+  const defaultBranch = project.defaultBranch ?? (await refreshDefaultBranch(project));
+  const worktrees = git ? await worktreePaths(project.repoPath, git) : [];
+  return {
+    identity: { ...identity, hubKey: identity.hubKey },
+    defaultBranch,
+    defaultBranchSource: project.defaultBranch ? "explicit" : "detected",
+    redact: {
+      home: os.homedir(),
+      user: os.userInfo().username,
+      repos: [project.repoPath, run.source?.path, ...worktrees].filter((p): p is string => Boolean(p)).flatMap(withRealpath),
+      dataDir: DATA_DIR,
+      tmpDirs: [...withRealpath(os.tmpdir()), "/tmp", "/private/tmp"],
+    },
+  };
+}
+
+function projectMeta(project: Project, context: HubContext, redact: Redactor): HubProjectMetaT {
+  const { identity, defaultBranch, defaultBranchSource } = context;
+  return {
+    hubKey: identity.hubKey,
+    name: clamp(redact.text(project.name), 60),
+    remoteUrl: identity.remoteUrl,
+    subpath: identity.subpath,
+    defaultBranch: defaultBranch ?? null,
+    ...(defaultBranch ? { defaultBranchSource } : {}),
+    defaultPlatform: project.defaultPlatform,
+    localId: project.id,
+  };
+}
+
+/** The run's document as the hub stores it: the local-only fields dropped, the rest redacted. What differs between a finished upload and live progress is passed in. */
+function runDocument(run: Run, redact: Redactor, parts: { checks: Check[]; reportPath: string | null; transcriptHtml: boolean }) {
+  const { stats: _stats, deviceLabel: _deviceLabel, ...rest } = run;
+  return redact.value({
+    ...rest,
+    title: clamp(run.title, 500),
+    checks: parts.checks,
+    source: run.source ? { ...run.source, remoteUrl: run.source.remoteUrl ? withoutQueryAndFragment(run.source.remoteUrl) : null } : null,
+    storage: "data",
+    reportPath: parts.reportPath,
+    transcriptHtml: parts.transcriptHtml,
+    stats: null,
+    deviceSerial: null,
+    deviceRequest: { platform: run.deviceRequest.platform },
+    install: run.install ? { path: path.basename(run.install.path) } : null,
+  });
+}
+
+/** Live progress: the same document and redaction as an upload, from a run still in progress, with no blobs and no check screenshots. The git answers and redaction context are remembered per run. */
+/** The finished upload carries brief and notes in full; live documents must stay far below `LIVE_MAX_BYTES`. */
+const LIVE_BRIEF_MAX = 4000;
+const LIVE_NOTE_MAX = 2000;
+const LIVE_CONTEXTS_MAX = 16;
+const liveContexts = new Map<string, { key: string; context: HubContext }>();
+
+export async function packageLive(run: Run, project: Project, opts: Pick<PackageOptions, "now" | "clientVersion" | "git"> = {}): Promise<LiveRunBodyT> {
+  if (!ACTIVE.includes(run.status)) throw new Error(`run ${run.id} is not in progress (${run.status})`);
+  const key = [project.repoPath, project.hubKey, project.defaultBranch, project.name, run.source?.path].join("\0");
+  let known = liveContexts.get(run.id);
+  if (known?.key !== key) {
+    known = { key, context: await hubContextFor(run, project, opts.git) };
+    liveContexts.delete(run.id);
+    liveContexts.set(run.id, known);
+    for (const oldest of liveContexts.keys()) {
+      if (liveContexts.size <= LIVE_CONTEXTS_MAX) break;
+      liveContexts.delete(oldest);
+    }
+  }
+  const { context } = known;
+  const redact = createRedactor(context.redact);
+  const checks: Check[] = run.checks.map(({ screenshot: _screenshot, ...c }) => ({ ...c, title: clamp(c.title, 2000), ...(c.note ? { note: clamp(c.note, LIVE_NOTE_MAX) } : {}) }));
+  const body = {
+    protocol: HUB_PROTOCOL,
+    clientVersion: opts.clientVersion ?? pkg.version,
+    sentAt: new Date((opts.now ?? Date.now)()).toISOString(),
+    project: projectMeta(project, context, redact),
+    run: runDocument({ ...run, brief: clamp(run.brief, LIVE_BRIEF_MAX) }, redact, { checks, reportPath: null, transcriptHtml: false }),
+    redaction: { replaced: redact.replaced },
+  };
+  const parsed = LiveRunBody.safeParse(body);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0]!;
+    throw new Error(`run ${run.id} cannot be shared live: ${issue.path.join(".") || "document"}: ${issue.message}`);
+  }
+  return parsed.data;
+}
+
 /**
  * Builds the upload for one finished run: a redacted run document, the report with its image links rewritten to the hub
  * layout, the mapped activity feed (never the raw event stream), the screenshots, and the content hash that tells
@@ -139,21 +239,8 @@ const clamp = (s: string, max: number): string => (s.length > max ? `${s.slice(0
 export async function packageRun(run: Run, project: Project, opts: PackageOptions = {}): Promise<PackagedRun> {
   if (ACTIVE.includes(run.status)) throw new Error(`run ${run.id} is not finished (${run.status})`);
   const git = opts.git;
-  const identity = await hubIdentityFor(project, git);
-  if (!identity.hubKey) {
-    throw new Error(`project ${project.id} has no git remote to name it on the hub: set a hubKey on the project (for example local/${project.id})`);
-  }
-  const defaultBranch = project.defaultBranch ?? (await refreshDefaultBranch(project));
-  const defaultBranchSource = project.defaultBranch ? "explicit" : "detected";
-
-  const [worktrees] = await Promise.all([git ? worktreePaths(project.repoPath, git) : Promise.resolve([])]);
-  const redact = createRedactor({
-    home: os.homedir(),
-    user: os.userInfo().username,
-    repos: [project.repoPath, run.source?.path, ...worktrees].filter((p): p is string => Boolean(p)).flatMap(withRealpath),
-    dataDir: DATA_DIR,
-    tmpDirs: [...withRealpath(os.tmpdir()), "/tmp", "/private/tmp"],
-  });
+  const context = await hubContextFor(run, project, git);
+  const redact = createRedactor(context.redact);
   const mode = opts.screenshots ?? "webp";
   const blobs = new Map<string, Blob>();
   const keep = (bytes: Bytes, type: BlobTypeT): BlobRefT => {
@@ -201,41 +288,19 @@ export async function packageRun(run: Run, project: Project, opts: PackageOption
   const transcript =
     opts.transcript && run.transcriptHtml && fs.existsSync(transcriptFile) ? textBlob(redact.text(fs.readFileSync(transcriptFile, "utf8")), "text/html") : null;
 
-  const { stats: _stats, deviceLabel: _deviceLabel, ...rest } = run;
   const checks: Check[] = run.checks.map((c) => {
     const { screenshot, ...other } = c;
     const hubPath = screenshot ? swapLink(screenshot) ?? hubPathOf.get(path.posix.normalize(screenshot.replace(/\\/g, "/"))) : undefined;
     return { ...other, title: clamp(c.title, 2000), ...(hubPath ? { screenshot: hubPath } : {}) };
   });
-  const runDoc = redact.value({
-    ...rest,
-    title: clamp(run.title, 500),
-    checks,
-    source: run.source ? { ...run.source, remoteUrl: run.source.remoteUrl ? withoutQueryAndFragment(run.source.remoteUrl) : null } : null,
-    storage: "data",
-    reportPath: report ? "report.md" : null,
-    transcriptHtml: transcript !== null,
-    stats: null,
-    deviceSerial: null,
-    deviceRequest: { platform: run.deviceRequest.platform },
-    install: run.install ? { path: path.basename(run.install.path) } : null,
-  });
+  const runDoc = runDocument(run, redact, { checks, reportPath: report ? "report.md" : null, transcriptHtml: transcript !== null });
 
   const batchMeta = run.batchId ? getBatchMeta(run.batchId) : null;
   const body = {
     protocol: HUB_PROTOCOL,
     clientVersion: opts.clientVersion ?? pkg.version,
     sentAt: new Date((opts.now ?? Date.now)()).toISOString(),
-    project: {
-      hubKey: identity.hubKey,
-      name: clamp(redact.text(project.name), 60),
-      remoteUrl: identity.remoteUrl,
-      subpath: identity.subpath,
-      defaultBranch: defaultBranch ?? null,
-      ...(defaultBranch ? { defaultBranchSource } : {}),
-      defaultPlatform: project.defaultPlatform,
-      localId: project.id,
-    },
+    project: projectMeta(project, context, redact),
     run: runDoc,
     batch: batchMeta ? { id: batchMeta.id, title: clamp(redact.text(batchMeta.title), 500), createdAt: batchMeta.createdAt } : null,
     report,

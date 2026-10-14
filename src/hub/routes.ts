@@ -3,9 +3,9 @@ import pkg from "../../package.json";
 import { HttpError } from "../config";
 import { listRuns } from "../runs/store";
 import { readCappedBody } from "./body";
-import { ingestRun, missingBlobs, putBlob, rekeyAll, rekeyProject, runState, unpublishRun, unpublishRuns, type Uploader } from "./ingest";
+import { ingestLiveRun, ingestRun, missingBlobs, putBlob, rekeyAll, rekeyProject, runState, unpublishRun, unpublishRuns, type Uploader } from "./ingest";
 import { HUB_PROTOCOL_MIN, hubIdentityHeader, hubLimits } from "./mode";
-import { BlobCheckBody, HUB_PROTOCOL, RunId, Sha256 } from "./protocol";
+import { BlobCheckBody, HUB_PROTOCOL, LIVE_MAX_BYTES, RunId, Sha256 } from "./protocol";
 import { hubMachines, hubSummary } from "./status";
 import { verifyToken } from "./tokens";
 
@@ -44,9 +44,13 @@ function requireUploader(req: Request): Uploader {
   return uploader;
 }
 
-/** Writes one token may make per minute: a run document costs keying work, a blob costs disk. A backfill of a few hundred runs fits; a leaked token cannot grind the hub. */
+/**
+ * Writes one token may make per minute: a run document costs keying work, a blob costs disk. A backfill of a few hundred runs
+ * fits; a leaked token cannot grind the hub. `live` is its own budget: a laptop sends progress at most every 3 s per run
+ * (and a heartbeat a minute), which must neither starve nor be starved by finished-run uploads.
+ */
 const RATE_WINDOW_MS = 60_000;
-const RATE_LIMITS = { run: 120, blob: 600 } as const;
+const RATE_LIMITS = { run: 120, blob: 600, live: 240 } as const;
 const rateWindows = new Map<string, { start: number; count: number }>();
 
 /** A 429 once `uploader` has used up this minute's budget for `kind`, else null. Answered before any body is read. */
@@ -71,6 +75,12 @@ function safeJson(text: string): unknown {
 
 async function smallJson(req: Request): Promise<unknown> {
   return safeJson(new TextDecoder().decode(await readCappedBody(req, { maxBytes: MAX_SMALL_BODY_BYTES, allowGzip: true })));
+}
+
+/** The JSON document of an upload: `application/json` (415 otherwise), optionally gzipped, at most `maxBytes` once decoded (413). */
+async function jsonBody(req: Request, maxBytes: number): Promise<unknown> {
+  if (!req.headers.get("content-type")?.startsWith("application/json")) throw new HttpError(415, "content-type must be application/json");
+  return safeJson(new TextDecoder().decode(await readCappedBody(req, { maxBytes, allowGzip: true })));
 }
 
 /** `POST /api/hub/v1/admin/rekey|unpublish`: what the admin CLI asks of a running hub so its in-memory store never goes stale. */
@@ -141,9 +151,7 @@ export async function hubV1Route(req: Request, parts: string[]): Promise<Respons
       const uploader = requireUploader(req);
       const limited = overRate(uploader, "run");
       if (limited) return limited;
-      if (!req.headers.get("content-type")?.startsWith("application/json")) throw new HttpError(415, "content-type must be application/json");
-      const text = new TextDecoder().decode(await readCappedBody(req, { maxBytes: hubLimits().maxDocBytes, allowGzip: true }));
-      const { result } = ingestRun(id, safeJson(text), uploader);
+      const { result } = ingestRun(id, await jsonBody(req, hubLimits().maxDocBytes), uploader);
       return Response.json(result, { status: result.status === "created" ? 201 : 200 });
     }
     if (method === "DELETE") {
@@ -151,6 +159,16 @@ export async function hubV1Route(req: Request, parts: string[]): Promise<Respons
       return new Response(null, { status: 204 });
     }
     return notAllowed("PUT, DELETE");
+  }
+
+  if (resource === "runs" && id && action === "live" && parts.length === 6) {
+    if (method !== "PUT") return notAllowed("PUT");
+    if (!RunId.safeParse(id).success) throw new HttpError(400, "invalid run id");
+    const uploader = requireUploader(req);
+    const limited = overRate(uploader, "live");
+    if (limited) return limited;
+    const { result } = ingestLiveRun(id, await jsonBody(req, LIVE_MAX_BYTES), uploader);
+    return Response.json(result);
   }
 
   if (resource === "runs" && id && action === "state" && parts.length === 6) {

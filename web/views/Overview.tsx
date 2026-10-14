@@ -4,6 +4,7 @@ import { toast } from "sonner";
 
 import { ChangesCard } from "@/components/hub/changes-card";
 import { Freshness } from "@/components/hub/freshness";
+import { RunningNowSection } from "@/components/hub/live-status";
 import { KpiSkeleton, KpiTiles } from "@/components/hub/kpi-tiles";
 import { LaneGrid } from "@/components/hub/lane-grid";
 import { TrendCard } from "@/components/hub/pass-rate-trend";
@@ -195,6 +196,8 @@ export function Overview({ projectId, refValue, show }: { projectId: string; ref
           </AlertDescription>
         </Alert>
       )}
+
+      <RunningNowSection projectId={projectId} />
 
       <KpiTiles overview={overview} projectId={projectId} refValue={ref} />
 

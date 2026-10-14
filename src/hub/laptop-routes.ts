@@ -72,7 +72,12 @@ async function saveConnection(req: Request): Promise<Response> {
   else if (headers && Object.keys(headers).length > 0) throw new HttpError(400, "enter the upload token before saving proxy headers");
 
   const previous = activeHubConfig();
-  const hub = { url: body.url.replace(/\/+$/, ""), ...((body.screenshots ?? previous?.screenshots) ? { screenshots: body.screenshots ?? previous?.screenshots } : {}), ...(previous?.headers ? { headers: previous.headers } : {}) };
+  const hub = {
+    url: body.url.replace(/\/+$/, ""),
+    ...((body.screenshots ?? previous?.screenshots) ? { screenshots: body.screenshots ?? previous?.screenshots } : {}),
+    ...(previous?.headers ? { headers: previous.headers } : {}),
+    ...(previous?.live !== undefined ? { live: previous.live } : {}),
+  };
   writeHubConfig(hubPaths.configFile, hub);
   refreshHubConfig();
   await hubSyncWorker().testConnection();

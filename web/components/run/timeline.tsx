@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import { ArrowDown, Clock, History, Loader2, Radio, Search, SearchX, TriangleAlert, X, XCircle } from "lucide-react";
 
 import { EmptyState } from "@/components/empty-state";
+import { LivePendingState } from "@/components/hub/live-status";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -267,7 +268,11 @@ export function Timeline({
             </div>
           ) : null}
 
-          {activity.length === 0 ? (
+          {activity.length === 0 && run.hub?.live ? (
+            <div className="p-3">
+              <LivePendingState machine={run.hub.machine} />
+            </div>
+          ) : activity.length === 0 ? (
             <div className="p-3">
               <EmptyState
                 icon={active ? Loader2 : History}

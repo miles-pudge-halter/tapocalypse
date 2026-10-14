@@ -113,7 +113,10 @@ function hasJsonBody(method: string, parts: string[]): boolean {
   const [root, a, b, c] = parts;
   if (method === "PUT") {
     if (root !== "api") return false;
-    return (parts.length === 3 && (a === "projects" || (a === "hub" && b === "connection"))) || (parts.length === 5 && a === "hub" && b === "v1" && c === "runs");
+    return (
+      (parts.length === 3 && (a === "projects" || (a === "hub" && b === "connection"))) ||
+      (a === "hub" && b === "v1" && c === "runs" && (parts.length === 5 || (parts.length === 6 && parts[5] === "live")))
+    );
   }
   if (method === "DELETE") return parts.length === 2 && root === "api" && a === "check-links";
   if (method !== "POST") return false;
