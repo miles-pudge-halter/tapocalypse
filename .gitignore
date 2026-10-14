@@ -11,6 +11,9 @@ node_modules/
 .env.*
 !.env.example
 !.env.hub.example
+# Written next to the config (mode 600); with the in-repo config layout that is the repository root.
+/hub-credentials.json
+/share-credentials.json
 
 # Build, coverage, TypeScript caches
 /dist/
