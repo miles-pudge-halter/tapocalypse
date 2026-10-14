@@ -59,6 +59,14 @@ describe("buildReport", () => {
     expect(byId(checks, "bun").status).toBe("ok");
   });
 
+  test("the team-hub rows come from the laptop hub checks, after the others, and a throwing probe is an error row", async () => {
+    const row: DoctorCheck = { id: "hub", label: "Team hub", status: "skip", detail: "not connected (optional)", required: false };
+    const { checks } = await buildReport(envWith({ hubChecks: async () => [row] }));
+    expect(checks.at(-1)).toEqual(row);
+    const broken = await buildReport(envWith({ hubChecks: async () => Promise.reject(new Error("boom")) }));
+    expect(broken.checks.at(-1)).toMatchObject({ id: "hub", status: "error", required: false, detail: "boom" });
+  });
+
   test("a missing omp binary is a required error with an install fix, not a throw", async () => {
     const { checks } = await buildReport(envWith({ harnessBins: { omp: MISSING, claude: "claude", codex: "codex" }, run: fakeRun([MISSING]) }));
     const omp = byId(checks, "omp");

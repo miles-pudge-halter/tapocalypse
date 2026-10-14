@@ -17,6 +17,8 @@ const byBrief: PerProject<Run> = new Map();
 const byRunTitle: PerProject<Run> = new Map();
 /** The snapshot each run is currently indexed under, so a change can take exactly its old entries out. */
 const indexed = new Map<string, Run>();
+/** Runs with a `rerunOf` / `retryOf` parent, by project and id (live ones included): all a lineage walk needs, so it never scans the whole project. */
+const linked: Map<string, Map<string, Run>> = new Map();
 let built = false;
 const generations = new Map<string, number>();
 
@@ -51,6 +53,11 @@ function add(run: Run): void {
   // A hand-edited or truncated run.json must not take every enqueue down with it.
   if (typeof run.brief !== "string" || typeof run.title !== "string" || !Array.isArray(run.checks)) return;
   indexed.set(run.id, run);
+  if (run.rerunOf !== null || run.retryOf !== null) {
+    let inner = linked.get(run.projectId);
+    if (!inner) linked.set(run.projectId, (inner = new Map()));
+    inner.set(run.id, run);
+  }
   const runCreated = (r: Run) => r.createdAt;
   if (run.testKey !== null) {
     insert(bucket(byBrief, run.projectId, briefFingerprint(run.brief)), run, runCreated);
@@ -67,6 +74,7 @@ function drop(id: string): void {
   const old = indexed.get(id);
   if (!old) return;
   indexed.delete(id);
+  linked.get(old.projectId)?.delete(id);
   const isOld = (r: Run) => r.id === id;
   if (old.testKey !== null) {
     remove(byBrief, old.projectId, briefFingerprint(old.brief), isOld);
@@ -78,10 +86,24 @@ function drop(id: string): void {
   }
 }
 
+/**
+ * Adds the store's runs oldest first, so `insert` appends instead of walking the whole bucket (O(n²) per key at 50k
+ * runs). `listRuns()` is newest first; runs created at the same instant keep that order, exactly as inserting them
+ * newest first would have left them.
+ */
+function addOldestFirst(runs: Run[]): void {
+  for (let end = runs.length; end > 0; ) {
+    let start = end - 1;
+    while (start > 0 && runs[start - 1]!.createdAt === runs[end - 1]!.createdAt) start--;
+    for (let i = start; i < end; i++) add(runs[i]!);
+    end = start;
+  }
+}
+
 function ensureBuilt(): void {
   if (built) return;
   built = true;
-  for (const run of listRuns()) add(run);
+  addOldestFirst(listRuns());
   subscribeRuns((change) => {
     const old = indexed.get("deleted" in change ? change.deleted : change.saved.id);
     // Only finished runs feed baselines, snapshots and flakiness: a live run saving a check touches nothing derived.
@@ -102,6 +124,18 @@ function ensureBuilt(): void {
 export function projectGeneration(projectId: string): number {
   ensureBuilt();
   return generations.get(projectId) ?? 0;
+}
+
+/** The runs of the project that are re-runs or retries of another run, in no particular order. */
+export function linkedRuns(projectId: string): Run[] {
+  ensureBuilt();
+  return [...(linked.get(projectId)?.values() ?? [])];
+}
+
+/** A run from the index (the store's current snapshot); null for an unknown id. Unlike `getRun` it never reads the disk. */
+export function indexedRun(id: string): Run | null {
+  ensureBuilt();
+  return indexed.get(id) ?? null;
 }
 
 /** The terminal runs of one test, newest first. */
@@ -145,15 +179,15 @@ export const keyLookup: KeyLookup = {
  * A run that cannot be keyed (a hand-edited or truncated run.json) is logged and left as it is: keying must never stop
  * boot or a save.
  */
-export function keyRun(run: Run): boolean {
+export function keyRun(run: Run, lookup: KeyLookup = keyLookup): boolean {
   let changed = false;
   try {
     if (run.testKey === null) {
-      run.testKey = assignTestKey(run, keyLookup);
+      run.testKey = assignTestKey(run, lookup);
       changed = true;
     }
     if (isTerminal(run)) {
-      for (const [id, key] of assignCheckKeys(run, keyLookup)) {
+      for (const [id, key] of assignCheckKeys(run, lookup)) {
         const check = run.checks.find((c) => c.id === id)!;
         check.checkKey = key.checkKey;
         check.keyKind = key.keyKind;
@@ -165,6 +199,51 @@ export function keyRun(run: Run): boolean {
     console.warn(`regression: run ${run.id} could not be keyed: ${err instanceof Error ? err.message : String(err)}`);
   }
   return changed;
+}
+
+/**
+ * A `KeyLookup` over runs the caller keys in memory, oldest first: `add` each run once it has its keys and later runs see it.
+ * Lets a project be re-keyed from scratch without persisting the half-cleared state in between. `getRun` answers from
+ * `known` (the caller's working copies) before the store.
+ */
+export function createKeyPass(known: ReadonlyMap<string, Run>): { lookup: KeyLookup; add(run: Run): void } {
+  const brief = new Map<string, Run>();
+  const title = new Map<string, Run>();
+  const tests = new Map<string, Run[]>();
+  const checkKeys = new Set<string>();
+  const add = (run: Run): void => {
+    if (typeof run.brief !== "string" || typeof run.title !== "string" || !Array.isArray(run.checks)) return;
+    if (run.testKey !== null) {
+      const b = `${run.projectId}\0${briefFingerprint(run.brief)}`;
+      if (!brief.has(b)) brief.set(b, run);
+      const t = `${run.projectId}\0${runTitleFingerprint(run.title)}`;
+      if (!title.has(t)) title.set(t, run);
+    }
+    if (!isTerminal(run)) return;
+    if (run.testKey !== null) {
+      const k = `${run.projectId}\0${run.testKey}`;
+      const list = tests.get(k) ?? [];
+      list.push(run);
+      tests.set(k, list);
+    }
+    for (const check of run.checks) if (check.checkKey) checkKeys.add(`${run.projectId}\0${check.checkKey}`);
+  };
+  const lookup: KeyLookup = {
+    getRun: (id) => known.get(id) ?? getRun(id),
+    earliestWithBrief: (projectId, fingerprint) => brief.get(`${projectId}\0${fingerprint}`) ?? null,
+    earliestWithTitle: (projectId, fingerprint) => title.get(`${projectId}\0${fingerprint}`) ?? null,
+    recentTestRuns: (projectId, testKey, before, limit) => {
+      const recent: Run[] = [];
+      const runs = tests.get(`${projectId}\0${testKey}`) ?? [];
+      for (let i = runs.length - 1; i >= 0 && recent.length < limit; i--) {
+        const run = runs[i]!;
+        if (run.createdAt < before && run.checks.length > 0) recent.push(run);
+      }
+      return recent;
+    },
+    hasCheckKey: (projectId, checkKey) => checkKeys.has(`${projectId}\0${checkKey}`),
+  };
+  return { lookup, add };
 }
 
 const BACKFILL_YIELD_EVERY = 200;

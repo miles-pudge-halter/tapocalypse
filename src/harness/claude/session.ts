@@ -2,6 +2,7 @@ import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import type { RunUsage } from "../../runs/types";
+import { harnessEnv } from "../env";
 import { failedSession } from "../failed";
 import type { HarnessEvent, HarnessExit, HarnessSession, McpServerSpec, SessionInfo, SpawnOptions } from "../types";
 import { StreamMapper, parseFrame } from "./events";
@@ -135,7 +136,7 @@ export class ClaudeSession implements HarnessSession {
     private readonly opts: SpawnOptions,
     private readonly deps: ClaudeDeps,
   ) {
-    const proc = deps.spawn(argv, { cwd: opts.cwd, env: { ...process.env } });
+    const proc = deps.spawn(argv, { cwd: opts.cwd, env: harnessEnv() });
     this.proc = proc;
 
     const stdout = this.pump(proc.stdout, (line) => this.onLine(line));

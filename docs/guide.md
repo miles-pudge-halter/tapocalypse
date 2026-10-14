@@ -22,6 +22,7 @@ Back to the [README](../README.md). This is the long-form reference: every page 
 - [CLI and CI](#cli-and-ci)
 - [Reading reports and screenshots](#reading-reports-and-screenshots)
 - [Sharing a report](#sharing-a-report)
+- [Sharing with your team: report links or a hub](#sharing-with-your-team-report-links-or-a-hub)
 - [Running as a service](#running-as-a-service)
 - [Brief templates and suites](#brief-templates-and-suites)
 - [Configuration](#configuration)
@@ -47,7 +48,7 @@ Run `bun run doctor` to check all of this. It prints one line per tool with a fi
 
 | Tool | Why | Required? | Install |
 | --- | --- | --- | --- |
-| [Bun](https://bun.sh) ≥ 1.3 | Runs the server, the UI bundler and the tests | Required | `curl -fsSL https://bun.sh/install \| bash` |
+| [Bun](https://bun.sh) ≥ 1.3.14 | Runs the server, the UI bundler and the tests | Required | `curl -fsSL https://bun.sh/install \| bash` |
 | An agent runtime, signed in: [omp](https://github.com/can1357/oh-my-pi), [Claude Code](https://code.claude.com) **or** [Codex CLI](https://github.com/openai/codex) | The QA agent. Tapocalypse starts one headless process of the harness you pick per run, and you need at least one. Doctor checks that each installed harness is signed in and requires only the one that is your default. See [Agent runtimes](#agent-runtimes) | Required (at least one of the three) | See [Agent runtimes](#agent-runtimes) |
 | Node.js 18+ with `npx` | Fetches and runs `@mobilenext/mobile-mcp`, the device driver. Tapocalypse starts it itself and serves its tools to each run pinned to the run's device, no config edit needed | Required | https://nodejs.org |
 | Android `adb` (platform-tools) | Talks to Android emulators and devices | Required for Android | Android Studio → SDK Manager, `brew install --cask android-platform-tools`, or your distro's `android-tools-adb`; put it on `PATH` or set `ADB_BIN` |
@@ -111,15 +112,18 @@ The sidebar is on every page: a **project switcher** that scopes the whole UI to
 
 | Page | What you do there |
 | --- | --- |
-| **Runs** (`#/`) | A live strip (running, queued, devices busy, how many are held by agents, 7-day pass rate and spend; each segment is a filter shortcut), an **Active** lane with a card per queued or running run (live screen, current check, progress, queue position and reason), and the history below. Filter by status, verdict, project and free text (title, branch, PR, ticket, commit); group by day, batch or nothing. Filters live in the URL, so they can be bookmarked. **New run** opens a sheet with brief templates, saved suites, recent briefs, harness, device, model, effort, package, working directory/PR and an optional app to install |
+| **Runs** (`#/`, also `#/runs`) | A live strip (running, queued, devices busy, how many are held by agents, 7-day pass rate and spend; each segment is a filter shortcut), an **Active** lane with a card per queued or running run (live screen, current check, progress, queue position and reason), and the history below. Filter by status, verdict, project and free text (title, branch, PR, ticket, commit); group by day, batch or nothing. Filters live in the URL, so they can be bookmarked. **New run** opens a sheet with brief templates, saved suites, recent briefs, harness, device, model, effort, package, working directory/PR and an optional app to install |
 | **Run** (`#/runs/<id>`) | The workbench. Header with status, the harness badge, verdict (tagged *derived* when the agent never reported one), device and actions: Cancel, Re-run (all checks or failed only), Open report, Transcript (when the harness exports one), Details, Delete. A phase stepper while active, an outcome callout when it ended (what went wrong in plain words, the stderr tail, Retry / Re-run failed), then three panes: the **checks** list, the **timeline** of the agent's tool calls paired with their results and the **device** pane (live screen, or the evidence screenshot of the selected check). A Screenshots tab shows the gallery; a steer box sends instructions to a running agent (hidden when the run's harness cannot be steered). Narrow windows switch to tabs |
 | **Batch** (`#/batches/<id>`) | One lane per device of a [batch](#batches), the rolled-up verdict and total cost, and **Re-run failed lanes** |
 | **Devices** | Run slots and emulators booted vs `maxBooted`, and how many devices are held by agents; a card per connected device with a live thumbnail and its state (Free, Running, Held by an agent with its holder, reason, time left and the agents and runs waiting, Booting, Idle with a shutdown countdown, Excluded, "not used for QA" for watches and TVs); **New run here**, **Release…** (end an agent's lease), a bell to be notified when a held device frees up, **Shut down** (devices Tapocalypse booted) and ghost cards with a **Boot** button for your configured AVDs and simulators. See [Sharing devices between agents](#sharing-devices-between-agents) |
-| **Setup** | A *Get started* checklist that ticks itself off (prerequisites, add a project, connect a device, first run, connect your coding agent), every doctor check (one pair per installed harness) with copyable fixes, and **Connect agent** snippets for omp, Claude Code and Cursor with live status of the first MCP call |
-| **Projects** | A card per project with its last runs, 7-day pass rate and spend; New run, Edit, Reports, Suites and Delete. The add-project wizard suggests folders and shows what detection found |
+| **Setup** | A *Get started* checklist that ticks itself off (prerequisites, add a project, connect a device, first run, connect your coding agent), every doctor check (one pair per installed harness) with copyable fixes, and **Connect agent** snippets for omp, Claude Code and Cursor with live status of the first MCP call. Setup also has **Connect to a team hub** (address, upload token, optional proxy headers, the upload queue): see [Sharing with your team](#sharing-with-your-team-report-links-or-a-hub) |
+| **Projects** | A card per project with its last runs, 7-day pass rate and spend; New run, Edit, Reports, Suites and Delete. The add-project wizard suggests folders and shows what detection found. A project that is shared with a team hub shows a *Shared* badge and its upload queue; the project form has the **Share with team hub** block |
 | **Reports** | Per-project report list (search, verdict tabs, grouped by day). A report page has an "On this page" outline, the run's details with a link back to it, a screenshot gallery (click any image) and a reading-progress bar |
 | **Compare** (`#/runs/<id>/compare/<baselineId>`) | One run against a baseline, check by check: newly failing first, then flaky, fixed, changed, still failing, new, removed and unchanged. Screenshots side by side, as a swipe or as an onion skin, the two notes, duration and cost deltas, and **Confirm / Unlink / Link** for matches Tapocalypse is unsure about. See [Regressions, history and flaky checks](#regressions-history-and-flaky-checks) |
 | **Flaky checks** (`#/p/<projectId>/flaky`, the second tab of **Reports**) | Checks of the project that flip between pass and fail on the same code and device, with their recent results, pass rate and last flip; open any of them to see its history. Says "Not enough history yet" until some check has run more than once |
+| **Overview** (`#/p/<projectId>/overview`) | The stakeholder landing page of a project: a pass-rate trend, the latest result per test and platform with recent history, counts of newly failing, flaky and failing-now checks, a branch or version selector and "what changed since the last release". Works on your own runs too; on a [team hub](hub.md) it covers everybody's |
+| **Releases** (`#/p/<projectId>/releases`, `#/p/<projectId>/releases/version/<name>`) | One release across every machine: a version (`build.version`) or a branch named `release/*`, `releases/*`, `hotfix/*` or `release-*`. Blockers first (failing, and *could not be tested* for BLOCKED), then a matrix of tests by devices with rounds and re-runs folded, and the changes against the previous release |
+| **About this hub** (`#/about`, hub only) | What a hub is, its address, version, run count, retention and the machines that upload, plus the three steps to connect a machine |
 
 **Regressions in the UI.** A finished or running run page shows a *Compared to* strip under its header: the auto-picked baseline run (change it with the picker or `b`), the verdict change (`PASS → FAIL`) and the counts (↓ newly failing, ↑ fixed, ❄ flaky, + new, − removed, = unchanged), with **Open comparison** (`c`). These links, the `↓ n` chip and `c` open the comparison with the automatic baseline (`#/runs/<id>/compare/auto`), so they show what the strip counted; a baseline you picked yourself stays picked in the links of that run page. Every check in the checks list carries a badge such as "was pass on main · 2d ago", and its **History** button (or `h`) opens the check's history in a side sheet: a strip of its recent results, the pass rate, and each result with branch, commit, device, note and screenshot. In the runs list a red `↓ 2` chip marks a run with checks that passed in its baseline and fail now, and **Has regressions** filters to those runs. When a finished run has newly failing checks, its toast and desktop notification say so.
 
@@ -158,6 +162,8 @@ A project tells Tapocalypse where your app's repository is and how to test it. A
 | `defaultPlatform` | `android` or `ios`, used when a run names no platform or device |
 | `agent` | Optional per-project override `{ harness?, model?, effort? }` of the [harness](#agent-runtimes), model and effort for this project's runs |
 | `defaultBranch` | Optional. The branch [regressions](#regressions-history-and-flaky-checks) compare a feature branch against (for example `main`). Unset: the remote's default branch (`origin/HEAD`), else `main` or `master` when the repo has one. Editable in the project form; clear it to go back to the fallback |
+| `share` | Optional, default off. When on (and a [team hub](hub.md) is connected), finished runs of this project upload to the hub. The project form's **Share with team hub** checkbox |
+| `hubKey` | Optional. The key under which this project's runs merge with teammates' on the hub, such as `github.com/acme/shop` or `github.com/acme/shop#apps/mobile`. Derived from the git remote `origin` (and the folder inside a monorepo); set it yourself when the repo has no remote or two projects would derive the same key |
 
 **Detection.** The UI wizard and `qa_detect_project` inspect the repo without running anything and suggest every field. They read: `pubspec.yaml` (Flutter), `package.json` dependencies (Expo, React Native), `app.json`/`app.config.json` (Expo ids), Gradle files and `AndroidManifest.xml` (`applicationId`, flavors and suffixes in `android/app`, `app`, `androidApp`, `composeApp`), Xcode `project.pbxproj` (`PRODUCT_BUNDLE_IDENTIFIER`), `shared`/`composeApp` modules (Kotlin Multiplatform), `.omp/agents/`, `.claude/agents/` and `.codex/agents/` for QA-looking persona files and whether the folder is a git repo. When several package ids exist it prefers one ending in `.dev` or `.debug`. The wizard also suggests app folders it finds under common code directories (`~/Projects`, `~/code`, `~/src`, `~/Developer`, …).
 
@@ -529,6 +535,31 @@ Both are disabled while the run is still active, because its report is not final
 
 Without `share.s3` the UI offers only the download, `tapocalypse share` exits 2 with a hint, and `qa_share_report` returns the file path and a note that links need `share.s3`.
 
+## Sharing with your team: report links or a hub
+
+Two ways to let other people see what Tapocalypse found. They solve different problems, and you can use both.
+
+| | [Report link or file](#sharing-a-report) | [Team hub](hub.md) |
+| --- | --- | --- |
+| For | "Look at this run" in a chat or ticket | "Is release 2.4 good to go?" for the whole team and stakeholders |
+| The viewer sees | One run | Every run your team uploaded: overview, releases, history, compare |
+| Setup | Nothing for a file; an S3-compatible bucket for links | A container with an access proxy, and a token per teammate's machine |
+| Who can open it | Anyone with the file or the link | Whoever your proxy or VPN lets in |
+| Expires | Links after at most 7 days | After the hub's retention (365 days by default) |
+| Stays in sync | No, it is a snapshot | Yes, runs upload when they finish and again when edited |
+
+**The hub in short.** A team hub is Tapocalypse in a read-only mode, running in a container somebody on the team hosts. Each teammate opts projects in to sharing; their machine then uploads every finished run in the background (the run, its activity feed, its report and screenshots, with paths rewritten and secret shapes masked, and never the raw agent events or transcript). Stakeholders open the hub's URL, log in at the access proxy, and see a project **Overview** (pass-rate trend, latest result per test and platform, what is newly failing) and **Releases** (one version or release branch across every teammate's runs, with blockers first), plus the usual run, report and compare pages without any control that writes.
+
+**Joining a hub as a teammate:**
+
+1. Ask the hub's admin for an upload token named after your machine (`tapocalypse hub token create <your-machine>` on the hub).
+2. `tapocalypse hub login https://qa.example.com` (or **Setup → Connect to a team hub**), paste the token. `tapocalypse hub status` should say it is connected.
+3. Open a project, tick **Share with team hub**, and choose whether to upload the runs you already have. Projects merge across machines by their git remote, so teammates working on the same repository land in one hub project; a repository without a remote needs a hub key you choose.
+4. Work as usual. A chip on each run shows *Queued*, *Uploading…*, *On team hub ↗*, or why it could not upload; the Projects page shows how many runs are waiting. Offline? Runs queue and upload later.
+5. To see what a run would send, `tapocalypse hub pack <runId> --out <dir>`. To take a run back, **Remove from team hub** on the run page, or `tapocalypse hub unpublish <runId>`. Deleting a run locally does not remove it from the hub.
+
+**Running a hub, securing it and fixing it:** [Team hub](hub.md) covers the Docker deployment, the three access-proxy recipes (oauth2-proxy, nginx `auth_request`, VPN only) and how to verify them, tokens, retention, backups and upgrades.
+
 ## Running as a service
 
 `tapocalypse service install` keeps Tapocalypse running in the background and starts it at login, so your coding agent's MCP calls always find it. On macOS it installs a launchd agent (`~/Library/LaunchAgents/dev.tapocalypse.server.plist`); on Linux a systemd user unit (`~/.config/systemd/user/tapocalypse.service`). Both run `<bun> <checkout>/src/cli.ts serve`, restart it if it exits with an error (a clean exit stays stopped), and write its output to `<data dir>/logs/service.log` (Linux: `journalctl --user -u tapocalypse`). The unit records your `PATH`, `HOME`, `NODE_ENV=production` and any `TAPOCALYPSE_*`, `ANDROID_HOME` / `ANDROID_SDK_ROOT` and harness binary variables (`OMP_BIN`, `CLAUDE_BIN`, `CODEX_BIN`, `ADB_BIN`, `XCRUN_BIN`, `EMULATOR_BIN`) set when you install, so run it from the shell that works with `bun start`; run `install` again after you change them.
@@ -613,6 +644,7 @@ Tapocalypse keeps three things outside your repositories: its config, its run hi
   transcript.html  full agent transcript (omp runs only)
 <data dir>/batches/                                     batch titles
 <data dir>/leases.json                                  agent device leases (owner-only; holds lease secrets)
+<data dir>/hub-outbox.json                              team hub upload queue and what was uploaded (laptops that share projects)
 <data dir>/logs/service.log                             output of the background service, if installed
 ```
 
@@ -636,11 +668,14 @@ Run ids look like `20260101-093015-a1b2-dark-mode-toggle`. By default nothing is
 
 Tapocalypse is a local developer tool with no login.
 
-- **Local only.** The server binds `127.0.0.1`. Do not expose the port (tunnels, port forwarding, reverse proxies).
+This section is about the normal, local app. A [team hub](hub.md) is a different deployment with its own model: read-only for viewers behind an access proxy you provide, and writes only with a per-machine upload token. See [the hub's access proxy section](hub.md#put-an-access-proxy-in-front).
+
+- **Local only.** The server binds `127.0.0.1`. Do not expose the port (tunnels, port forwarding, reverse proxies). To share results with a team, use [report links](#sharing-a-report) or a [team hub](hub.md) instead; never expose this app.
 - **Request guards.** Every request's `Host` must be `127.0.0.1:<port>` or `localhost:<port>` (blocks DNS rebinding). Writes carrying an `Origin` must come from those same origins, and JSON endpoints require `Content-Type: application/json` (blocks cross-site form posts). Clients without an `Origin`, such as `curl` and MCP clients, are allowed. Request bodies are capped at 1 MiB, and `/mcp` accepts only `POST`.
 - **Agents are trusted code.** Runs start the harness in its non-interactive, no-prompt mode: omp with `--auto-approve`, Claude Code with `--permission-mode bypassPermissions` (or, with `permissions: "allowlist"`, `dontAsk` plus an allowlist), Codex CLI with `--sandbox danger-full-access` and `approval_policy="never"`. The agent runs shell commands (`adb`, `xcrun`, anything else it decides to) as your user, in your repo, without asking. A brief is effectively a program you execute. Anyone or anything that can reach the port, including every local process and every MCP client you register, can start runs, so treat them as having your shell. Review third-party personas before using them.
 - **Reports are sanitized.** Markdown reports are rendered to HTML on the server and then sanitized: scripts, event handlers, iframes, styles, forms and `javascript:`-style links are stripped, and only `http`, `https`, `mailto`, relative and `#` links survive. External images are dropped and replaced by their alt text, so opening a report never contacts a third party. Task-list checkboxes are rendered disabled. Transcripts, which omp exports, are served with a `sandbox` Content-Security-Policy.
 - **Shared reports.** A standalone HTML report contains no script and may only load `data:` images, and agent text goes through the same sanitizer as the UI. A share link is an unguessable presigned URL to an object in a private bucket; whoever has the link can read that report until it expires (at most 7 days). Credentials come only from the server's environment, never from the config file or the UI. See [Sharing a report](#sharing-a-report).
+- **Team hub uploads.** A project only uploads when you turn on *Share with team hub*. What leaves the machine is the run document, the activity feed, the report and the screenshots, with your home, repository and temp paths rewritten and token-shaped secrets masked (`tapocalypse hub pack` shows it exactly); raw agent events, transcripts, the agent session, `stderr.log`, the run's MCP token and device serials never leave. Briefs and reports are uploaded as written, so do not put real credentials in them. The upload token is stored in `hub-credentials.json` (mode 600) or `TAPOCALYPSE_HUB_TOKEN`, never in the config file. See [Team hub](hub.md#what-is-uploaded-and-what-never-is).
 - **Content-Security-Policy.** The UI page allows only same-origin scripts, styles and connections, images from itself or `data:`/`blob:`, fonts from itself or `data:` (the bundled monospace font is inlined), and no plugins, base tags or foreign form targets.
 - **Frame protection.** Every API and file response carries `X-Frame-Options: DENY` and `frame-ancestors 'none'`; the UI page itself refuses to render inside another page. This stops clickjacking of a running instance.
 - **Guards on destructive actions.** Only finished runs can be deleted, only devices Tapocalypse booted (and no run or agent lease is using) can be shut down from the UI, projects with active runs cannot be removed, and retention only deletes run folders inside the data directory.
@@ -661,6 +696,7 @@ Start with `bun run doctor` (or the **Setup** page): it checks every prerequisit
 - **A run stays queued.** The run's card and page show the reason in plain words: `maxConcurrentRuns (n) reached`, `all android devices busy`, `no android device available`, `maxBooted (n) reached`, or `<serial> is busy` / `is not connected` / `is booting` for a run that named a device. When a coding agent holds the device the reason names it: `<serial> is held by <holder> until HH:MM`, or `all android devices busy (2 held by agents, 1 running QA)`. Physical devices are only used when requested by serial; to let a run start, free a device, raise the limits or list an AVD in `devicePool.android.avds`. A device held by a stuck agent can be released from the **Devices** page. The scheduler re-checks every 10 s.
 - **Slow element lists on Flutter apps.** mobile-mcp can take 15-25 s to dump a large Flutter tree. The agent is told to list elements once per screen and to batch actions.
 - **Emulator does not boot.** Names in `devicePool.android.avds` must match `emulator -list-avds` exactly (doctor flags unknown ones). Tapocalypse finds the emulator under `$ANDROID_HOME`, `$ANDROID_SDK_ROOT`, `~/Library/Android/sdk` (macOS) or `~/Android/Sdk` (Linux); elsewhere set `ANDROID_HOME` or `EMULATOR_BIN`. On Linux check KVM access (see [Operating systems](#operating-systems)). Try `emulator -avd <name>` by hand to see hardware-acceleration or disk-space errors. Booting is abandoned after 180 s.
+- **Team hub uploads do not happen or are paused.** `tapocalypse hub status` and `bun run doctor` say why: the token was rejected or revoked (save a new one with `tapocalypse hub login <url>`), the access proxy answered with a login page instead of passing the upload through, the hub needs a newer Tapocalypse (update, then retry), or the hub is unreachable (the queue retries on its own). The table in [Team hub → Troubleshooting](hub.md#troubleshooting) lists every case.
 - **Port 4310 is in use.** Start with another port: `TAPOCALYPSE_PORT=4311 bun start` (or set `port`), and update the URL in your MCP client config. Requests to a different host or port get `403 forbidden host`.
 - **A run ended `done` but the verdict is tagged "derived".** The agent stopped without calling `qa_finish` (often because it hit `runMaxTime`) and the verdict was computed from its checks. Open the activity feed (or, on omp, the transcript) to see why, then re-run the failed checks with a narrower brief or a larger `runMaxTime`. If no check had resolved, the run is `error` with kind `agent` ("agent ended without qa_finish").
 - **Screenshots look tiny or unreadable.** Emulators booted by Tapocalypse are raised to `minSize`; for ones you started yourself, use a larger AVD.
@@ -674,7 +710,8 @@ Roadmap, in no particular order. None of these exist today:
 - Scheduled and recurring runs (use cron plus the [CLI](#cli-and-ci) for now).
 - A Settings page with hot reload: the config file is edited by hand and read once at startup (projects are the exception).
 - A demo mode that works without devices or a model provider.
-- Authentication: there is no login or access token; Tapocalypse relies on binding to localhost.
+- Authentication in the local app: there is no login or access token; it relies on binding to localhost. (A [team hub](hub.md) delegates viewing to an access proxy you run in front of it and authorizes uploads with tokens.)
+- Hub extras: a SQLite summary store for hubs beyond about 10,000 runs, an S3-compatible blob store, Cloudflare Access JWT verification, a read-only MCP endpoint on the hub, and fetching regression hints from the hub before a run.
 - Frame-by-frame evidence replay and an action overlay (tap markers) on the live device screen.
 
 ## Development

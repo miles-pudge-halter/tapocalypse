@@ -1,0 +1,84 @@
+# Tapocalypse team hub behind an access proxy. Everything in <angle brackets> or example.com is a placeholder.
+#
+#   cp .env.hub.example .env.hub        # fill in the proxy's settings; never commit .env.hub
+#   docker compose --env-file .env.hub -f compose.hub.yml up -d --build
+#   docker compose -f compose.hub.yml exec hub bun src/cli.ts hub token create <machine-name>
+#
+# Three containers, one path split:
+#   nginx         the only entry point (127.0.0.1:4180). It sends the upload routes (protected by upload tokens) straight to
+#                 the hub and EVERYTHING else to oauth2-proxy, so no route of the hub is ever "skipped" by the login.
+#   oauth2-proxy  the login for viewers. It has no skip-auth rules, so the X-Forwarded-Uri spoofing bypass
+#                 (GHSA-7x63-xv5r-3p2x) has nothing to bypass; it is pinned to a fixed release anyway.
+#   hub           publishes no port: only containers on this compose network can reach it.
+# Terminate TLS in front of nginx (a reverse proxy, a load balancer or an ingress), send it the public host name, and have it
+# OVERWRITE (not pass on) any client-supplied X-Forwarded-* header. See docs/hub.md, "Verify the setup".
+services:
+  hub:
+    build: .
+    restart: unless-stopped
+    environment:
+      # The public host name(s) the proxy forwards (Host header allowlist, DNS-rebinding guard). Comma-separated.
+      TAPOCALYPSE_HUB_HOSTS: qa.example.com
+      # Header the proxy sets with the signed-in viewer; shown as "uploaded by". Only safe because the hub port is
+      # reachable through the proxies alone (no `ports:` below). Remove the line when your proxy sends no such header.
+      TAPOCALYPSE_HUB_IDENTITY_HEADER: X-Forwarded-Email
+      # Hub retention: 365 days by default, "0" keeps everything.
+      # TAPOCALYPSE_HUB_RETENTION_DAYS: "365"
+    volumes:
+      - hub-data:/data
+    mem_limit: 1g
+    expose:
+      - "4310"
+
+  oauth2-proxy:
+    # Any login proxy works (nginx auth_request, a VPN, a tunnel...). Keep it >= 7.15.2: older releases trust a client-supplied
+    # X-Forwarded-Uri when --reverse-proxy and a skip-auth rule are combined (GHSA-7x63-xv5r-3p2x, CVE-2026-40575).
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.2
+    restart: unless-stopped
+    depends_on:
+      hub:
+        condition: service_healthy
+    expose:
+      - "4180"
+    environment:
+      OAUTH2_PROXY_HTTP_ADDRESS: 0.0.0.0:4180
+      OAUTH2_PROXY_UPSTREAMS: http://hub:4310
+      OAUTH2_PROXY_PROVIDER: oidc
+      OAUTH2_PROXY_OIDC_ISSUER_URL: https://idp.example.com
+      OAUTH2_PROXY_CLIENT_ID: ${OIDC_CLIENT_ID}
+      OAUTH2_PROXY_CLIENT_SECRET: ${OIDC_CLIENT_SECRET}
+      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_COOKIE_SECRET}
+      OAUTH2_PROXY_COOKIE_SECURE: "true"
+      OAUTH2_PROXY_REDIRECT_URL: https://qa.example.com/oauth2/callback
+      OAUTH2_PROXY_EMAIL_DOMAINS: example.com
+      # nginx sits in front and carries the original host and scheme. Trust forwarded headers from the compose network
+      # (pinned below) and from nothing else: without this list every client counts as a trusted proxy.
+      OAUTH2_PROXY_REVERSE_PROXY: "true"
+      OAUTH2_PROXY_TRUSTED_PROXY_IPS: 172.29.40.0/24
+      # Sends X-Forwarded-Email upstream (see TAPOCALYPSE_HUB_IDENTITY_HEADER above).
+      OAUTH2_PROXY_PASS_USER_HEADERS: "true"
+      # Hub pages need the original Host so the hub's Host allowlist matches.
+      OAUTH2_PROXY_PASS_HOST_HEADER: "true"
+      # Deliberately no OAUTH2_PROXY_SKIP_AUTH_ROUTES: the upload routes are split off in nginx.
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      - hub
+      - oauth2-proxy
+    ports:
+      # Plain HTTP on loopback: put your TLS terminator in front of it.
+      - "127.0.0.1:4180:80"
+    volumes:
+      - ./nginx.hub.conf:/etc/nginx/conf.d/default.conf:ro
+
+networks:
+  default:
+    ipam:
+      config:
+        # Fixed so that OAUTH2_PROXY_TRUSTED_PROXY_IPS can name it. Change both together if it clashes with your network.
+        - subnet: 172.29.40.0/24
+
+volumes:
+  hub-data: {}

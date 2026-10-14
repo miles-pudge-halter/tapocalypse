@@ -4,19 +4,35 @@ import type { Check, KeyKind, Run } from "../runs/types";
 const LEADING_ID = /^\s*([A-Z]{1,3}\d+[a-z]?(\.\d+)?|[A-Z]\d*-[A-Z]?\d+)(\s*[:/—-]\s*|\s+)/;
 const FILLER = new Set(["a", "an", "the", "is", "are", "be", "to", "verify", "check", "ensure", "confirm", "that", "this", "it", "its"]);
 
-/** Tokens of a title, in order: accents dropped, agent id stripped, lowercased, split on non-letters/digits, filler removed. */
-function titleTokens(title: string): string[] {
-  const plain = title.normalize("NFKD").replace(/\p{M}/gu, "").replace(LEADING_ID, "");
-  return plain
+/** Only the first part of a title identifies a check; a longer title (an upload can carry 2,000 characters) would make every comparison cost more for no better key. */
+export const KEY_TITLE_CHARS = 300;
+const TOKEN_CACHE_MAX = 4096;
+const tokenCache = new Map<string, { tokens: readonly string[]; set: ReadonlySet<string> }>();
+
+/** Tokens of a title, in order: accents dropped, agent id stripped, lowercased, split on non-letters/digits, filler removed. Memoised: matching compares the same titles many times. */
+function tokenized(title: string): { tokens: readonly string[]; set: ReadonlySet<string> } {
+  const cached = tokenCache.get(title);
+  if (cached) return cached;
+  const tokens = title
+    .slice(0, KEY_TITLE_CHARS)
+    .normalize("NFKD")
+    .replace(/\p{M}/gu, "")
+    .replace(LEADING_ID, "")
     .toLowerCase()
     .split(/[^\p{L}\p{N}]+/u)
     .filter((t) => t !== "" && !FILLER.has(t));
+  if (tokenCache.size >= TOKEN_CACHE_MAX) tokenCache.clear();
+  const entry = { tokens, set: new Set(tokens) };
+  tokenCache.set(title, entry);
+  return entry;
 }
+
+const titleTokens = (title: string): readonly string[] => tokenized(title).tokens;
 
 /** A title reduced to what identifies the check: the same check worded with another id, case or filler words compares equal. */
 export function canonicalTitle(title: string): string {
   const tokens = titleTokens(title);
-  return tokens.length > 0 ? tokens.join(" ") : title.trim();
+  return tokens.length > 0 ? tokens.join(" ") : title.trim().slice(0, KEY_TITLE_CHARS);
 }
 
 export const sha256url = (text: string, length: number): string => createHash("sha256").update(text).digest("base64url").slice(0, length);
@@ -50,12 +66,14 @@ const TICKET = /(?<![\p{L}\p{N}])([A-Z][A-Z0-9]+-\d+|#\d+)(?![\p{L}\p{N}])/gu;
 
 /** How likely two checks test the same thing: token Jaccard, +0.25 for a shared ticket key, +0.1 for the same id. Range 0–1.35. */
 export function matchScore(a: { id: string; title: string }, b: { id: string; title: string }): number {
-  const left = new Set(titleTokens(a.title));
-  const right = new Set(titleTokens(b.title));
-  const union = new Set([...left, ...right]).size;
-  let score = union === 0 ? 0 : [...left].filter((t) => right.has(t)).length / union;
-  const tickets = new Set(a.title.match(TICKET));
-  if (b.title.match(TICKET)?.some((t) => tickets.has(t))) score += 0.25;
+  const left = tokenized(a.title).set;
+  const right = tokenized(b.title).set;
+  let shared = 0;
+  for (const t of left) if (right.has(t)) shared++;
+  const union = left.size + right.size - shared;
+  let score = union === 0 ? 0 : shared / union;
+  const tickets = new Set(a.title.slice(0, KEY_TITLE_CHARS).match(TICKET));
+  if (tickets.size > 0 && b.title.slice(0, KEY_TITLE_CHARS).match(TICKET)?.some((t) => tickets.has(t))) score += 0.25;
   if (a.id === b.id) score += 0.1;
   return score;
 }
@@ -104,14 +122,17 @@ function lineageKey(run: Pick<Run, "retryOf" | "rerunOf">, checkId: string, look
 
 /** Runs of the same test searched for an inferred key, newest first. */
 const INFERENCE_WINDOW = 3;
+/** Title comparisons one run may spend on inferred keys; a run of 40 checks against 3 runs of 40 needs 4,800. Past the budget a check just gets its title key. */
+const COMPARISON_BUDGET = 20_000;
 export const INFERRED_THRESHOLD = 0.6;
 
 /** The best-scoring key of the test's last runs that this run has not used yet, when it reaches the threshold (ties: the newer run, the earlier check). */
-function bestMatch(run: Run, check: Check, used: ReadonlySet<string>, lookup: KeyLookup): { checkKey: string; score: number } | null {
+function bestMatch(run: Run, check: Check, used: ReadonlySet<string>, lookup: KeyLookup, budget: { left: number }): { checkKey: string; score: number } | null {
   let best: { checkKey: string; score: number } | null = null;
   for (const earlier of lookup.recentTestRuns(run.projectId, run.testKey!, run.createdAt, INFERENCE_WINDOW)) {
     for (const candidate of earlier.checks) {
       if (!candidate.checkKey || used.has(candidate.checkKey)) continue;
+      if (budget.left-- <= 0) return best;
       const score = matchScore(check, candidate);
       if (score + 1e-9 >= INFERRED_THRESHOLD && (!best || score > best.score + 1e-9)) best = { checkKey: candidate.checkKey, score };
     }
@@ -137,6 +158,7 @@ export function assignCheckKeys(run: Run, lookup: KeyLookup): Map<string, Assign
   const used = new Set(run.checks.flatMap((c) => (c.checkKey ? [c.checkKey] : [])));
   const seen = new Set<string>();
   const claimed = new Set<string>();
+  const budget = { left: COMPARISON_BUDGET };
 
   for (const check of run.checks) {
     if (seen.has(check.id)) continue;
@@ -173,7 +195,7 @@ export function assignCheckKeys(run: Run, lookup: KeyLookup): Map<string, Assign
       take({ checkKey: tKey, keyKind: "title" });
       continue;
     }
-    const inferred = run.testKey === null ? null : bestMatch(run, check, used, lookup);
+    const inferred = run.testKey === null ? null : bestMatch(run, check, used, lookup, budget);
     if (inferred) {
       take({ checkKey: inferred.checkKey, keyKind: "inferred", keyScore: inferred.score });
       continue;

@@ -2,6 +2,8 @@ import {
   ChevronsUpDown,
   FileText,
   FolderKanban,
+  Info,
+  LayoutDashboard,
   LayoutList,
   Monitor,
   Moon,
@@ -10,11 +12,15 @@ import {
   Settings2,
   Smartphone,
   Sun,
+  Tag,
+  type LucideIcon,
 } from "lucide-react";
 import { useEffect } from "react";
 import pkg from "../../package.json";
 import { LogoMark, Wordmark } from "@/components/brand";
 import { openCommandPalette } from "@/components/command-palette";
+import { MachinesNav } from "@/components/hub/machines-nav";
+import { TeamHubBadge } from "@/components/hub/team-hub-badge";
 import { NotificationsToggle } from "@/components/notifications";
 import {
   DropdownMenu,
@@ -46,12 +52,15 @@ import {
   useActiveRuns,
   useDevices,
   useDoctor,
+  useHubStatus,
   useLiveConnection,
   useProjectScope,
   useProjects,
   useRoute,
 } from "@/lib/hooks";
+import { overviewHash, releasesHash } from "@/lib/api";
 import { deviceCounts } from "@/lib/leases";
+import { isHub } from "@/lib/mode";
 import { type Theme, useTheme } from "@/lib/theme";
 import { cn } from "@/lib/utils";
 
@@ -60,6 +69,7 @@ function ProjectSwitcher() {
   const { projectId, setProjectId } = useProjectScope();
   const ready = projects.filter((p) => p.status === "ok");
   const current = ready.find((p) => p.id === projectId);
+  const hub = isHub();
 
   // A scope that no longer exists (deleted/renamed project) must not silently filter every page to nothing.
   useEffect(() => {
@@ -71,11 +81,18 @@ function ProjectSwitcher() {
       <SidebarMenuItem>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <SidebarMenuButton size="lg" tooltip={current?.name ?? "All projects"} className="data-[state=open]:bg-sidebar-accent">
+            <SidebarMenuButton
+              size="lg"
+              tooltip={hub ? `Team hub · ${current?.name ?? "All projects"}` : (current?.name ?? "All projects")}
+              className="data-[state=open]:bg-sidebar-accent"
+            >
               <LogoMark size={32} />
               <div className="grid flex-1 gap-1 text-left leading-tight">
                 <Wordmark className="h-[11px]" />
-                <span className="truncate text-xs text-muted-foreground">{current?.name ?? "All projects"}</span>
+                <div className="flex min-w-0 items-center gap-1.5">
+                  {hub ? <TeamHubBadge /> : null}
+                  <span className="truncate text-xs text-muted-foreground">{current?.name ?? "All projects"}</span>
+                </div>
               </div>
               <ChevronsUpDown className="ml-auto size-4 text-muted-foreground" />
             </SidebarMenuButton>
@@ -91,9 +108,15 @@ function ProjectSwitcher() {
               ))}
             </DropdownMenuRadioGroup>
             <DropdownMenuSeparator />
-            <DropdownMenuItem onSelect={() => navigate("#/projects?new=1")}>
-              <Plus /> Add project
-            </DropdownMenuItem>
+            {hub ? (
+              <DropdownMenuItem onSelect={() => navigate("#/about")}>
+                <Info /> About this hub
+              </DropdownMenuItem>
+            ) : (
+              <DropdownMenuItem onSelect={() => navigate("#/projects?new=1")}>
+                <Plus /> Add project
+              </DropdownMenuItem>
+            )}
           </DropdownMenuContent>
         </DropdownMenu>
       </SidebarMenuItem>
@@ -108,7 +131,7 @@ function RunsNav({ active }: { active: boolean }) {
   return (
     <SidebarMenuItem>
       <SidebarMenuButton asChild isActive={active} tooltip="Runs" className="strike">
-        <a href="#/">
+        <a href="#/runs">
           <LayoutList />
           <span>Runs</span>
         </a>
@@ -154,7 +177,20 @@ function DevicesNav({ active }: { active: boolean }) {
   );
 }
 
-function ReportsNav({ active }: { active: boolean }) {
+/** A nav item for a page that belongs to one project: a link for the scoped (or only) project, else a project dropdown. */
+function ProjectNav({
+  label,
+  dropdownLabel,
+  icon: Icon,
+  active,
+  hrefFor,
+}: {
+  label: string;
+  dropdownLabel: string;
+  icon: LucideIcon;
+  active: boolean;
+  hrefFor(projectId: string): string;
+}) {
   const { projects } = useProjects();
   const { projectId } = useProjectScope();
   const ready = projects.filter((p) => p.status === "ok");
@@ -162,10 +198,10 @@ function ReportsNav({ active }: { active: boolean }) {
   if (target) {
     return (
       <SidebarMenuItem>
-        <SidebarMenuButton asChild isActive={active} tooltip="Reports" className="strike">
-          <a href={`#/p/${encodeURIComponent(target.id)}/reports`}>
-            <FileText />
-            <span>Reports</span>
+        <SidebarMenuButton asChild isActive={active} tooltip={label} className="strike">
+          <a href={hrefFor(target.id)}>
+            <Icon />
+            <span>{label}</span>
           </a>
         </SidebarMenuButton>
       </SidebarMenuItem>
@@ -175,16 +211,16 @@ function ReportsNav({ active }: { active: boolean }) {
     <SidebarMenuItem>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <SidebarMenuButton isActive={active} tooltip="Reports" className="strike">
-            <FileText />
-            <span>Reports</span>
+          <SidebarMenuButton isActive={active} tooltip={label} className="strike">
+            <Icon />
+            <span>{label}</span>
           </SidebarMenuButton>
         </DropdownMenuTrigger>
         <DropdownMenuContent side="right" align="start">
-          <DropdownMenuLabel>Project reports</DropdownMenuLabel>
+          <DropdownMenuLabel>{dropdownLabel}</DropdownMenuLabel>
           {ready.length === 0 && <DropdownMenuItem disabled>No projects yet</DropdownMenuItem>}
           {ready.map((p) => (
-            <DropdownMenuItem key={p.id} onSelect={() => navigate(`#/p/${encodeURIComponent(p.id)}/reports`)}>
+            <DropdownMenuItem key={p.id} onSelect={() => navigate(hrefFor(p.id))}>
               {p.name}
             </DropdownMenuItem>
           ))}
@@ -196,12 +232,14 @@ function ReportsNav({ active }: { active: boolean }) {
 
 function SetupNav({ active }: { active: boolean }) {
   const { blocked } = useDoctor();
+  const { status } = useHubStatus();
+  const paused = status?.paused ?? null;
   return (
     <SidebarMenuItem>
       <SidebarMenuButton
         asChild
         isActive={active}
-        tooltip={blocked ? "Setup — a required prerequisite is missing" : "Setup"}
+        tooltip={blocked ? "Setup — a required prerequisite is missing" : paused ? "Setup: team hub uploads are paused" : "Setup"}
         className="strike"
       >
         <a href="#/setup">
@@ -209,11 +247,14 @@ function SetupNav({ active }: { active: boolean }) {
           <span>Setup</span>
         </a>
       </SidebarMenuButton>
-      {blocked && (
+      {(blocked || paused) && (
         <span
           role="img"
-          aria-label="Setup needed"
-          className="pointer-events-none absolute right-2 top-1/2 size-2 -translate-y-1/2 rounded-full bg-red-500 group-data-[collapsible=icon]:right-1 group-data-[collapsible=icon]:top-1.5 group-data-[collapsible=icon]:translate-y-0"
+          aria-label={blocked ? "Setup needed" : "Team hub uploads paused"}
+          className={cn(
+            "pointer-events-none absolute right-2 top-1/2 size-2 -translate-y-1/2 rounded-full group-data-[collapsible=icon]:right-1 group-data-[collapsible=icon]:top-1.5 group-data-[collapsible=icon]:translate-y-0",
+            blocked ? "bg-red-500" : "bg-orange-400",
+          )}
         />
       )}
     </SidebarMenuItem>
@@ -258,7 +299,7 @@ function LiveIndicator() {
   return (
     <SidebarMenuItem>
       <SidebarMenuButton
-        tooltip={live ? "Live — receiving run updates" : "Reconnecting to the Tapocalypse server…"}
+        tooltip={live ? (isHub() ? "Live: new uploads appear automatically" : "Live — receiving run updates") : "Reconnecting to the Tapocalypse server…"}
         className="cursor-default hover:bg-transparent active:bg-transparent"
         aria-live="polite"
       >
@@ -276,7 +317,8 @@ function LiveIndicator() {
 
 export function AppSidebar() {
   const route = useRoute();
-  const runsActive = route.name === "runs" || route.name === "run" || route.name === "compare" || route.name === "batch";
+  const hub = isHub();
+  const runsActive = route.name === "run" || route.name === "compare" || route.name === "batch" || route.name === "runs" || (!hub && route.name === "home");
   return (
     <Sidebar collapsible="icon">
       <SidebarHeader>
@@ -298,9 +340,28 @@ export function AppSidebar() {
                   <Kbd className="ml-auto group-data-[collapsible=icon]:hidden">{MOD_KEY_LABEL} K</Kbd>
                 </SidebarMenuButton>
               </SidebarMenuItem>
+              {hub ? (
+                <SidebarMenuItem>
+                  <SidebarMenuButton asChild isActive={route.name === "home" || route.name === "overview"} tooltip="Overview" className="strike">
+                    <a href="#/">
+                      <LayoutDashboard />
+                      <span>Overview</span>
+                    </a>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              ) : (
+                <ProjectNav label="Overview" dropdownLabel="Project overview" icon={LayoutDashboard} active={route.name === "overview"} hrefFor={(id) => overviewHash(id)} />
+              )}
+              <ProjectNav label="Releases" dropdownLabel="Project releases" icon={Tag} active={route.name === "releases" || route.name === "release"} hrefFor={releasesHash} />
               <RunsNav active={runsActive} />
-              <DevicesNav active={route.name === "devices"} />
-              <ReportsNav active={route.name === "reports" || route.name === "report" || route.name === "flaky"} />
+              {hub ? null : <DevicesNav active={route.name === "devices"} />}
+              <ProjectNav
+                label="Reports"
+                dropdownLabel="Project reports"
+                icon={FileText}
+                active={route.name === "reports" || route.name === "report" || route.name === "flaky"}
+                hrefFor={(id) => `#/p/${encodeURIComponent(id)}/reports`}
+              />
               <SidebarMenuItem>
                 <SidebarMenuButton asChild isActive={route.name === "projects"} tooltip="Projects" className="strike">
                   <a href="#/projects">
@@ -309,13 +370,29 @@ export function AppSidebar() {
                   </a>
                 </SidebarMenuButton>
               </SidebarMenuItem>
-              <SetupNav active={route.name === "setup"} />
+              {hub ? (
+                <SidebarMenuItem>
+                  <SidebarMenuButton asChild isActive={route.name === "about"} tooltip="About this hub" className="strike">
+                    <a href="#/about">
+                      <Info />
+                      <span>About this hub</span>
+                    </a>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              ) : (
+                <SetupNav active={route.name === "setup"} />
+              )}
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>
       </SidebarContent>
       <SidebarFooter>
         <SidebarMenu>
+          {hub ? (
+            <SidebarMenuItem>
+              <MachinesNav />
+            </SidebarMenuItem>
+          ) : null}
           <LiveIndicator />
           <SidebarMenuItem>
             <NotificationsToggle />
@@ -324,6 +401,7 @@ export function AppSidebar() {
           <SidebarMenuItem>
             <span className="flex items-center gap-1.5 px-2 py-1 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden">
               v{pkg.version}
+              {hub ? " · hub" : ""}
             </span>
           </SidebarMenuItem>
         </SidebarMenu>

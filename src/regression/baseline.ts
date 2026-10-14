@@ -1,9 +1,9 @@
 import { GIT_BIN, HttpError } from "../config";
 import { exec } from "../devices/devices";
 import { getProject, type Project } from "../projects/registry";
-import { getRun, listRuns } from "../runs/store";
+import { getRun } from "../runs/store";
 import { ACTIVE, type Check, type CheckStatus, type KeyKind, type Platform, type Run } from "../runs/types";
-import { keysOf, runsOfTest } from "./index";
+import { indexedRun, keysOf, linkedRuns, runsOfTest } from "./index";
 import type { Baseline, BaselineTier } from "./types";
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -72,6 +72,8 @@ export function refreshDefaultBranch(project: Pick<Project, "repoPath">): Promis
  */
 export function defaultBranch(project: Pick<Project, "repoPath"> & { defaultBranch?: string }): string | null {
   if (project.defaultBranch) return project.defaultBranch;
+  // A hub project has no repository to ask: its default branch is what the uploaders reported.
+  if (!project.repoPath) return null;
   const hit = detected.get(project.repoPath);
   if (!hit || gitDefaults.now() - hit.at >= DEFAULT_BRANCH_TTL_MS) void refreshDefaultBranch(project);
   return hit?.value ?? null;
@@ -101,7 +103,7 @@ function buildLabel(run: Run): string | null {
 /** Ids of the run, its rerun/retry ancestors and every descendant of any of them. */
 export function lineageOf(head: Run): Set<string> {
   // Only runs with a parent link can join a lineage: the fixed point below never needs the rest.
-  const byId = new Map(listRuns({ projectId: head.projectId }).filter((r) => r.rerunOf !== null || r.retryOf !== null).map((r) => [r.id, r]));
+  const byId = new Map(linkedRuns(head.projectId).map((r) => [r.id, r]));
   byId.set(head.id, head);
   const seen = new Set<string>([head.id]);
   for (let grew = true; grew; ) {
@@ -125,17 +127,20 @@ export function lineageOf(head: Run): Set<string> {
 export function headSnapshot(run: Run): Run[] {
   if (isDirty(run)) return [run];
   const lineage = lineageOf(run);
-  const same = listRuns({ projectId: run.projectId }).filter(
-    (r) =>
-      r.id !== run.id &&
-      lineage.has(r.id) &&
-      r.createdAt < run.createdAt &&
-      r.retriedBy === null &&
-      isTerminalRun(r) &&
-      !isDirty(r) &&
-      platformOf(r) === platformOf(run) &&
-      commitOf(r) === commitOf(run),
-  );
+  const same = [...lineage]
+    .flatMap((id) => indexedRun(id) ?? [])
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .filter(
+      (r) =>
+        r.id !== run.id &&
+        r.projectId === run.projectId &&
+        r.createdAt < run.createdAt &&
+        r.retriedBy === null &&
+        isTerminalRun(r) &&
+        !isDirty(r) &&
+        platformOf(r) === platformOf(run) &&
+        commitOf(r) === commitOf(run),
+    );
   return [run, ...same];
 }
 

@@ -59,7 +59,7 @@ type RunDefaultKey = keyof typeof RUN_DEFAULTS;
 /** What callers of `createRun` must supply: everything but the generated id/createdAt and the optional newer fields. */
 export type NewRun = Omit<Run, "id" | "createdAt" | RunDefaultKey> & Partial<Pick<Run, RunDefaultKey>>;
 
-function normalizeRun(raw: Run): Run {
+export function normalizeRun(raw: Run): Run {
   const run = raw as unknown as Record<string, unknown>;
   for (const [key, value] of Object.entries(RUN_DEFAULTS)) run[key] ??= value;
   // A corrupt or foreign harness id would leave replay and start without an adapter.
@@ -239,12 +239,28 @@ function activityFrame(frame: unknown, seq: number): Activity | null {
   return activity;
 }
 
+/** A hub copy keeps the uploader's mapped feed instead of raw frames; items carry their original `seq`, which is not contiguous. */
+function readStoredActivity(file: string, opts: { before?: number; limit: number }): { items: Activity[]; hasMore: boolean } {
+  const all: Activity[] = [];
+  for (const line of readFileSync(file, "utf8").split("\n")) {
+    const item = line ? (parseLine(line) as Partial<Activity> | null) : null;
+    if (item && typeof item.seq === "number" && typeof item.text === "string" && typeof item.kind === "string" && typeof item.ts === "string") all.push(item as Activity);
+  }
+  all.sort((a, b) => a.seq - b.seq);
+  const before = opts.before ?? Number.POSITIVE_INFINITY;
+  const eligible = all.filter((a) => a.seq < before);
+  const limit = Math.max(0, opts.limit);
+  return { items: eligible.slice(Math.max(0, eligible.length - limit)), hasMore: eligible.length > limit };
+}
+
 /**
  * Activity page: the newest `limit` items with `seq < before` (or the newest overall), oldest first.
  * Only the lines it walks are mapped to feed lines; the rest are scanned once for tool-call starts (to resolve tool
  * names and durations), incrementally across calls.
  */
 export function readActivity(id: string, opts: { before?: number; limit: number }): { items: Activity[]; hasMore: boolean } {
+  const stored = path.join(runDir(id), "activity.jsonl");
+  if (existsSync(stored)) return readStoredActivity(stored, opts);
   const file = path.join(runDir(id), "events.jsonl");
   if (!existsSync(file)) return { items: [], hasMore: false };
   const text = readFileSync(file, "utf8");

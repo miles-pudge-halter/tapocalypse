@@ -26,6 +26,15 @@ import { HARNESS_IDS, HarnessIdSchema, type HarnessId } from "./harness/types";
 import { handleRunMcp } from "./mcp/run-server";
 import { acquireDevice, activeRunIds, handleMcp, mcpStatus, releaseDevice, renewDevice } from "./mcp/server";
 import { listModels } from "./models";
+import { hubAllowedHosts, hubAllowedOrigins, hubRouteAllowed } from "./hub/gate";
+import { HubHttpError } from "./hub/ingest";
+import { isHub } from "./hub/mode";
+import { hubProjectsView } from "./hub/projects";
+import { laptopHubRoute } from "./hub/laptop-routes";
+import { projectHubInfo, queueBackfill } from "./hub/project-hub";
+import { healthView, hubV1Route } from "./hub/routes";
+import { subscribeHubSync } from "./hub/sync";
+import { overviewRoute } from "./overview";
 import { detectProject } from "./projects/detect";
 import {
   createProject,
@@ -53,6 +62,8 @@ const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
   "Cache-Control": "no-cache",
   Connection: "keep-alive",
+  // nginx (and proxies modelled on it) buffer proxied responses by default; a buffered stream never delivers its first frame.
+  "X-Accel-Buffering": "no",
 };
 const PING_MS = 15_000;
 const SNAPSHOT_ACTIVITY = 200;
@@ -100,7 +111,10 @@ function connectedSerials(): Promise<ConnectedSerials> {
  */
 function hasJsonBody(method: string, parts: string[]): boolean {
   const [root, a, b, c] = parts;
-  if (method === "PUT") return parts.length === 3 && root === "api" && a === "projects";
+  if (method === "PUT") {
+    if (root !== "api") return false;
+    return (parts.length === 3 && (a === "projects" || (a === "hub" && b === "connection"))) || (parts.length === 5 && a === "hub" && b === "v1" && c === "runs");
+  }
   if (method === "DELETE") return parts.length === 2 && root === "api" && a === "check-links";
   if (method !== "POST") return false;
   if (root === "mcp") return parts.length === 1 || (parts.length === 3 && a === "runs");
@@ -110,23 +124,34 @@ function hasJsonBody(method: string, parts: string[]): boolean {
     return (
       (a === "projects" && (b === "validate" || b === "detect")) ||
       (a === "devices" && b === "boot") ||
-      (a === "leases" && (b === "renew" || b === "release"))
+      (a === "leases" && (b === "renew" || b === "release")) ||
+      (a === "hub" && (b === "test" || b === "push"))
     );
   }
   if (parts.length === 4) {
-    return (a === "projects" && c === "suites") || (a === "runs" && (c === "steer" || c === "rerun" || c === "export" || c === "share")) || (a === "devices" && c === "release");
+    return (
+      (a === "projects" && c === "suites") ||
+      (a === "runs" && (c === "steer" || c === "rerun" || c === "export" || c === "share" || c === "unpublish")) ||
+      (a === "devices" && c === "release")
+    );
   }
-  return false;
+  return parts.length === 5 && a === "hub" && b === "v1" && ((c === "blobs" && parts[4] === "check") || c === "admin");
 }
 
-/** Blocks DNS rebinding (Host) and cross-site writes (Origin, Content-Type); Origin-less clients such as curl stay allowed. */
+/**
+ * Blocks DNS rebinding (Host) and cross-site writes (Origin, Content-Type); Origin-less clients such as curl stay allowed.
+ * On the hub the Host allowlist also holds `TAPOCALYPSE_HUB_HOSTS` (the names the access proxy forwards), and writes may
+ * come from `https://<such a host>`.
+ */
 function guardRequest(req: Request, parts: string[]): void {
-  const hosts = [`127.0.0.1:${config.port}`, `localhost:${config.port}`];
-  const host = req.headers.get("host");
+  const hub = isHub();
+  const hosts = hub ? hubAllowedHosts(config.port) : [`127.0.0.1:${config.port}`, `localhost:${config.port}`];
+  const origins = hub ? hubAllowedOrigins(config.port) : hosts.map((h) => `http://${h}`);
+  const host = req.headers.get("host")?.toLowerCase();
   if (!host || !hosts.includes(host)) throw new HttpError(403, "forbidden host");
   if (req.method === "GET" || req.method === "HEAD") return;
   const origin = req.headers.get("origin");
-  if (origin !== null && !hosts.some((h) => origin === `http://${h}`)) throw new HttpError(403, "forbidden origin");
+  if (origin !== null && !origins.includes(origin.toLowerCase())) throw new HttpError(403, "forbidden origin");
   if (hasJsonBody(req.method, parts) && !req.headers.get("content-type")?.startsWith("application/json")) {
     throw new HttpError(415, "content-type must be application/json");
   }
@@ -197,6 +222,8 @@ function csvParam(url: URL, name: string): string[] | undefined {
   return values?.length ? values : undefined;
 }
 
+/** The part of a project form that asks about team-hub sharing. */
+const SharedProjectForm = z.object({ share: z.literal(true), repoPath: z.string(), hubKey: z.string().nullish() });
 const BoolParam = z.enum(["1", "true", "0", "false"]).transform((v) => v === "1" || v === "true");
 const PlatformParam = z.enum(["android", "ios"]);
 const CompareQuery = z.object({ baseline: z.string().min(1).max(200).default("auto"), includeFlaky: BoolParam.default(false) });
@@ -296,15 +323,18 @@ function globalEvents(req: Request): Response {
     req,
     (send) => {
       const onRun = (updated: Run) => send("run", runView(updated));
-      const onProjects = () => send("projects", listProjects());
+      const onProjects = () => send("projects", isHub() ? hubProjectsView() : listProjects());
       const onLease = (event: LeaseEvent) => send("lease", event);
       scheduler.bus.on("run", onRun);
       projectEvents.on("change", onProjects);
       leaseBus.on("lease", onLease);
+      // Laptop only: upload progress of runs and the connection status for the UI's chips.
+      const offHub = isHub() ? null : subscribeHubSync((event) => send("hub", event));
       return () => {
         scheduler.bus.off("run", onRun);
         projectEvents.off("change", onProjects);
         leaseBus.off("lease", onLease);
+        offHub?.();
       };
     },
     ["hello", {}],
@@ -365,6 +395,20 @@ async function route(req: Request, url: URL): Promise<Response> {
   const parts = pathname.split("/").filter(Boolean).map(decodeURIComponent);
   guardRequest(req, parts);
 
+  if (method === "GET" && parts.length === 2 && parts[0] === "api" && parts[1] === "health") return json(healthView(isHub() ? "hub" : "local"));
+  if (isHub()) {
+    if (parts[0] === "api" && parts[1] === "hub" && parts[2] === "v1") return hubV1Route(req, parts);
+    // Everything that is not a read-only viewer route (runs, devices, repos, MCP) does not exist on the hub.
+    if (!hubRouteAllowed(method, parts)) throw new HttpError(404, "not available on the team hub");
+  } else {
+    const laptop = await laptopHubRoute(req, url);
+    if (laptop) return laptop;
+  }
+  if (parts[0] === "api") {
+    const overview = await overviewRoute(req, url);
+    if (overview) return overview;
+  }
+
   if (parts[0] === "mcp" && (parts.length === 1 || (parts.length === 3 && parts[1] === "runs"))) {
     if (method !== "POST") return json({ error: "method not allowed" }, 405, { Allow: "POST" });
     return parts.length === 1 ? handleMcp(req) : handleRunMcp(req, parts[2], (id) => runner.progressLookup(id));
@@ -382,30 +426,43 @@ async function route(req: Request, url: URL): Promise<Response> {
 
   if (parts[1] === "projects") {
     if (parts.length === 2) {
-      if (method === "GET") return json(listProjects());
-      if (method === "POST") return json(createProject(await readJsonObject(req)), 201);
+      if (method === "GET") return json(isHub() ? hubProjectsView() : listProjects());
+      if (method === "POST") {
+        const { backfill, ...input } = await readJsonObject(req);
+        const saved = createProject(input);
+        if (backfill === true && saved.share === true) queueBackfill(saved.id);
+        return json(saved, 201);
+      }
     }
     if (parts.length === 3 && method === "GET" && parts[2] === "suggestions") return json(await suggestProjectFolders());
     if (parts.length === 3 && method === "POST" && parts[2] === "validate") {
       const { input, mode, existingId } = await readJsonObject(req);
       if (mode !== "create" && mode !== "update") throw new HttpError(400, "mode must be create or update");
       if (existingId !== undefined && typeof existingId !== "string") throw new HttpError(400, "existingId must be a string");
-      return json(validateProject(input, mode, existingId));
+      // Asked first: it looks at the git remote, and the registry's hub-key check reads the answer it warms.
+      const shared = SharedProjectForm.safeParse(input);
+      const hub = shared.success ? await projectHubInfo({ repoPath: shared.data.repoPath, share: true, hubKey: shared.data.hubKey ?? null, id: existingId }) : undefined;
+      return json({ ...validateProject(input, mode, existingId), ...(hub ? { hub } : {}) });
     }
     if (parts.length === 3 && method === "POST" && parts[2] === "detect") {
       const { repoPath } = await readJsonObject(req);
       if (typeof repoPath !== "string" || !repoPath.trim()) throw new HttpError(400, "repoPath is required");
       return json(await detectProject(repoPath.trim()));
     }
-    if (parts.length === 3 && method === "PUT") return json(updateProject(parts[2], await readJsonObject(req)));
+    if (parts.length === 3 && method === "PUT") {
+      const { backfill, ...input } = await readJsonObject(req);
+      const saved = updateProject(parts[2], input);
+      if (backfill === true && saved.share === true) queueBackfill(saved.id);
+      return json(saved);
+    }
     if (parts.length === 3 && method === "DELETE") {
       deleteProject(parts[2], activeRunIds(parts[2]));
       return new Response(null, { status: 204 });
     }
     if (parts[3] === "reports" && method === "GET") {
       const p = project(parts[2]);
-      if (parts.length === 4) return json(listReports(p));
-      if (parts.length === 5) return json(renderReport(p, parts[4]));
+      if (parts.length === 4) return json(isHub() ? listReports(p).map((r) => ({ ...r, path: "" })) : listReports(p));
+      if (parts.length === 5) return json(isHub() ? { ...renderReport(p, parts[4]), path: "" } : renderReport(p, parts[4]));
     }
     if (parts[3] === "suites" && parts.length === 4) {
       const p = project(parts[2]);
@@ -542,6 +599,8 @@ async function route(req: Request, url: URL): Promise<Response> {
             q: url.searchParams.get("q") || undefined,
             batch: url.searchParams.get("batch") || undefined,
             branch: url.searchParams.get("branch") || undefined,
+            version: url.searchParams.get("version") || undefined,
+            machine: csvParam(url, "machine"),
             pr: intParam(url, "pr"),
             ticket: url.searchParams.get("ticket") || undefined,
             commit: url.searchParams.get("commit") || undefined,
@@ -696,10 +755,20 @@ function withFramingHeaders(res: Response): Response {
   return res;
 }
 
-export async function fetchHandler(req: Request): Promise<Response> {
+/** The one thing `fetchHandler` needs from `Bun.Server`: lifting the idle timeout of a long-lived response. */
+export interface IdleControl {
+  timeout(req: Request, seconds: number): void;
+}
+
+const EVENT_STREAM_PATH = /^\/api\/(events|runs\/[^/]+\/events)$/;
+
+export async function fetchHandler(req: Request, server?: IdleControl): Promise<Response> {
   try {
+    // The server's idle timeout does not count the pings of a server-sent stream as activity: exempt the streams only.
+    if (req.method === "GET" && EVENT_STREAM_PATH.test(new URL(req.url).pathname)) server?.timeout(req, 0);
     return withFramingHeaders(await route(req, new URL(req.url)));
   } catch (err) {
+    if (err instanceof HubHttpError) return withFramingHeaders(json({ error: err.message, code: err.code, ...err.extra }, err.status));
     if (err instanceof HttpError) return withFramingHeaders(json(err.code ? { error: err.message, code: err.code } : { error: err.message }, err.status));
     if (err instanceof URIError) return withFramingHeaders(json({ error: "malformed URL" }, 400));
     console.error(err);

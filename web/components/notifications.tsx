@@ -4,6 +4,8 @@ import { toast } from "sonner";
 import notificationIcon from "../logo-192.png";
 import { SidebarMenuButton } from "@/components/ui/sidebar";
 import { ACTIVE_STATUSES, type RunStatus, type RunView, runHash } from "@/lib/api";
+import { alertCoalesce, attribution, syncReason, uploadAlert } from "@/lib/hub";
+import { isHub } from "@/lib/mode";
 import {
   isWatched,
   lastOwnRelease,
@@ -11,6 +13,7 @@ import {
   listenLeaseEvent,
   navigate,
   useActiveRuns,
+  useHubStatus,
   useLeases,
   useNewRun,
   useNotifications,
@@ -18,7 +21,8 @@ import {
 } from "@/lib/hooks";
 import { leaseToast } from "@/lib/leases";
 
-const APP_TITLE = "Tapocalypse";
+/** Read lazily: the mode is only known once the boot gate has passed. */
+const appTitle = () => (isHub() ? "Team hub · Tapocalypse" : "Tapocalypse");
 /** A terminal event for a run we never saw active only counts when it ended this recently (fast cancel/error). */
 const UNSEEN_TERMINAL_WINDOW_MS = 15_000;
 const TOAST_MS = 8000;
@@ -54,6 +58,21 @@ function showDesktopNotification(run: RunView): void {
   };
 }
 
+/** One failing or regressed upload: a toast (and a desktop notification while the tab is hidden). */
+function showUploadAlert(run: RunView, alert: NonNullable<ReturnType<typeof uploadAlert>>, desktop: boolean): void {
+  const options = { description: alert.description, duration: TOAST_MS, action: { label: "Open", onClick: () => navigate(runHash(run.id)) } };
+  if (alert.severity === "warning") toast.warning(alert.title, options);
+  else toast.error(alert.title, options);
+  if (desktop) {
+    const n = new Notification(alert.title, { body: alert.description, tag: run.id, icon: notificationIcon });
+    n.onclick = () => {
+      window.focus();
+      navigate(runHash(run.id));
+      n.close();
+    };
+  }
+}
+
 function showLeaseNotification(serial: string, title: string, body: string): void {
   const n = new Notification(title, { body, tag: `lease:${serial}`, icon: notificationIcon });
   n.onclick = () => {
@@ -75,6 +94,7 @@ export function Notifications() {
   const enabledRef = useRef(enabled);
   enabledRef.current = enabled;
   const known = useRef(new Map<string, RunStatus>());
+  const alerts = useRef<number[]>([]);
   const [unseen, setUnseen] = useState(0);
   const { runs: active } = useActiveRuns();
   // Keeps the last known lease per device fresh: the ending events themselves carry none.
@@ -94,6 +114,26 @@ export function Notifications() {
         } catch {
           return;
         }
+        if (isHub()) {
+          const alert = uploadAlert(run, Date.now());
+          if (!alert) return;
+          const next = alertCoalesce(alerts.current, Date.now());
+          alerts.current = next.history;
+          const desktop = document.hidden && enabledRef.current;
+          if (document.hidden) setUnseen((n) => n + 1);
+          if (next.collapse) {
+            // A burst (a teammate's backfill that went wrong, a whole batch failing) is one toast, not a wall of them.
+            toast.dismiss();
+            toast.error(`${next.history.length} new failing runs`, {
+              description: `${run.hub ? attribution(run.hub).short : "A teammate"} and others`,
+              duration: TOAST_MS,
+              action: { label: "Show", onClick: () => navigate("#/runs?verdict=FAIL,BLOCKED") },
+            });
+          } else {
+            showUploadAlert(run, alert, desktop);
+          }
+          return;
+        }
         const prev = known.current.get(run.id);
         known.current.set(run.id, run.status);
         if (ACTIVE_STATUSES.includes(run.status)) return;
@@ -109,6 +149,29 @@ export function Notifications() {
       }),
     [],
   );
+
+  // A laptop whose upload queue is paused says so once per page load; backfills announce their end.
+  const { status: hubStatus } = useHubStatus();
+  const pausedToasted = useRef(false);
+  const backfillTotal = useRef<number | null>(null);
+  useEffect(() => {
+    const paused = hubStatus?.paused;
+    if (paused && !pausedToasted.current) {
+      pausedToasted.current = true;
+      toast.warning("Team hub uploads paused", {
+        description: syncReason({ code: paused.reason, detail: paused.detail }, null),
+        duration: TOAST_MS,
+        action: { label: "Fix", onClick: () => navigate("#/setup?section=team-hub") },
+      });
+    }
+    if (!paused) pausedToasted.current = false;
+    const backfill = hubStatus?.queue.backfill ?? null;
+    if (backfill) backfillTotal.current = backfill.total;
+    else if (hubStatus && backfillTotal.current !== null) {
+      toast.success(`Uploaded ${backfillTotal.current} runs to the team hub`);
+      backfillTotal.current = null;
+    }
+  }, [hubStatus]);
 
   // Devices the user watches (bell on a held card): a toast when one frees up, plus a desktop notification while the tab is hidden.
   useEffect(
@@ -147,9 +210,9 @@ export function Notifications() {
   }, []);
 
   useEffect(() => {
-    document.title = unseen > 0 ? `(${unseen}) ${APP_TITLE}` : APP_TITLE;
+    document.title = unseen > 0 ? `(${unseen}) ${appTitle()}` : appTitle();
     return () => {
-      document.title = APP_TITLE;
+      document.title = appTitle();
     };
   }, [unseen]);
 
@@ -160,14 +223,23 @@ export function Notifications() {
 export function NotificationsToggle() {
   const { enabled, permission, setEnabled } = useNotifications();
   const Icon = enabled ? Bell : BellOff;
+  const hub = isHub();
   return (
     <SidebarMenuButton
-      tooltip={enabled ? "Desktop notifications on" : "Notify me when runs finish"}
+      tooltip={
+        hub
+          ? enabled
+            ? "Desktop alerts for new failing uploads"
+            : "Alert me when a teammate uploads a failing run"
+          : enabled
+            ? "Desktop notifications on"
+            : "Notify me when runs finish"
+      }
       disabled={permission === "unsupported"}
       onClick={() => void setEnabled(!enabled)}
     >
       <Icon />
-      <span>{enabled ? "Notifications on" : "Notifications off"}</span>
+      <span>{hub ? (enabled ? "Failure alerts on" : "Failure alerts off") : enabled ? "Notifications on" : "Notifications off"}</span>
     </SidebarMenuButton>
   );
 }

@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import path from "node:path";
-import { applyRetention, selectExpiredRuns } from "../src/retention";
+import { hubRetention, setHubMode } from "../src/hub/mode";
+import { applyRetention, retentionPolicy, selectExpiredRuns } from "../src/retention";
 import { getRun, runDir, saveRun } from "../src/runs/store";
 import type { Run, RunStatus } from "../src/runs/types";
 
@@ -86,5 +87,34 @@ describe("applyRetention", () => {
     expect(getRun(id)).not.toBeNull();
     expect(applyRetention({ now: NOW, policy: { days: 30 } })).toContain(id);
     expect(getRun(id)).toBeNull();
+  });
+});
+
+describe("hub retention policy", () => {
+  const saved = process.env.TAPOCALYPSE_HUB_RETENTION_DAYS;
+  const savedMax = process.env.TAPOCALYPSE_HUB_RETENTION_MAX_RUNS;
+  afterEach(() => {
+    setHubMode(null);
+    if (saved === undefined) delete process.env.TAPOCALYPSE_HUB_RETENTION_DAYS;
+    else process.env.TAPOCALYPSE_HUB_RETENTION_DAYS = saved;
+    if (savedMax === undefined) delete process.env.TAPOCALYPSE_HUB_RETENTION_MAX_RUNS;
+    else process.env.TAPOCALYPSE_HUB_RETENTION_MAX_RUNS = savedMax;
+  });
+
+  test("a hub keeps a year by default; 0 keeps everything; a count cap is optional", () => {
+    expect(hubRetention({})).toEqual({ days: 365 });
+    expect(hubRetention({ TAPOCALYPSE_HUB_RETENTION_DAYS: "90" })).toEqual({ days: 90 });
+    expect(hubRetention({ TAPOCALYPSE_HUB_RETENTION_DAYS: "0" })).toEqual({});
+    expect(hubRetention({ TAPOCALYPSE_HUB_RETENTION_DAYS: "0", TAPOCALYPSE_HUB_RETENTION_MAX_RUNS: "5000" })).toEqual({ maxRuns: 5000 });
+    expect(hubRetention({ TAPOCALYPSE_HUB_RETENTION_DAYS: "soon" })).toEqual({});
+  });
+
+  test("the policy in force is the hub's on a hub and the config's on a laptop", () => {
+    process.env.TAPOCALYPSE_HUB_RETENTION_DAYS = "30";
+    delete process.env.TAPOCALYPSE_HUB_RETENTION_MAX_RUNS;
+    setHubMode(true);
+    expect(retentionPolicy()).toEqual({ days: 30 });
+    setHubMode(false);
+    expect(retentionPolicy()).toEqual({});
   });
 });

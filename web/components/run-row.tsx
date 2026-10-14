@@ -1,6 +1,7 @@
-import { Copy, ExternalLink, FileText, Loader2, MoreHorizontal, RotateCcw, Trash2, XCircle } from "lucide-react";
+import { Copy, Download, ExternalLink, FileText, Link2, Loader2, MoreHorizontal, RotateCcw, Trash2, XCircle } from "lucide-react";
 import { useState } from "react";
 import { toast } from "sonner";
+import { HubSyncIcon } from "@/components/hub/sync-chip";
 import { RegressionCount } from "@/components/regression/transition";
 import { rerunWithChangesPrefill } from "@/components/run/use-run-actions";
 import { RunStatusIcon } from "@/components/run-status-icon";
@@ -24,9 +25,11 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { VerdictBadge } from "@/components/verdict-badge";
-import { api, batchHash, compareHash, isActive, reportHash, runHash, type RunStatus, type RunView, type Verdict } from "@/lib/api";
+import { api, batchHash, compareHash, isActive, reportHash, reportHtmlUrl, runHash, type RunStatus, type RunView, type Verdict } from "@/lib/api";
 import { formatCost, formatDuration, formatRelative, formatTime } from "@/lib/format";
 import { navigate, useNewRun } from "@/lib/hooks";
+import { attribution } from "@/lib/hub";
+import { isHub } from "@/lib/mode";
 import { cn } from "@/lib/utils";
 
 const VERDICT_SEVERITY: Verdict[] = ["FAIL", "BLOCKED", "PARTIAL", "PASS WITH ISSUES", "PASS"];
@@ -151,7 +154,7 @@ function MetaLine({ parts }: { parts: MetaPart[] }) {
 }
 
 /** Relative time with the absolute timestamp in a tooltip. */
-function RelativeTime({ iso, now, className }: { iso: string; now: number; className?: string }) {
+export function RelativeTime({ iso, now, className }: { iso: string; now: number; className?: string }) {
   return (
     <Tooltip>
       <TooltipTrigger asChild>
@@ -166,6 +169,7 @@ export function RunActions({ run, onChanged }: { run: RunView; onChanged(): void
   const [busy, setBusy] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const { openNewRun } = useNewRun();
+  const hub = isHub();
   const active = isActive(run.status);
   const hasFailed = !active && run.checks.some((c) => c.status !== "pass" && c.status !== "skipped");
 
@@ -197,6 +201,15 @@ export function RunActions({ run, onChanged }: { run: RunView; onChanged(): void
     }
   }
 
+  async function copyLink() {
+    try {
+      await navigator.clipboard.writeText(`${location.origin}${location.pathname}${runHash(run.id)}`);
+      toast.success("Link copied", { description: "Anyone who can sign in to the hub can open it." });
+    } catch (err) {
+      toast.error(errorText(err));
+    }
+  }
+
   async function remove() {
     setBusy(true);
     try {
@@ -222,9 +235,9 @@ export function RunActions({ run, onChanged }: { run: RunView; onChanged(): void
         <DropdownMenuContent align="end" className="w-48">
           <DropdownMenuItem onSelect={() => navigate(runHash(run.id))}>
             <ExternalLink />
-            {active ? "Open / steer" : "Open run"}
+            {active && !hub ? "Open / steer" : "Open run"}
           </DropdownMenuItem>
-          {active ? (
+          {hub ? null : active ? (
             <DropdownMenuItem variant="destructive" onSelect={() => void cancel()}>
               <XCircle />
               Cancel run
@@ -251,11 +264,25 @@ export function RunActions({ run, onChanged }: { run: RunView; onChanged(): void
               Open report
             </DropdownMenuItem>
           )}
+          {hub && run.reportPath && (
+            <DropdownMenuItem asChild>
+              <a href={reportHtmlUrl(run.id, { download: true })} download>
+                <Download />
+                Download HTML report
+              </a>
+            </DropdownMenuItem>
+          )}
+          {hub && (
+            <DropdownMenuItem onSelect={() => void copyLink()}>
+              <Link2 />
+              Copy link
+            </DropdownMenuItem>
+          )}
           <DropdownMenuItem onSelect={() => void copyId()}>
             <Copy />
             Copy id
           </DropdownMenuItem>
-          {!active && (
+          {!active && !hub && (
             <>
               <DropdownMenuSeparator />
               <DropdownMenuItem variant="destructive" onSelect={() => setConfirmDelete(true)}>
@@ -310,6 +337,7 @@ export interface RunRowProps {
 
 export function RunRow({ run, projectName, deviceName, now, onChanged, nested }: RunRowProps) {
   const pr = run.source?.pr?.number;
+  const requester = run.hub ? attribution(run.hub).short : run.requestedBy;
   return (
     <div className={cn(ROW, nested && "pl-9")}>
       <RunStatusIcon status={run.status} verdict={run.verdict} className="size-4 shrink-0" />
@@ -324,6 +352,7 @@ export function RunRow({ run, projectName, deviceName, now, onChanged, nested }:
           </a>
           {run.verdict ? <VerdictBadge verdict={run.verdict} className="shrink-0" /> : <StatusBadge status={run.status} className="shrink-0" />}
           <RunRegressionChip run={run} now={now} />
+          <HubSyncIcon sync={run.hubSync} />
           {run.attempt > 1 && (
             <span className="shrink-0 rounded border px-1 text-[10px] leading-4 text-muted-foreground">attempt {run.attempt}</span>
           )}
@@ -334,7 +363,7 @@ export function RunRow({ run, projectName, deviceName, now, onChanged, nested }:
             { text: run.source?.branch },
             { text: pr !== undefined ? `#${pr}` : null },
             { text: run.deviceName ?? deviceName ?? run.deviceSerial, className: "hidden @3xl:inline" },
-            { text: run.requestedBy, className: "hidden @4xl:inline" },
+            { text: requester, className: run.hub ? "hidden @3xl:inline" : "hidden @4xl:inline" },
             { text: run.model, className: "hidden @5xl:inline" },
           ]}
         />
@@ -445,10 +474,12 @@ export function BatchRow({ batchId, runs, projectName, now, onChanged }: BatchRo
             <ExternalLink />
             Open batch
           </DropdownMenuItem>
-          <DropdownMenuItem disabled={!failedLanes || busy} onSelect={() => void rerunFailed()}>
-            <RotateCcw />
-            Re-run failed lanes
-          </DropdownMenuItem>
+          {isHub() ? null : (
+            <DropdownMenuItem disabled={!failedLanes || busy} onSelect={() => void rerunFailed()}>
+              <RotateCcw />
+              Re-run failed lanes
+            </DropdownMenuItem>
+          )}
         </DropdownMenuContent>
       </DropdownMenu>
     </div>

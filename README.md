@@ -4,7 +4,7 @@
 
 <p align="center">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-f59e0b?style=flat-square&labelColor=1c1917">
-  <img alt="Bun ≥ 1.3" src="https://img.shields.io/badge/Bun-%E2%89%A5%201.3-f59e0b?style=flat-square&labelColor=1c1917&logo=bun&logoColor=fbf0df">
+  <img alt="Bun ≥ 1.3.14" src="https://img.shields.io/badge/Bun-%E2%89%A5%201.3.14-f59e0b?style=flat-square&labelColor=1c1917&logo=bun&logoColor=fbf0df">
   <img alt="Platforms: Android • iOS" src="https://img.shields.io/badge/platforms-Android%20%E2%80%A2%20iOS-f59e0b?style=flat-square&labelColor=1c1917&logo=android&logoColor=3ddc84">
   <img alt="MCP: streamable HTTP" src="https://img.shields.io/badge/MCP-streamable%20HTTP-f59e0b?style=flat-square&labelColor=1c1917&logo=modelcontextprotocol&logoColor=white">
   <img alt="Runs on omp • Claude Code • Codex" src="https://img.shields.io/badge/runs%20on-omp%20%E2%80%A2%20Claude%20Code%20%E2%80%A2%20Codex-f59e0b?style=flat-square&labelColor=1c1917">
@@ -46,6 +46,7 @@ flowchart LR
 4. **Checks.** The agent declares its checks up front and reports each one as it goes. You watch them turn pending → running → pass/fail next to a live device screen and the agent's activity feed. Cancel at any time; steer it on omp and Claude Code.
 5. **Verdict.** The agent hands in a markdown report; with its screenshots it is stored in `<data dir>/runs/<run-id>/` (`report.md`, `screenshots/`), and the run ends with `PASS`, `PASS WITH ISSUES`, `FAIL`, `BLOCKED` or `PARTIAL`, plus a summary and what it cost. Read it in the UI, with `qa_get_report` / `qa_get_screenshots`, or `tapocalypse report <run-id>`; copy it anywhere with `qa_export` or `tapocalypse report <run-id> --export <dir>`.
 6. **Share.** Any finished run becomes one self-contained HTML file for stakeholders (no Tapocalypse needed), or a presigned link to a private bucket once `share.s3` is configured: [sharing a report](docs/guide.md#sharing-a-report).
+7. **Team hub.** For a team, point every machine at one self-hosted, read-only [team hub](docs/hub.md): projects you opt in upload their finished runs in the background, and stakeholders open one URL, behind your own login or VPN, to see a project overview, releases and every run with its evidence.
 
 Details: [run outcomes](docs/guide.md#run-outcomes), [devices](docs/guide.md#devices) and [what happens under the hood](docs/guide.md#how-it-works).
 
@@ -70,7 +71,7 @@ Details: [run outcomes](docs/guide.md#run-outcomes), [devices](docs/guide.md#dev
 
 You need:
 
-- [ ] [Bun](https://bun.sh) ≥ 1.3
+- [ ] [Bun](https://bun.sh) ≥ 1.3.14
 - [ ] **One** agent runtime, installed and signed in: [omp](https://github.com/can1357/oh-my-pi), [Claude Code](https://code.claude.com) or [Codex CLI](https://github.com/openai/codex) ([details](#runtimes))
 - [ ] Node.js 18+ with `npx` (runs mobile-mcp, which Tapocalypse starts for each run)
 - [ ] Android `adb` with an emulator, and/or Xcode with iOS simulators (macOS). Linux runs Android only; Windows is not supported
@@ -145,6 +146,7 @@ Selection order, limits and models: [Agent runtimes](docs/guide.md#agent-runtime
 ## Docs
 
 - [Guide](docs/guide.md): the UI, projects and personas, devices, run outcomes, regressions and flaky checks, MCP, CLI and CI, suites, data, troubleshooting
+- [Team hub](docs/hub.md): run a shared read-only hub in a container, secure it with an access proxy or VPN, connect teammates' machines
 - [Configuration](docs/configuration.md): every config key and environment variable
 - [HTTP API and MCP tools](docs/api.md): every route and tool parameter
 - [Agent setup](docs/agent-setup.md): step-by-step instructions for a coding agent
@@ -153,7 +155,7 @@ Selection order, limits and models: [Agent runtimes](docs/guide.md#agent-runtime
 
 ## Status
 
-Early: version 0.1. Local only by design: the server binds `127.0.0.1` and has no login, and QA agents run shell commands as your user. Read the [security model](docs/guide.md#security-model) before you point it at anything. Bugs and ideas go to [GitHub issues](https://github.com/miles-pudge-halter/tapocalypse/issues); see [what's not here yet](docs/guide.md#whats-not-here-yet).
+Early: version 0.1. Local by design: the app binds `127.0.0.1` and has no login, and QA agents run shell commands as your user. To share results, use the read-only [team hub](docs/hub.md) (viewers log in at an access proxy you run; uploads need per-machine tokens) and never expose the app itself. Read the [security model](docs/guide.md#security-model) before you point it at anything. Bugs and ideas go to [GitHub issues](https://github.com/miles-pudge-halter/tapocalypse/issues); see [what's not here yet](docs/guide.md#whats-not-here-yet).
 
 ## License
 

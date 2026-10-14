@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import path from "node:path";
-import { config, ConfigSchema, findEmulator, REPO_ROOT, resolveConfigPath, resolveDataDir } from "../src/config";
+import { config, ConfigSchema, findEmulator, HubConfigSchema, REPO_ROOT, resolveConfigPath, resolveDataDir } from "../src/config";
 
 const HOME = "/home/me";
 const legacyConfig = path.join(REPO_ROOT, "tapocalypse.config.json");
@@ -50,5 +50,20 @@ describe("ConfigSchema runMaxTime", () => {
   test("accepts the durations the runner and omp understand and rejects what parseDurationMs cannot read", () => {
     for (const ok of ["60m", "1h30m", "45s", "2h", "90"]) expect(ConfigSchema.safeParse({ ...config, runMaxTime: ok }).success).toBe(true);
     for (const bad of ["soon", "10 minutes", "m60", "0s"]) expect(ConfigSchema.safeParse({ ...config, runMaxTime: bad }).success).toBe(false);
+  });
+});
+
+describe("team hub address", () => {
+  test("the config accepts https, and plain http only for this machine", () => {
+    for (const ok of ["https://hub.example.com", "https://hub.example.com/qa", "http://localhost:4311", "http://127.0.0.1:4311", "http://[::1]:4311"]) {
+      expect(HubConfigSchema.safeParse({ url: ok }).success).toBe(true);
+    }
+    for (const bad of ["http://hub.example.com", "http://127.0.0.1.example.com", "http://localhost.example.com", "ftp://hub.example.com", "hub.example.com", "javascript:alert(1)"]) {
+      expect(HubConfigSchema.safeParse({ url: bad }).success).toBe(false);
+    }
+  });
+
+  test("a config file naming an insecure hub address is refused as a whole", () => {
+    expect(ConfigSchema.safeParse({ ...config, share: { hub: { url: "http://hub.example.com" } } }).success).toBe(false);
   });
 });

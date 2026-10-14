@@ -5,6 +5,8 @@ import path from "node:path";
 import { z } from "zod";
 import { CONFIG_PATH, HttpError, REPO_ROOT } from "../config";
 import { HARNESS_IDS, type HarnessId } from "../harness/types";
+import { derivedHubKey, onDerivedHubKeyChange } from "../hub/identity";
+import { HubKey } from "../hub/protocol";
 import { resolveUnder } from "../reports/reports";
 import { parsePersona } from "../runs/prompt";
 import type { Platform } from "../runs/types";
@@ -26,6 +28,13 @@ export interface Project {
   defaultBranch?: string;
   /** Per-project agent runtime overrides (harness, harness-native model and effort); absent = defaults. */
   agent?: ProjectAgent;
+  /** Opt-in: finished runs of this project are pushed to the team hub. Absent = not shared. */
+  share?: boolean;
+  /**
+   * How the team hub identifies the project (`github.com/org/app[#subpath]`, or `local/<id>`). Absent = derived from the
+   * git remote; required to share a repo that has no usable remote, or when two local projects derive the same key.
+   */
+  hubKey?: string;
 }
 
 export interface ProjectAgent {
@@ -69,6 +78,8 @@ const FIELD_ORDER: (keyof Project)[] = [
   "defaultPlatform",
   "defaultBranch",
   "agent",
+  "share",
+  "hubKey",
 ];
 const BUNDLED_PERSONA = path.join(REPO_ROOT, "personas", "default-mobile-qa.md");
 
@@ -83,8 +94,17 @@ interface Entry {
 
 let entries: Entry[] = [];
 let loaded = false;
+let source: ProjectSource | null = null;
+
+/** What a hub installs to serve projects that have no repo: `listProjects` and `getProject` delegate to it. */
+export interface ProjectSource {
+  list(): ProjectStatus[];
+  get(id: string): Project | undefined;
+}
 
 export const projectEvents = new EventEmitter();
+// A remote git reports after the first look can make a shared project valid or invalid.
+onDerivedHubKeyChange(() => projectEvents.emit("change"));
 
 const isRaw = (v: unknown): v is Raw => typeof v === "object" && v !== null && !Array.isArray(v);
 const str = (v: unknown): string => (typeof v === "string" ? v : "");
@@ -124,12 +144,33 @@ function coerce(raw: Raw): Project {
     defaultPackage: str(raw.defaultPackage),
     defaultPlatform: raw.defaultPlatform === "ios" ? "ios" : "android",
     ...(agent.success && Object.keys(agent.data).length > 0 ? { agent: agent.data } : {}),
+    ...(raw.share === true ? { share: true } : {}),
+    ...(HubKey.safeParse(raw.hubKey).success ? { hubKey: raw.hubKey as string } : {}),
   };
 }
 
 interface Check {
   project: Project | null;
   result: ValidationResult;
+}
+
+/** The key a shared project uploads under: its explicit one, else what git says (null = none, undefined = not asked yet). */
+const effectiveHubKey = (p: Pick<Project, "repoPath" | "hubKey">): string | null | undefined => p.hubKey ?? derivedHubKey(p.repoPath);
+
+/**
+ * Why project `id` cannot be shared under its key, or null. Projects earlier in the list keep a key they derive
+ * together with a later one, so only the later one is asked for an explicit `hubKey`.
+ */
+function hubKeyProblem(id: string, repoPath: string, explicit: string | undefined): string | null {
+  const key = explicit ?? derivedHubKey(repoPath);
+  if (key === undefined) return null; // git has not been asked yet; the answer arrives as a "change" event
+  if (key === null) {
+    return `no git remote to derive a hub key from; set a hubKey (for example local/${id || "my-app"}), which will not merge with teammates' runs`;
+  }
+  const at = entries.findIndex((e) => e.project.id === id);
+  const earlier = at < 0 ? entries : entries.slice(0, at);
+  const clash = earlier.find((e) => e.project.share === true && effectiveHubKey(e.project) === key);
+  return clash ? `same hub key as project ${clash.project.id} (${key}); give one of them an explicit hubKey such as ${key}#com.example.app` : null;
 }
 
 /** Validates a complete project record. `unique` additionally requires the id to be unused. */
@@ -211,6 +252,23 @@ function check(input: Raw, unique: boolean): Check {
     else if (Object.keys(parsed.data).length > 0) agent = parsed.data;
   }
 
+  let share: true | undefined;
+  if (input.share !== undefined && input.share !== null) {
+    if (typeof input.share !== "boolean") errors.share = "must be true or false";
+    else if (input.share) share = true;
+  }
+
+  let hubKey: string | undefined;
+  if (input.hubKey !== undefined && input.hubKey !== null && input.hubKey !== "") {
+    const parsed = HubKey.safeParse(input.hubKey);
+    if (!parsed.success) errors.hubKey = "must look like github.com/org/app (optionally #subpath), or local/<project-id>";
+    else hubKey = parsed.data;
+  }
+  if (share && !errors.hubKey) {
+    const problem = hubKeyProblem(id, repoPath, hubKey);
+    if (problem) errors.hubKey = problem;
+  }
+
   if (repoOk) {
     if (!fs.existsSync(path.join(repoPath, ".git"))) warnings.push("Not a git repository: runs will not record branch/commit/PR.");
   }
@@ -229,6 +287,8 @@ function check(input: Raw, unique: boolean): Check {
       defaultPlatform,
       ...(defaultBranch ? { defaultBranch } : {}),
       ...(agent ? { agent } : {}),
+      ...(share ? { share } : {}),
+      ...(hubKey ? { hubKey } : {}),
     },
     result,
   };
@@ -300,12 +360,19 @@ export function initProjects(): void {
   load();
 }
 
+/** Replaces the config-backed registry (a hub has no repos); null restores it. */
+export function setProjectSource(next: ProjectSource | null): void {
+  source = next;
+}
+
 export function listProjects(): ProjectStatus[] {
+  if (source) return source.list();
   ensureLoaded();
   return entries.map(statusOf);
 }
 
 export function getProject(id: string): Project | undefined {
+  if (source) return source.get(id);
   ensureLoaded();
   const entry = entries.find((e) => e.project.id === id);
   return entry && statusOf(entry).status === "ok" ? entry.project : undefined;

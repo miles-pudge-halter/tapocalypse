@@ -1,4 +1,5 @@
-import type { Device } from "./api";
+import { Apple, Bot, type LucideIcon } from "lucide-react";
+import type { Device, HarnessId, Platform } from "./api";
 
 export function formatDuration(startIso: string | null, endIso: string | null, now: number): string {
   if (!startIso) return "—";
@@ -97,3 +98,9 @@ export function deviceDisplayName(d: Pick<Device, "serial" | "model" | "name">):
 export function deviceSubtitle(d: Pick<Device, "serial" | "osVersion" | "screen">): string {
   return [d.osVersion, d.screen, d.serial].filter(Boolean).join(" · ");
 }
+
+export const PLATFORM_LABEL: Record<Platform, string> = { android: "Android", ios: "iOS" };
+export const PLATFORM_ICON: Record<Platform, LucideIcon> = { android: Bot, ios: Apple };
+
+/** Harness names for the hub, which never lists installed harnesses. */
+export const HARNESS_LABEL: Record<HarnessId, string> = { omp: "omp", claude: "Claude Code", codex: "Codex CLI" };

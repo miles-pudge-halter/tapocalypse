@@ -19,6 +19,7 @@ import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { CodeBlock } from "@/components/code-block";
 import { api, isActive, runHash, transcriptUrl, type RunView, type Verdict } from "@/lib/api";
+import { isHub } from "@/lib/mode";
 import { cn } from "@/lib/utils";
 import { failedChecks, type RunActions } from "./use-run-actions";
 
@@ -41,7 +42,13 @@ interface Problem {
   showStderr: boolean;
 }
 
-function describeProblem(run: RunView, resolved: number): Problem | null {
+/** `hub`: the stderr tail comes from `GET /api/runs/:id/stderr`, a route a team hub never serves. */
+export function describeProblem(run: RunView, resolved: number, hub: boolean): Problem | null {
+  const problem = describeKind(run, resolved);
+  return problem && hub ? { ...problem, showStderr: false } : problem;
+}
+
+function describeKind(run: RunView, resolved: number): Problem | null {
   const noChecks = resolved === 0;
   if (run.status === "interrupted") {
     return {
@@ -193,7 +200,7 @@ export function OutcomeCallout({ run, actions }: { run: RunView; actions: RunAct
   if (isActive(run.status)) sawActive.current = true;
   if (isActive(run.status)) return null;
   const resolved = run.checks.filter((c) => c.status !== "pending" && c.status !== "running").length;
-  const problem = describeProblem(run, resolved);
+  const problem = describeProblem(run, resolved, isHub());
   const canRerunFailed = resolved > 0 && failedChecks(run.checks).length > 0;
 
   return (
@@ -219,11 +226,13 @@ export function OutcomeCallout({ run, actions }: { run: RunView; actions: RunAct
             ) : null}
             {problem.showStderr ? <StderrTail runId={run.id} /> : null}
             <div className="flex flex-wrap items-center gap-2 pt-1">
-              <Button size="sm" variant="outline" className="strike" disabled={actions.busy} onClick={() => void actions.rerun("all")}>
-                {actions.busy ? <Loader2 className="animate-spin" /> : <RotateCcw />}
-                Retry
-              </Button>
-              {canRerunFailed ? (
+              {isHub() ? null : (
+                <Button size="sm" variant="outline" className="strike" disabled={actions.busy} onClick={() => void actions.rerun("all")}>
+                  {actions.busy ? <Loader2 className="animate-spin" /> : <RotateCcw />}
+                  Retry
+                </Button>
+              )}
+              {canRerunFailed && !isHub() ? (
                 <Button size="sm" variant="outline" className="strike" disabled={actions.busy} onClick={() => void actions.rerun("failed")}>
                   Re-run failed
                 </Button>

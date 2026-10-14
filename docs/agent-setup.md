@@ -45,7 +45,7 @@ Run each check and note the result. Commands that are missing exit with "command
 
 | Need | Check | Pass when |
 | --- | --- | --- |
-| Bun ≥ 1.3 (required) | `bun --version` | Prints 1.3 or newer |
+| Bun ≥ 1.3.14 (required) | `bun --version` | Prints 1.3.14 or newer |
 | git (required to clone) | `git --version` | Prints a version |
 | Node.js 18+ with `npx` (required) | `node --version && npx --version` | Node prints v18 or newer |
 | One agent runtime, signed in (required) | omp: `omp --version && omp models --json`<br>Claude Code: `claude --version && claude auth status --json`<br>Codex CLI: `codex --version && codex login status` | At least one: omp lists one or more models; Claude Code prints `"loggedIn": true`; `codex login status` exits 0 |

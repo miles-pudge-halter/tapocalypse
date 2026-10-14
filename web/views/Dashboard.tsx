@@ -11,6 +11,7 @@ import { LeaseRing } from "@/components/lease-ring";
 import { EmptyState } from "@/components/empty-state";
 import { PageHeader } from "@/components/page-header";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -27,6 +28,7 @@ import {
   setRunFilters,
   useActiveRuns,
   useDevices,
+  useHubMachines,
   useNewRun,
   useNow,
   useProjects,
@@ -38,6 +40,8 @@ import {
   useTemplates,
   type RunFilters,
 } from "@/lib/hooks";
+import { isHub } from "@/lib/mode";
+import { displayPerson } from "@/lib/hub";
 import { cn } from "@/lib/utils";
 
 const TERMINAL_STATUSES: RunStatus[] = ["done", "error", "cancelled", "interrupted"];
@@ -129,6 +133,9 @@ function describeFilters(filters: RunFilters, projectName: string | null): strin
   if (projectName) parts.push(`project: ${projectName}`);
   if (filters.q) parts.push(`search: “${filters.q}”`);
   if (filters.regressed) parts.push("with newly failing checks");
+  if (filters.machine?.length) parts.push(`from ${filters.machine.join(", ")}`);
+  if (filters.branch) parts.push(`branch: ${filters.branch}`);
+  if (filters.version) parts.push(`version: ${filters.version}`);
   return parts.join(" · ");
 }
 
@@ -156,8 +163,11 @@ export function Dashboard() {
       verdict: filters.verdict,
       q: filters.q,
       regressed: filters.regressed,
+      branch: filters.branch,
+      version: filters.version,
+      machine: filters.machine,
     }),
-    [project, filters.status, filters.verdict, filters.q, filters.regressed],
+    [project, filters.status, filters.verdict, filters.q, filters.regressed, filters.branch, filters.version, filters.machine],
   );
   const activeStore = useActiveRuns();
   const activeBatchIds = useMemo(() => new Set(activeStore.runs.flatMap((r) => (r.batchId ? [r.batchId] : []))), [activeStore.runs]);
@@ -198,11 +208,14 @@ export function Dashboard() {
       </Tooltip>
     );
 
-  const header = (
+  const hub = isHub();
+  const header = hub ? (
+    <PageHeader title="Runs" description="Every run your team has uploaded." />
+  ) : (
     <PageHeader title="Runs" description="Parallel, agent-driven QA runs across your devices." actions={newRunButton} />
   );
 
-  if (!projectsLoading && !projectsError && projects.length === 0) {
+  if (!hub && !projectsLoading && !projectsError && projects.length === 0) {
     return (
       <div>
         <SetupBanner />
@@ -225,11 +238,11 @@ export function Dashboard() {
   }
 
   const active = [...activeRuns.runs].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-  const filtered = Boolean(filters.status?.length || filters.verdict?.length || filters.q || filters.project);
+  const filtered = Boolean(filters.status?.length || filters.verdict?.length || filters.q || filters.project || filters.machine?.length || filters.branch || filters.version);
 
   return (
     <div className="space-y-5">
-      <SetupBanner />
+      {hub ? null : <SetupBanner />}
       {header}
 
       {projectsError && (
@@ -240,6 +253,7 @@ export function Dashboard() {
         </Alert>
       )}
 
+      {hub ? null : (
       <LiveStrip
         project={project}
         filters={filters}
@@ -248,6 +262,7 @@ export function Dashboard() {
         devices={devices}
         loading={activeRuns.loading && activeRuns.runs.length === 0}
       />
+      )}
 
       {!showsActive && active.length > 0 && (
         <section aria-label="Active runs" className="space-y-2">
@@ -477,7 +492,17 @@ function FilterBar({
   const { setProjectId } = useProjectScope();
   const [q, setQ] = useState(filters.q ?? "");
   const group = filters.group ?? "day";
-  const filterCount = (filters.status?.length ?? 0) + (filters.verdict?.length ?? 0) + (filters.q ? 1 : 0) + (filters.project ? 1 : 0) + (filters.regressed ? 1 : 0);
+  const hub = isHub();
+  const { machines } = useHubMachines();
+  const filterCount =
+    (filters.status?.length ?? 0) +
+    (filters.verdict?.length ?? 0) +
+    (filters.q ? 1 : 0) +
+    (filters.project ? 1 : 0) +
+    (filters.regressed ? 1 : 0) +
+    (filters.machine?.length ?? 0) +
+    (filters.branch ? 1 : 0) +
+    (filters.version ? 1 : 0);
 
   useEffect(() => setQ(filters.q ?? ""), [filters.q]);
   useEffect(() => {
@@ -510,15 +535,17 @@ function FilterBar({
           autoComplete="off"
         />
       </div>
-      <MultiFilter
-        label="Status"
-        options={ALL_STATUSES}
-        selected={filters.status ?? []}
-        dot={(s) => STATUS_DOT[s]}
-        text={(s) => s.charAt(0).toUpperCase() + s.slice(1)}
-        onChange={(status) => setRunFilters({ ...filters, status })}
-        hint="None selected shows finished runs"
-      />
+      {hub ? null : (
+        <MultiFilter
+          label="Status"
+          options={ALL_STATUSES}
+          selected={filters.status ?? []}
+          dot={(s) => STATUS_DOT[s]}
+          text={(s) => s.charAt(0).toUpperCase() + s.slice(1)}
+          onChange={(status) => setRunFilters({ ...filters, status })}
+          hint="None selected shows finished runs"
+        />
+      )}
       <MultiFilter
         label="Verdict"
         options={ALL_VERDICTS}
@@ -527,6 +554,21 @@ function FilterBar({
         text={(v) => v}
         onChange={(verdict) => setRunFilters({ ...filters, verdict })}
       />
+      {hub && (
+        <MultiFilter
+          label="Machine"
+          options={[...new Set([...machines.map((m) => m.name), ...(filters.machine ?? [])])]}
+          selected={filters.machine ?? []}
+          dot={() => "bg-stone-400"}
+          text={(name) => {
+            const person = displayPerson(machines.find((m) => m.name === name)?.uploader ?? null);
+            return person ? `${name} · ${person}` : name;
+          }}
+          onChange={(machine) => setRunFilters({ ...filters, machine: machine.length ? machine : undefined })}
+        />
+      )}
+      {filters.branch && <RefChip label={`Branch: ${filters.branch}`} onClear={() => setRunFilters({ ...filters, branch: undefined })} />}
+      {filters.version && <RefChip label={`Version: ${filters.version}`} onClear={() => setRunFilters({ ...filters, version: undefined })} />}
       <Tooltip>
         <TooltipTrigger asChild>
           <Toggle
@@ -579,6 +621,17 @@ function FilterBar({
         </Button>
       )}
     </div>
+  );
+}
+
+function RefChip({ label, onClear }: { label: string; onClear(): void }) {
+  return (
+    <Badge variant="secondary" className="h-8 gap-1 rounded-md pl-2.5 pr-1 text-xs font-normal">
+      {label}
+      <button type="button" aria-label={`Remove filter ${label}`} className="rounded p-0.5 hover:bg-background/60" onClick={onClear}>
+        <X className="size-3" />
+      </button>
+    </Badge>
   );
 }
 
@@ -726,6 +779,20 @@ function HistorySection(props: HistoryProps) {
     }
     if (props.hasActive) {
       return <EmptyState icon={Inbox} title="No finished runs yet" description="Completed runs and their verdicts appear here." />;
+    }
+    if (isHub()) {
+      return (
+        <EmptyState
+          icon={Inbox}
+          title="No runs on the hub yet"
+          description="Runs appear once a teammate shares a project. See About this hub for how to connect a machine."
+          action={
+            <Button asChild variant="outline">
+              <a href="#/about">About this hub</a>
+            </Button>
+          }
+        />
+      );
     }
     const smoke = templates.find((t) => t.id === "smoke");
     const quickStart = (platform: "android" | "ios") => (

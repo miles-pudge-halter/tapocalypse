@@ -57,6 +57,14 @@ describe("computeStats", () => {
     ]);
   });
 
+  test("byDay splits runs with issues and other outcomes from passes and failures", () => {
+    const stats = computeStats([finished(0, "PASS WITH ISSUES", 1), finished(0, "BLOCKED", 1), finished(0, "PARTIAL", 1), run(0), finished(1, "FAIL", 1)], 2, NOW);
+    expect(stats.byDay.map((d) => [d.runs, d.pass, d.issues, d.fail, d.other])).toEqual([
+      [1, 0, 0, 1, 0],
+      [4, 0, 1, 0, 3],
+    ]);
+  });
+
   test("runs outside the window and runs replaced by an infra retry are not counted", () => {
     const stats = computeStats([finished(0, "PASS", 1), finished(10, "FAIL", 1), run(0, { retriedBy: "next" })], 7, NOW);
     expect(stats).toMatchObject({ runs: 1, pass: 1, fail: 0, other: 0 });

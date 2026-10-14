@@ -2,13 +2,16 @@ import {
   Bell,
   FileText,
   FolderKanban,
+  Info,
   Keyboard,
+  LayoutDashboard,
   LayoutList,
   Moon,
   Play,
   RotateCcw,
   Settings2,
   Smartphone,
+  Tag,
 } from "lucide-react";
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { toast } from "sonner";
@@ -23,7 +26,7 @@ import {
   CommandList,
   CommandSeparator,
 } from "@/components/ui/command";
-import { type Device, type ReportEntry, type RunView, api, reportEntryHash, runHash } from "@/lib/api";
+import { type Device, type ReportEntry, type RunView, api, overviewHash, releaseHash, releasesHash, reportEntryHash, runHash } from "@/lib/api";
 import { deviceDisplayName, deviceSubtitle } from "@/lib/format";
 import {
   navigate,
@@ -33,8 +36,11 @@ import {
   useNotifications,
   useProjectScope,
   useProjects,
+  useRefs,
   useShortcut,
 } from "@/lib/hooks";
+import { attribution, releaseStatus, releaseStatusText } from "@/lib/hub";
+import { isHub } from "@/lib/mode";
 import { useTheme } from "@/lib/theme";
 
 const listeners = new Set<() => void>();
@@ -75,7 +81,31 @@ interface ProjectReport extends ReportEntry {
   projectName: string;
 }
 
+/** The scoped project's five newest releases, each with its blocker count. Hub palette only. */
+function ReleaseItems({ projectId, go }: { projectId: string; go(hash: string): () => void }) {
+  const { refs } = useRefs(projectId);
+  const releases = refs.filter((r) => r.release).slice(0, 5);
+  if (releases.length === 0) return null;
+  return (
+    <>
+      <CommandSeparator />
+      <CommandGroup heading="Releases">
+        {releases.map((r) => {
+          const status = releaseStatus(r.lanes);
+          return (
+            <CommandItem key={`${r.ref.kind}:${r.ref.name}`} value={`release ${r.ref.name}`} onSelect={go(releaseHash(projectId, r.ref))}>
+              <Tag /> {r.ref.name}
+              <span className="ml-auto text-xs text-muted-foreground">{releaseStatusText(status)}</span>
+            </CommandItem>
+          );
+        })}
+      </CommandGroup>
+    </>
+  );
+}
+
 function PaletteContent({ close }: { close: () => void }) {
+  const hub = isHub();
   const [query, setQuery] = useState("");
   const [recent, setRecent] = useState<RunView[]>([]);
   const [found, setFound] = useState<RunView[]>([]);
@@ -145,6 +175,7 @@ function PaletteContent({ close }: { close: () => void }) {
   }, [found, recent]);
 
   const lastFailed = recent.find((r) => r.status === "error" || (r.verdict !== null && FAILED_VERDICTS.includes(r.verdict)));
+  const target = readyProjects.find((p) => p.id === scopeId)?.id ?? (readyProjects.length === 1 ? readyProjects[0]?.id : undefined);
   const bookable = devices.filter((d: Device) => d.state === "ready" && d.deviceType !== "watch" && d.deviceType !== "tv");
 
   const run = (action: () => void) => () => {
@@ -169,21 +200,25 @@ function PaletteContent({ close }: { close: () => void }) {
       <CommandList className="max-h-[60vh]">
         <CommandEmpty>Nothing matches “{query}”.</CommandEmpty>
 
-        <CommandGroup heading="Actions">
-          <CommandItem value="action new run" keywords={["start", "create"]} onSelect={run(() => openNewRun())}>
-            <Play /> New run
-          </CommandItem>
-          {bookable.map((d) => (
-            <CommandItem
-              key={d.serial}
-              value={`action new run on ${deviceDisplayName(d)} ${d.serial}`}
-              onSelect={run(() => openNewRun({ device: { platform: d.platform, serial: d.serial } }))}
-            >
-              <Smartphone /> New run on {deviceDisplayName(d)}
-              <span className="ml-auto text-xs text-muted-foreground">{d.serial}</span>
+        <CommandGroup heading={hub ? "Preferences" : "Actions"}>
+          {hub ? null : (
+            <CommandItem value="action new run" keywords={["start", "create"]} onSelect={run(() => openNewRun())}>
+              <Play /> New run
             </CommandItem>
-          ))}
-          {lastFailed && (
+          )}
+          {hub
+            ? null
+            : bookable.map((d) => (
+                <CommandItem
+                  key={d.serial}
+                  value={`action new run on ${deviceDisplayName(d)} ${d.serial}`}
+                  onSelect={run(() => openNewRun({ device: { platform: d.platform, serial: d.serial } }))}
+                >
+                  <Smartphone /> New run on {deviceDisplayName(d)}
+                  <span className="ml-auto text-xs text-muted-foreground">{d.serial}</span>
+                </CommandItem>
+              ))}
+          {lastFailed && !hub && (
             <CommandItem value="action re-run last failed" keywords={["retry", "rerun"]} onSelect={rerunLastFailed}>
               <RotateCcw /> Re-run last failed
               <span className="ml-auto max-w-48 truncate text-xs text-muted-foreground">{lastFailed.title}</span>
@@ -201,7 +236,7 @@ function PaletteContent({ close }: { close: () => void }) {
             keywords={["notify", "alerts"]}
             onSelect={run(() => void setEnabled(!notificationsOn))}
           >
-            <Bell /> Toggle notifications
+            <Bell /> {hub ? "Toggle failure alerts" : "Toggle notifications"}
             <span className="ml-auto text-xs text-muted-foreground">{notificationsOn ? "on" : "off"}</span>
           </CommandItem>
           <CommandItem value="action keyboard shortcuts" keywords={["help", "keys"]} onSelect={run(openShortcutsDialog)}>
@@ -211,12 +246,20 @@ function PaletteContent({ close }: { close: () => void }) {
 
         <CommandSeparator />
         <CommandGroup heading="Go to">
-          <CommandItem value="page runs" onSelect={go("#/")}>
+          <CommandItem value="page overview" onSelect={go(hub ? "#/" : target ? overviewHash(target) : "#/projects")}>
+            <LayoutDashboard /> Overview
+          </CommandItem>
+          <CommandItem value="page releases" disabled={!target} onSelect={go(releasesHash(target ?? ""))}>
+            <Tag /> Releases
+          </CommandItem>
+          <CommandItem value="page runs" onSelect={go("#/runs")}>
             <LayoutList /> Runs
           </CommandItem>
-          <CommandItem value="page devices" onSelect={go("#/devices")}>
-            <Smartphone /> Devices
-          </CommandItem>
+          {hub ? null : (
+            <CommandItem value="page devices" onSelect={go("#/devices")}>
+              <Smartphone /> Devices
+            </CommandItem>
+          )}
           <CommandItem
             value="page reports"
             disabled={!reportsProjectId}
@@ -227,9 +270,15 @@ function PaletteContent({ close }: { close: () => void }) {
           <CommandItem value="page projects" onSelect={go("#/projects")}>
             <FolderKanban /> Projects
           </CommandItem>
-          <CommandItem value="page setup" keywords={["doctor", "mcp", "connect agent"]} onSelect={go("#/setup")}>
-            <Settings2 /> Setup
-          </CommandItem>
+          {hub ? (
+            <CommandItem value="page about this hub" onSelect={go("#/about")}>
+              <Info /> About this hub
+            </CommandItem>
+          ) : (
+            <CommandItem value="page setup" keywords={["doctor", "mcp", "connect agent"]} onSelect={go("#/setup")}>
+              <Settings2 /> Setup
+            </CommandItem>
+          )}
         </CommandGroup>
 
         {readyProjects.length > 0 && (
@@ -253,7 +302,9 @@ function PaletteContent({ close }: { close: () => void }) {
           </>
         )}
 
-        {devices.length > 0 && (
+        {hub && target ? <ReleaseItems projectId={target} go={go} /> : null}
+
+        {!hub && devices.length > 0 && (
           <>
             <CommandSeparator />
             <CommandGroup heading="Devices">
@@ -280,7 +331,7 @@ function PaletteContent({ close }: { close: () => void }) {
                 >
                   <RunStatusIcon status={r.status} verdict={r.verdict} />
                   <span className="truncate">{r.title}</span>
-                  <span className="ml-auto shrink-0 text-xs text-muted-foreground">{runDetail(r)}</span>
+                  <span className="ml-auto shrink-0 text-xs text-muted-foreground">{r.hub ? attribution(r.hub).short : runDetail(r)}</span>
                 </CommandItem>
               ))}
             </CommandGroup>

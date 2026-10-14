@@ -5,6 +5,8 @@ import { CodeBlock } from "@/components/code-block";
 import { CopyButton } from "@/components/copy-button";
 import { runHash, type Device, type RunView } from "@/lib/api";
 import { deviceDisplayName, formatTime } from "@/lib/format";
+import { attribution } from "@/lib/hub";
+import { isHub } from "@/lib/mode";
 
 function Field({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -40,6 +42,8 @@ export function DetailsSheet({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
+  const hub = isHub();
+  const uploaded = hub && run.hub ? attribution(run.hub) : null;
   const labels = Object.entries(run.source?.labels ?? {});
   const model = run.usage?.model ?? run.model;
   return (
@@ -57,7 +61,7 @@ export function DetailsSheet({
                 <CopyButton value={run.id} label="Copy run id" />
               </span>
             </Field>
-            {run.storage === "data" ? (
+            {!hub && run.storage === "data" ? (
               <Field label="Artefacts">
                 <span className="flex items-center gap-1">
                   <span className="min-w-0 break-all font-mono text-xs">{run.runDir}</span>
@@ -65,7 +69,7 @@ export function DetailsSheet({
                 </span>
               </Field>
             ) : null}
-            {run.reportFile ? (
+            {!hub && run.reportFile ? (
               <Field label="Report file">
                 <span className="flex items-center gap-1">
                   <span className="min-w-0 break-all font-mono text-xs">{run.reportFile}</span>
@@ -77,8 +81,18 @@ export function DetailsSheet({
             <Field label="Package">
               <span className="font-mono text-xs">{run.packageId}</span>
             </Field>
+            {uploaded && run.hub ? (
+              <>
+                <Field label="Uploaded by">{uploaded.long.replace(/^Uploaded /, "")}</Field>
+                <Field label="Machine">
+                  <span className="font-mono text-xs">{run.hub.machine}</span>
+                </Field>
+              </>
+            ) : null}
             <Field label="Device">
-              {run.deviceSerial ? (
+              {hub ? (
+                (run.deviceName ?? "—")
+              ) : run.deviceSerial ? (
                 <>
                   {run.deviceName ?? (device ? `${deviceDisplayName(device)} · ` : null)}
                   {run.deviceName ? " · " : null}
@@ -95,7 +109,7 @@ export function DetailsSheet({
                 <span className="text-muted-foreground"> · {run.harness === "omp" ? "thinking" : "effort"} {run.effort ?? run.thinking}</span>
               ) : null}
             </Field>
-            <Field label="Requested by">{run.requestedBy}</Field>
+            <Field label={hub ? "Requested via" : "Requested by"}>{run.requestedBy}</Field>
             <Field label="Created">{formatTime(run.createdAt)}</Field>
             <Field label="Started">{formatTime(run.startedAt)}</Field>
             <Field label="Ended">{formatTime(run.endedAt)}</Field>
@@ -131,12 +145,12 @@ export function DetailsSheet({
                 <span className="font-mono text-xs">{run.suiteId}</span>
               </Field>
             ) : null}
-            {run.install ? (
+            {!hub && run.install ? (
               <Field label="Installed from">
                 <span className="break-all font-mono text-xs">{run.install.path}</span>
               </Field>
             ) : null}
-            {run.source ? (
+            {!hub && run.source ? (
               <Field label="Worktree">
                 <span className="flex items-center gap-1">
                   <span className="min-w-0 break-all font-mono text-xs">{run.source.path}</span>

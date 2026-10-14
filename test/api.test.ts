@@ -89,6 +89,31 @@ describe("request guards", () => {
   });
 });
 
+describe("team-hub routes on a laptop", () => {
+  test("health says local mode", async () => {
+    expect(await (await call("/api/health")).json()).toMatchObject({ ok: true, mode: "local" });
+  });
+
+  test("the hub write routes insist on a JSON body, like every other JSON route", async () => {
+    for (const [method, route] of [["PUT", "/api/hub/connection"], ["POST", "/api/hub/push"], ["POST", "/api/hub/test"], ["POST", "/api/runs/x/unpublish"]] as const) {
+      const res = await call(route, { method, headers: { "content-type": "text/plain" }, body: "{}" });
+      expect(res.status).toBe(415);
+    }
+  });
+
+  test("the ingest API is a hub-only thing", async () => {
+    expect((await call("/api/hub/v1/info")).status).toBe(404);
+  });
+
+  test("validating a project that is to be shared adds what the hub would key it by; without sharing there is no hub block", async () => {
+    const input = { id: "shared-check", name: "Shared", repoPath: project.repoPath, defaultPackage: "com.example.app", defaultPlatform: "android" };
+    const plain = await call("/api/projects/validate", { method: "POST", json: { input, mode: "create" } });
+    expect(await plain.json()).not.toHaveProperty("hub");
+    const shared = await call("/api/projects/validate", { method: "POST", json: { input: { ...input, share: true, hubKey: "github.com/acme/shared-check" }, mode: "create" } });
+    expect(await shared.json()).toMatchObject({ hub: { existingRuns: 0, uploadedRuns: 0, conflictWith: null } });
+  });
+});
+
 describe("encoded paths and framing", () => {
   test("an encoded route spelling cannot skip the content-type check", async () => {
     const res = await call("/api/%72uns", { method: "POST", headers: { "content-type": "text/plain" }, body: "{}" });

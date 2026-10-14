@@ -191,6 +191,20 @@ describe("readActivity", () => {
     expect(page.items).toHaveLength(1);
     expect(page.items[0]).toMatchObject({ kind: "tool_end", seq: 2, tool: "bash", ok: true, durationMs: 3000 });
   });
+
+  test("a hub copy pages its stored activity.jsonl by the original seq, ignoring any events.jsonl", () => {
+    const r = createRun(newRun("hub activity"));
+    const items = [3, 7, 8, 20, 41].map((seq) => ({ ts: "2026-01-01T00:00:00.000Z", seq, kind: "say", text: `item ${seq}` }));
+    fs.writeFileSync(path.join(runDir(r.id), "activity.jsonl"), items.map((i) => JSON.stringify(i)).join("\n") + "\n");
+    writeEvents(r.id, [{ type: "_activity", kind: "info", text: "raw frame that must not be read" }]);
+
+    const newest = readActivity(r.id, { limit: 2 });
+    expect(newest.items.map((a) => a.seq)).toEqual([20, 41]);
+    expect(newest.hasMore).toBe(true);
+    const older = readActivity(r.id, { before: 20, limit: 5 });
+    expect(older.items.map((a) => a.text)).toEqual(["item 3", "item 7", "item 8"]);
+    expect(older.hasMore).toBe(false);
+  });
 });
 
 describe("readActivity per harness", () => {

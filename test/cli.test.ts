@@ -105,9 +105,16 @@ describe("parseCli", () => {
     for (const argv of bad) expect(() => parseCli(argv)).toThrow(UsageError);
   });
 
-  test("serve is production unless --dev is given", () => {
-    expect(parseCli(["serve"])).toEqual({ name: "serve", port: null, dev: false });
-    expect(parseCli(["serve", "--dev", "--port", "4400"])).toEqual({ name: "serve", port: 4400, dev: true });
+  test("serve is production unless --dev is given, and a hub only with --hub", () => {
+    expect(parseCli(["serve"])).toEqual({ name: "serve", port: null, dev: false, hub: false });
+    expect(parseCli(["serve", "--dev", "--port", "4400"])).toEqual({ name: "serve", port: 4400, dev: true, hub: false });
+    expect(parseCli(["serve", "--hub"])).toEqual({ name: "serve", port: null, dev: false, hub: true });
+  });
+
+  test("hub passes its arguments on to the laptop or hub-admin handler and needs a subcommand", () => {
+    expect(parseCli(["hub", "token", "create", "alice-laptop", "--admin"])).toEqual({ name: "hub", args: ["token", "create", "alice-laptop", "--admin"] });
+    expect(parseCli(["hub", "push", "--dry-run"])).toEqual({ name: "hub", args: ["push", "--dry-run"] });
+    expect(() => parseCli(["hub"])).toThrow(UsageError);
   });
 
   test("report takes one run id, an optional --export dir (resolved absolute) and --json", () => {

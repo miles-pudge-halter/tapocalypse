@@ -11,7 +11,7 @@ export interface RunStats {
   cost: number | null;
   medianDurationMs: number | null;
   /** One entry per local calendar day, oldest first, zero-filled. */
-  byDay: { date: string; runs: number; pass: number; fail: number; cost: number | null }[];
+  byDay: { date: string; runs: number; pass: number; issues: number; fail: number; other: number; cost: number | null }[];
 }
 
 function localDate(d: Date): string {
@@ -35,7 +35,7 @@ export function computeStats(runs: Run[], days: number, now = new Date()): RunSt
   const byDay = new Map<string, RunStats["byDay"][number]>();
   for (let i = 0; i < days; i++) {
     const date = localDate(new Date(first.getFullYear(), first.getMonth(), first.getDate() + i));
-    byDay.set(date, { date, runs: 0, pass: 0, fail: 0, cost: null });
+    byDay.set(date, { date, runs: 0, pass: 0, issues: 0, fail: 0, other: 0, cost: null });
   }
 
   const stats: RunStats = { days, runs: 0, pass: 0, fail: 0, issues: 0, other: 0, cost: null, medianDurationMs: null, byDay: [] };
@@ -55,8 +55,13 @@ export function computeStats(runs: Run[], days: number, now = new Date()): RunSt
     } else if (run.verdict === "FAIL") {
       stats.fail++;
       bucket.fail++;
-    } else if (run.verdict === "PASS WITH ISSUES") stats.issues++;
-    else stats.other++;
+    } else if (run.verdict === "PASS WITH ISSUES") {
+      stats.issues++;
+      bucket.issues++;
+    } else {
+      stats.other++;
+      bucket.other++;
+    }
 
     const cost = run.usage?.cost;
     if (typeof cost === "number") {

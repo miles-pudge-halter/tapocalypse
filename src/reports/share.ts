@@ -280,7 +280,7 @@ export type ShareCredentials = { source: "env" } | ({ source: "file" } & z.infer
  * key. The file is read on every call, so adding it needs no restart, and it works under `tapocalypse service`, whose unit carries
  * no secrets.
  */
-export function resolveShareCredentials(s3: ShareConfig["s3"], sources: CredentialSources = {}): { ok: true; credentials: ShareCredentials } | { ok: false; problem: string } {
+export function resolveShareCredentials(s3: NonNullable<ShareConfig["s3"]>, sources: CredentialSources = {}): { ok: true; credentials: ShareCredentials } | { ok: false; problem: string } {
   const env = sources.env ?? process.env;
   const pair = (id: string, secret: string) => Boolean(env[id] && env[secret]);
   if (pair("S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY") || pair("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")) return { ok: true, credentials: { source: "env" } };
@@ -318,7 +318,7 @@ export function shareStatus(
   share: ShareConfig | undefined,
   sources: CredentialSources = {},
 ): { configured: boolean; provider: "s3" | null; expiresInDays: number | null; problem: string | null } {
-  if (!share) return { configured: false, provider: null, expiresInDays: null, problem: null };
+  if (!share?.s3) return { configured: false, provider: null, expiresInDays: null, problem: null };
   const creds = resolveShareCredentials(share.s3, sources);
   return { configured: creds.ok, provider: "s3", expiresInDays: share.s3.expiresInDays, problem: creds.ok ? null : creds.problem };
 }
@@ -331,7 +331,7 @@ export async function shareRun(runId: string, deps: ShareDeps = {}): Promise<{ u
   const share = "share" in deps ? deps.share : config.share;
   const run = getRun(runId);
   if (!run) throw new HttpError(404, `unknown run ${runId}`);
-  if (!share) throw new HttpError(400, "sharing is not configured");
+  if (!share?.s3) throw new HttpError(400, "sharing is not configured");
   const { s3 } = share;
   const creds = resolveShareCredentials(s3, deps);
   if (!creds.ok) throw new HttpError(400, creds.problem);

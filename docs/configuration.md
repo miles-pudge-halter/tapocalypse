@@ -17,7 +17,7 @@ The config file is created with the defaults below when it does not exist. It is
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `port` | `4310` | HTTP port; the server only binds `127.0.0.1` |
+| `port` | `4310` | HTTP port; the server only binds `127.0.0.1` (a [team hub](hub.md) binds `TAPOCALYPSE_HOST`) |
 | `maxConcurrentRuns` | `2` | Runs executing at once (including ones waiting for an emulator to boot). Mind your RAM: each emulator needs several GB |
 | `runMaxTime` | `"60m"` | Time budget per run, shown to the agent and passed to omp as `--max-time` (the other harnesses have no time flag). Tapocalypse hard-kills Claude Code and Codex CLI at the budget and omp, which enforces it itself, 5 minutes after it. Must be a valid duration, checked at startup (`fatal: config: …`, exit 1): `90m`, `1h30m`, `45s`, `2h`; a bare number is minutes. At 80% of it the agent is told to wrap up; see [Run outcomes](guide.md#run-outcomes) |
 | `projects` | `[]` | Project objects, see [Projects](guide.md#projects). Normally managed from the UI |
@@ -28,6 +28,8 @@ The config file is created with the defaults below when it does not exist. It is
 | `agent.model`, `agent.thinking` | unset | Legacy omp keys, kept as they were: the omp model and thinking level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) for runs whose request, suite, project and persona name none. Prefer `agent.harnesses.omp.model` / `.effort` |
 | `projects[].agent` | unset | Per-project override `{ harness?, model?, effort? }`, see [Projects](guide.md#projects) |
 | `projects[].defaultBranch` | unset | Branch that [regression comparisons](guide.md#regressions-history-and-flaky-checks) treat as the project's default, for example `main`. Unset: the repo's `origin/HEAD` (looked up with `git`, cached for 10 minutes), else `main` or `master` if the repo has one |
+| `projects[].share` | `false` | Opt this project in to the [team hub](hub.md): its finished runs upload to `share.hub.url` automatically. Never on by default; turning it off stops future uploads and leaves what is already on the hub. A hub key is required, see below |
+| `projects[].hubKey` | derived | The key that merges this project's runs with teammates' runs of the same app on the hub: lowercase `host/path` of the git remote `origin` (credentials in the URL dropped) plus `#subpath` for an app inside a monorepo, for example `github.com/acme/shop#apps/mobile`. Set it when the repo has no remote (suggestion `local/<project id>`) or when two projects on this machine would derive the same key. See [Team hub sharing](#team-hub-sharing) |
 | `retry.infra` | `1` | Automatic retries of a run that failed on infrastructure (boot failure, agent crash, MCP tools missing) before any check resolved. `0` disables retries |
 | `retention.days` | unset | Delete finished runs that ended more than this many days ago. Unset keeps them |
 | `retention.maxRuns` | unset | Keep only the newest this-many runs, deleting older finished ones. Unset keeps them |
@@ -37,6 +39,9 @@ The config file is created with the defaults below when it does not exist. It is
 | `share.s3.credentialsFile` | `share-credentials.json` next to the config file | JSON file with the S3 credentials, used when no credentials are set in the environment. Absolute path or `~/...`. See [Sharing](#sharing) |
 | `share.s3.prefix` | `"tapocalypse/"` | Key prefix; reports are stored as `<prefix><project id>/<run id>-<random>.html` |
 | `share.s3.expiresInDays` | `7` | How long a share link works, 1 to 7 days (the SigV4 maximum) |
+| `share.hub.url` | unset | Address of the [team hub](hub.md), for example `https://qa.example.com`. Together with an upload token it connects this machine; see [Team hub sharing](#team-hub-sharing) |
+| `share.hub.screenshots` | `"webp"` | `"webp"` re-encodes uploaded screenshots to WebP quality 80 (about 10× smaller); `"original"` uploads the files unchanged |
+| `share.hub.headers` | unset | Extra request headers sent on every hub request, for an access proxy that accepts static headers. Not for secrets: secret values go in `hub-credentials.json` |
 | `devicePool.android.avds` | `[]` | AVD names (`emulator -list-avds`) Tapocalypse may boot on demand. Wear OS, TV and Automotive AVDs are never booted automatically |
 | `devicePool.android.basePort` | `5560` | First emulator console port; booted emulators get even ports from here |
 | `devicePool.android.maxBooted` | `1` | Max emulators Tapocalypse keeps booted at once; `0` disables auto-boot |
@@ -86,6 +91,85 @@ Use the file when Tapocalypse runs under `tapocalypse service`: the launchd/syst
 
  The bucket must stay private: Tapocalypse uploads the file and returns a presigned URL, so **anyone holding the link can open that report until it expires**, and nobody else can list or read the bucket. The key needs permission to write and read objects under the prefix. Links cannot be revoked before they expire; delete the object to pull one early. How it looks in use: [Sharing a report](guide.md#sharing-a-report).
 
+## Team hub sharing
+
+A [team hub](hub.md) is a read-only copy of your team's runs. To upload yours, connect this machine once and then opt projects in.
+
+```json
+{
+  "share": {
+    "hub": {
+      "url": "https://qa.example.com",
+      "screenshots": "webp"
+    }
+  },
+  "projects": [
+    { "id": "shop", "name": "Shop", "repoPath": "/Users/you/code/shop", "share": true }
+  ]
+}
+```
+
+Only `url` is required. Everything secret stays out of the config file. Tapocalypse looks for it, in this order, every time it uploads (no restart needed):
+
+1. **Environment variables** of the server: `TAPOCALYPSE_HUB_TOKEN` (the upload token, which starts with `tpu_`) and `TAPOCALYPSE_HUB_HEADERS` (a JSON object of extra request headers, for example `{"X-Proxy-Key":"..."}`).
+2. **A credentials file**, `hub-credentials.json` in the same folder as the active config file:
+
+   ```json
+   { "token": "tpu_...", "headers": { "X-Proxy-Key": "..." } }
+   ```
+
+   `tapocalypse hub login <url>` and **Setup → Connect to a team hub** write it for you. Like `share-credentials.json`, it must be `chmod 600`: a file that group or other users can read is refused, and `hub status`, `doctor` and Setup say why.
+
+Use the file when Tapocalypse runs under `tapocalypse service`: the unit carries no secrets from your shell, but the file reaches it.
+
+`share.hub.headers` (config) are sent on every hub request in addition to `Authorization: Bearer <token>`; values in the credentials file and then in `TAPOCALYPSE_HUB_HEADERS` override same-named keys. Use them when your access proxy accepts a static header or service token from machines instead of letting `/api/hub/v1/*` through ([proxy recipes](hub.md#put-an-access-proxy-in-front)).
+
+**Which projects upload.** Only projects with `"share": true`, never all of them. Finished runs upload automatically, one at a time, oldest first; offline machines queue and catch up (`<data dir>/hub-outbox.json`). A project needs a **hub key** to share: it is derived from the git remote `origin` (and the folder inside a monorepo), so teammates with the same repository merge into one hub project. Without a remote, or when two projects on this machine would derive the same key, set `hubKey` yourself (lowercase `host/path`, plus `#subpath`: `github.com/acme/shop`, `github.com/acme/shop#apps/mobile`, `local/shop`). The project form shows the derived key and validates this.
+
+**What leaves the machine** (the full list is in [the hub guide](hub.md#what-is-uploaded-and-what-never-is)): the run document, the activity feed, the report and the screenshots, with home, repository and temp paths rewritten and known secret shapes masked. Raw agent events, transcripts, the agent session, `stderr.log`, the run's MCP token and device serials are never uploaded. Briefs, notes and reports are uploaded as written, test-account emails included. `tapocalypse hub pack <runId> --out <dir>` writes exactly what would be sent so you can look.
+
+### Commands on a laptop
+
+```sh
+bun src/cli.ts hub login <url> [--token <t>] [--header "Name: value"]... [--screenshots webp|original]
+                                                    # test the hub first; save the address and token only if it answers
+bun src/cli.ts hub status                           # connection, queue, shared projects
+bun src/cli.ts hub push [<runId>...] [--all] [--project <id>] [--since <date>] [--failed] [--verify] [--wait] [--dry-run]
+bun src/cli.ts hub pack <runId> --out <dir>         # write upload.json + blobs/ (what would be uploaded), send nothing
+bun src/cli.ts hub unpublish <runId>                # remove one of your uploaded runs from the hub
+bun src/cli.ts hub unpublish --project <id>         # ... or all of a project's
+```
+
+`hub push` needs one selector (run ids, `--all`, `--project`, `--since` or `--failed`) and queues those finished runs of shared projects for the running server to upload (a **backfill**, oldest first); `--wait` follows the queue, `--dry-run` runs on this machine alone and prints counts, bytes and masked-secret totals without sending anything, and `--verify` asks the hub what it holds instead of trusting the local record (after restoring a hub from a backup). Deleting a run locally never deletes it from the hub; `hub unpublish` does.
+
+### Commands on the hub
+
+Run them where the hub's data directory is (`docker compose exec hub bun src/cli.ts hub …` on a container):
+
+```sh
+bun src/cli.ts hub token create <name> [--admin]    # prints the upload token once
+bun src/cli.ts hub token list
+bun src/cli.ts hub token revoke <name>
+bun src/cli.ts hub rekey [--project <id>]           # recompute regression keys over all runs
+bun src/cli.ts hub project list                     # hub project ids and keys
+bun src/cli.ts hub project rename <hubKey> "<name>" # pin a project's display name
+bun src/cli.ts hub unpublish <runId>                # remove a run (also: --project <id>, --machine <name>)
+```
+
+### Hub environment variables
+
+These apply to the hub process only ([details and deployment](hub.md#reference)):
+
+| Variable | Effect |
+| --- | --- |
+| `TAPOCALYPSE_MODE` | `hub` starts the read-only hub (`tapocalypse serve --hub` does too). Default: the normal local app |
+| `TAPOCALYPSE_HOST` | Bind address. Unset: `127.0.0.1`; the hub image sets `0.0.0.0` |
+| `TAPOCALYPSE_HUB_HOSTS` | Comma-separated public hostnames that may reach the hub (the `Host` guard); `localhost` and `127.0.0.1` are always allowed for the health check |
+| `TAPOCALYPSE_HUB_IDENTITY_HEADER` | Request header to read as the uploader's identity, for example `X-Forwarded-Email`. Only safe when the hub is reachable solely through the proxy that sets it |
+| `TAPOCALYPSE_HUB_RETENTION_DAYS` | Remove hub runs that ended more than this many days ago. Default `365`; `0` keeps everything |
+| `TAPOCALYPSE_HUB_RETENTION_MAX_RUNS` | Keep only the newest N runs on the hub |
+| `TAPOCALYPSE_HUB_MAX_BLOB_MB` | Largest accepted upload file, default `16` |
+
 ## Agent harnesses
 
 A *harness* is the headless coding-agent CLI that plays the QA agent: `omp`, `claude` (Claude Code) or `codex` (Codex CLI). Which one a run uses, and the settings it gets, come from the config like this:
@@ -131,6 +215,8 @@ A *harness* is the headless coding-agent CLI that plays the QA agent: `omp`, `cl
 | `TAPOCALYPSE_DATA_DIR` | Data directory (see above) |
 | `TAPOCALYPSE_PORT` | Overrides `port`. `tapocalypse serve --port` sets it. The CLI also uses it to find the server |
 | `TAPOCALYPSE_URL` | Server URL for `tapocalypse run` / `status` / `report` (default `http://127.0.0.1:<port>`); `--url` wins |
+| `TAPOCALYPSE_HUB_TOKEN`, `TAPOCALYPSE_HUB_HEADERS` | Upload token and extra request headers (a JSON object) for the [team hub](#team-hub-sharing) this machine uploads to. They win over `hub-credentials.json`. Never put them in the config file |
+| `TAPOCALYPSE_MODE`, `TAPOCALYPSE_HOST`, `TAPOCALYPSE_HUB_*` | Hub-side settings, see [Hub environment variables](#hub-environment-variables) |
 | `XDG_CONFIG_HOME`, `XDG_DATA_HOME` | Base directories for the default config and data locations |
 | `OMP_BIN`, `CLAUDE_BIN`, `CODEX_BIN`, `ADB_BIN`, `XCRUN_BIN`, `GIT_BIN`, `GH_BIN` | Binaries to use instead of `omp`, `claude`, `codex`, `adb`, `xcrun`, `git`, `gh` from `PATH`. The harness variables override `agent.harnesses.<id>.bin` |
 | `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` | Credentials for `share.s3` (`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` work too, as Bun's S3 client reads them). They win over the credentials file. Never put them in the config file; under `tapocalypse service` use the [credentials file](#sharing) instead |

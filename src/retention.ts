@@ -1,5 +1,6 @@
 import { pruneBatchMeta } from "./batches";
 import { config } from "./config";
+import { hubRetention, isHub } from "./hub/mode";
 import { deleteRun, listRuns } from "./runs/store";
 import { ACTIVE, type Run } from "./runs/types";
 
@@ -9,6 +10,11 @@ export interface RetentionPolicy {
 }
 
 const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+
+/** The policy in force: the hub's (`TAPOCALYPSE_HUB_RETENTION_*`, a year by default) on a hub, `config.retention` on a laptop. */
+export function retentionPolicy(): RetentionPolicy {
+  return isHub() ? hubRetention() : config.retention;
+}
 
 /**
  * Ids of runs the policy removes: terminal runs older than `days` (by end time), plus terminal runs beyond the newest `maxRuns`
@@ -37,7 +43,7 @@ export function selectExpiredRuns(runs: readonly Run[], policy: RetentionPolicy,
  * runner is still winding down (e.g. cancelled mid-preflight): they are skipped. Returns the deleted ids.
  */
 export function applyRetention(opts: { now?: number; policy?: RetentionPolicy; isHeld?: (id: string) => boolean } = {}): string[] {
-  const policy = opts.policy ?? config.retention;
+  const policy = opts.policy ?? retentionPolicy();
   if (policy.days === undefined && policy.maxRuns === undefined) return [];
   const runs = listRuns();
   const ids = selectExpiredRuns(runs, policy, opts.now ?? Date.now()).filter((id) => !opts.isHeld?.(id));

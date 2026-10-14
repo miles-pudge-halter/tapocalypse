@@ -109,6 +109,28 @@ export interface CheckHints {
   more?: number;
 }
 
+/** Where a run on the team hub came from. The `keys` are the uploader's machine-local identity, kept so the hub can re-key over the merged history. */
+export interface HubOrigin {
+  /** Name of the upload token that sent the run. */
+  machine: string;
+  /** Proxy identity header value at upload time (an email, a login), when the hub is configured to read one. */
+  uploader: string | null;
+  receivedAt: string;
+  /** The uploader's project id; the run's own `projectId` is the hub's. */
+  localProjectId: string;
+  /** Uploader clock minus hub clock in ms, only when it differs by more than 5 minutes. */
+  clockSkewMs: number | null;
+  /** `contentHashOf` the upload document: equal on re-upload means nothing changed. */
+  contentHash: string;
+  clientVersion: string;
+  keys: {
+    testKey: string | null;
+    checks: Record<string, { checkKey: string; keyKind: KeyKind }>;
+    /** The hints as uploaded (the uploader's keys); `checkHints` on the run holds them translated to hub keys. */
+    checkHints: CheckHints | null;
+  };
+}
+
 export interface Run {
   id: string;
   projectId: string;
@@ -173,6 +195,8 @@ export interface Run {
   checkHints: CheckHints | null;
   /** False when the run opted out of showing the agent the previous checks; a re-run of everything and an infra retry keep it. */
   reuseChecks: boolean;
+  /** Hub copies only (absent on laptops and on runs that were never uploaded): who uploaded the run and what the uploader's own keys were. */
+  hub?: HubOrigin | null;
 }
 
 export interface Activity {

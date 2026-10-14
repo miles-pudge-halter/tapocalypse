@@ -2,6 +2,7 @@
 import path from "node:path";
 import { z } from "zod";
 import type { RunUsage } from "../../runs/types";
+import { harnessEnv } from "../env";
 import { failedSession } from "../failed";
 import { STDIO_BRIDGE, writeBridgeCredentials } from "../bridge";
 import type { HarnessExit, HarnessSession, McpServerSpec, SessionInfo, SpawnOptions } from "../types";
@@ -122,7 +123,7 @@ export function buildCommand(opts: SpawnOptions): string[] {
 export function startSession(spawn: CodexSpawn, opts: SpawnOptions, timing: CodexTiming): HarnessSession {
   let proc: CodexProcess;
   try {
-    proc = spawn(buildCommand(opts), { cwd: opts.cwd, env: { ...process.env } });
+    proc = spawn(buildCommand(opts), { cwd: opts.cwd, env: harnessEnv() });
   } catch (e) {
     return failedSession(
       e instanceof z.ZodError ? `invalid codex settings: ${z.prettifyError(e)}` : `codex could not start: ${(e as Error).message}`,

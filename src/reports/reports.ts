@@ -204,6 +204,7 @@ function dataReports(project: Project): (ReportEntry & { ms: number })[] {
 }
 
 function legacyReports(project: Project): (ReportEntry & { ms: number })[] {
+  if (!project.repoPath) return [];
   const dir = reportsRoot(project);
   let names: string[];
   try {
@@ -318,6 +319,8 @@ export function renderReport(project: Project, name: string): RenderedReport {
     file = reportFile(run, project);
   } else {
     if (!REPORT_NAME_RE.test(name)) throw notFound();
+    // A hub project has no repository; an empty repoPath must not resolve against the server's working directory.
+    if (!project.repoPath) throw notFound();
     file = resolveUnder(reportsRoot(project), name);
   }
   if (!file) throw notFound();
@@ -339,6 +342,7 @@ export function renderReport(project: Project, name: string): RenderedReport {
 /** Absolute path of a servable file under the project's reports dir, or null. */
 export function reportFilePath(project: Project, rel: string): string | null {
   if (!FILE_EXTENSIONS[path.extname(rel).toLowerCase()]) return null;
+  if (!project.repoPath) return null;
   const file = resolveUnder(reportsRoot(project), rel);
   if (!file) return null;
   try {

@@ -7,6 +7,7 @@ import type { LinkActions } from "@/components/regression/match-badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import type { CompareSide, ComparePair, RunComparison } from "@/lib/api";
+import { isHub } from "@/lib/mode";
 import { cn } from "@/lib/utils";
 
 function PickList({
@@ -62,6 +63,15 @@ export function LinkMode({ comparison, actions }: { comparison: RunComparison; a
   const currentRows = comparison.pairs.filter((p) => p.current && !p.baseline);
   const [a, setA] = useState<ComparePair | null>(null);
   const [b, setB] = useState<ComparePair | null>(null);
+  if (isHub()) {
+    return (
+      <EmptyState
+        icon={Unlink}
+        title="No checks could be matched"
+        description="The two runs describe their checks differently. Checks can be linked in Tapocalypse on the machine that ran them; the links reach the hub with its next upload."
+      />
+    );
+  }
   return (
     <div className="space-y-4">
       <EmptyState

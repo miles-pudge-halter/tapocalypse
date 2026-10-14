@@ -15,6 +15,32 @@ const HarnessSettingsSchema = z.object({
   sandbox: z.enum(["danger-full-access", "workspace-write"]).optional(),
 });
 
+const LOOPBACK_HOSTS = ["localhost", "127.0.0.1", "[::1]"];
+
+/** True for an `https://` address, or a plain `http://` one that points at this machine: the upload token and proxy headers never travel in clear text. */
+export function isSecureHubUrl(text: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(text);
+  } catch {
+    return false;
+  }
+  return url.protocol === "https:" || (url.protocol === "http:" && LOOPBACK_HOSTS.includes(url.hostname));
+}
+
+/** The one validator for a team hub address (config file, settings form, `hub login`). */
+export const HUB_URL_PROBLEM = "use the hub's https:// address (plain http is only accepted for this machine)";
+export const HubUrlSchema = z.url({ protocol: /^https?$/ }).refine(isSecureHubUrl, HUB_URL_PROBLEM);
+
+/** `share.hub` in the config file. */
+export const HubConfigSchema = z.strictObject({
+  url: HubUrlSchema,
+  /** Screenshots upload as WebP q80 by default; `original` keeps the PNGs byte-exact. */
+  screenshots: z.enum(["webp", "original"]).optional(),
+  headers: z.record(z.string().min(1), z.string()).optional(),
+});
+export type HubConfig = z.infer<typeof HubConfigSchema>;
+
 export const ConfigSchema = z.object({
   port: z.number().int().positive(),
   maxConcurrentRuns: z.number().int().positive(),
@@ -63,7 +89,9 @@ export const ConfigSchema = z.object({
         prefix: z.string().default("tapocalypse/"),
         /** SigV4 presigned URLs last 7 days at most. */
         expiresInDays: z.number().int().min(1).max(7).default(7),
-      }),
+      }).optional(),
+      /** Team hub: finished runs of projects with `share: true` upload here. The upload token lives in `hub-credentials.json` (mode 600) or `TAPOCALYPSE_HUB_TOKEN`, never in this file. `headers` are static extra request headers for an access proxy that accepts them. */
+      hub: HubConfigSchema.optional(),
     })
     .optional(),
   devicePool: z.object({
@@ -135,14 +163,16 @@ function fatal(msg: string): never {
 }
 
 function loadConfig(): Config {
-  if (!existsSync(CONFIG_PATH)) {
+  // A hub keeps no config of its own to edit: without a file it runs on the starter defaults in memory.
+  const inMemory = !existsSync(CONFIG_PATH) && process.env.TAPOCALYPSE_MODE === "hub";
+  if (!existsSync(CONFIG_PATH) && !inMemory) {
     mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
     writeFileSync(CONFIG_PATH, `${JSON.stringify(STARTER_CONFIG, null, 2)}\n`);
     console.log(`created ${CONFIG_PATH}; add a project at http://127.0.0.1:${process.env.TAPOCALYPSE_PORT || STARTER_CONFIG.port}/#/projects`);
   }
-  let raw: unknown;
+  let raw: unknown = STARTER_CONFIG;
   try {
-    raw = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
+    if (!inMemory) raw = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
   } catch (e) {
     fatal(`config: ${(e as Error).message}`);
   }

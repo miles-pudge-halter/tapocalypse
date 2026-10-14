@@ -10,6 +10,7 @@ node_modules/
 .env
 .env.*
 !.env.example
+!.env.hub.example
 
 # Build, coverage, TypeScript caches
 /dist/

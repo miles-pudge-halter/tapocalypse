@@ -15,6 +15,10 @@ import {
   poolView,
   startIdleReaper,
 } from "./devices/pool";
+import { gcBlobs, hubEvents } from "./hub/ingest";
+import { isHub } from "./hub/mode";
+import { installHubProjects } from "./hub/projects";
+import { type HubSync, hubSyncState, startHubSync } from "./hub/sync";
 import { getProject, initProjects, listProjects } from "./projects/registry";
 import { branchOf, commitOf, defaultBranch, headSnapshot, noBaselineReason, platformOf, resolveBaseline } from "./regression/baseline";
 import { compareRuns } from "./regression/compare";
@@ -38,7 +42,7 @@ import { createRunner } from "./runs/runner";
 import { type QueueHold, Scheduler } from "./runs/scheduler";
 import { runMatches } from "./runs/source";
 import { getRun, listRuns } from "./runs/store";
-import { ACTIVE, type Check, type Platform, type Run } from "./runs/types";
+import { ACTIVE, type Check, type HubOrigin, type Platform, type Run } from "./runs/types";
 
 export const scheduler: Scheduler = new Scheduler({
   config,
@@ -74,7 +78,12 @@ export async function poolStateView(): Promise<PoolView> {
   return poolView(scheduler.activeCount(), scheduler.waitingView());
 }
 
-export type RunView = Run & {
+/** Who uploaded a hub copy and when (the run's `hub` origin without the uploader's machine-local keys). */
+export type HubAttribution = Pick<HubOrigin, "machine" | "uploader" | "receivedAt" | "localProjectId">;
+
+export type RunView = Omit<Run, "hub"> & {
+  /** Hub copies only: who uploaded the run; null on laptops and for runs that were never uploaded. */
+  hub: HubAttribution | null;
   queuePosition: number | null;
   /** Elapsed time for active runs, total time for finished ones; null before the run started. */
   durationMs: number | null;
@@ -88,6 +97,8 @@ export type RunView = Run & {
   runDir: string;
   /** How a finished run compares with its automatic baseline (null while active, without checks or without an earlier run of the test). */
   regression: RunRegression | null;
+  /** Laptop only: upload state of this run when its project is shared and a hub is configured; null otherwise (and always on a hub). */
+  hubSync: HubSync | null;
 };
 
 export function runDurationMs(run: Run): number | null {
@@ -97,15 +108,20 @@ export function runDurationMs(run: Run): number | null {
 }
 
 export function runView(run: Run): RunView {
+  const { hub, ...rest } = run;
   return {
-    ...run,
+    ...rest,
+    // The uploader's own keys stay on the server: the UI needs only who sent it and when.
+    hub: hub ? { machine: hub.machine, uploader: hub.uploader, receivedAt: hub.receivedAt, localProjectId: hub.localProjectId } : null,
     queuePosition: scheduler.queuePosition(run.id),
     durationMs: runDurationMs(run),
     queueReason: scheduler.queueReason(run.id),
     queueHold: scheduler.queueHold(run.id),
-    reportFile: reportLocation(run, getProject(run.projectId) ?? null),
-    runDir: runArtefactDir(run.id),
+    // The hub's own filesystem layout is none of a viewer's business.
+    reportFile: isHub() ? null : reportLocation(run, getProject(run.projectId) ?? null),
+    runDir: isHub() ? "" : runArtefactDir(run.id),
     regression: regressionOf(run),
+    hubSync: isHub() ? null : hubSyncState(run.id, run),
   };
 }
 
@@ -121,6 +137,10 @@ export interface RunQuery {
   q?: string;
   batch?: string;
   branch?: string;
+  /** `build.versionName` of the run. */
+  version?: string;
+  /** Hub only: upload token names (a run matches any of them). */
+  machine?: string[];
   pr?: number;
   ticket?: string;
   commit?: string;
@@ -166,6 +186,8 @@ export function queryRuns(query: RunQuery): { runs: RunView[]; hasMore: boolean 
     if (query.status?.length && !query.status.includes(run.status)) continue;
     if (query.verdict?.length && !query.verdict.includes(run.verdict ?? "none")) continue;
     if (query.batch && run.batchId !== query.batch) continue;
+    if (query.version && run.build?.versionName !== query.version) continue;
+    if (query.machine?.length && !(run.hub && query.machine.includes(run.hub.machine))) continue;
     if (bySource && !runMatches(run, source)) continue;
     if (q && !matchesText(run, q)) continue;
     if (query.regressed && !((regressionOf(run)?.newlyFailing ?? 0) > 0)) continue;
@@ -247,7 +269,7 @@ const compareDeps = {
 /** Memoised per run; a project's entries are dropped whenever one of its finished runs is saved or deleted or a check is linked, never by a live run's progress. */
 const regressionMemo = new Map<string, { generation: number; runs: Map<string, { stamp: string; value: RunRegression | null }> }>();
 
-function regressionOf(run: Run): RunRegression | null {
+export function regressionOf(run: Run): RunRegression | null {
   if (ACTIVE.includes(run.status) || run.checks.length === 0) return null;
   const generation = projectGeneration(run.projectId);
   let project = regressionMemo.get(run.projectId);
@@ -560,4 +582,22 @@ export async function init(): Promise<void> {
   }, 15_000);
   void scheduler.schedule();
   startRetention((id) => scheduler.isHeld(id));
+  // Finished runs of shared projects go to the team hub, when one is configured.
+  startHubSync();
+}
+
+const BLOB_GC_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Boot for `TAPOCALYPSE_MODE=hub`. Nothing here touches a device, an agent or a repository: the project registry is the hub's,
+ * the scheduler never runs anything (uploaded runs are always terminal), and the leases, gateway and idle reaper stay off.
+ * Retention follows the hub policy and unreferenced blobs are collected alongside it.
+ */
+export async function initHub(): Promise<void> {
+  installHubProjects();
+  // The live lists listen on the scheduler's bus; an ingested run is announced there like a finished local one.
+  hubEvents.on("run", (run: Run) => scheduler.bus.emit("run", run));
+  startRetention(() => false);
+  gcBlobs();
+  setInterval(() => gcBlobs(), BLOB_GC_INTERVAL_MS).unref();
 }

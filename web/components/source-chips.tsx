@@ -5,6 +5,7 @@ import type { ReactNode } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { BuildInfo, PullRequestInfo, RunSource } from "@/lib/api";
+import { externalUrl } from "@/lib/hub";
 import { cn } from "@/lib/utils";
 
 const SHORT_SHA_LENGTH = 7;
@@ -67,9 +68,9 @@ function Chip({
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        {href ? (
+        {externalUrl(href) ? (
           <Badge asChild variant="outline" className={classes}>
-            <a href={href} target="_blank" rel="noopener noreferrer">
+            <a href={externalUrl(href) ?? undefined} target="_blank" rel="noopener noreferrer">
               {content}
             </a>
           </Badge>

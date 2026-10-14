@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import { DeviceFrame } from "@/components/device-frame";
 import { DeviceName } from "@/components/device-name";
 import { EmptyState } from "@/components/empty-state";
+import { UploadedBy } from "@/components/hub/uploaded-by";
 import { isFailedLane, RunRegressionChip, rerunFailedLanes } from "@/components/run-row";
 import { RunStatusIcon } from "@/components/run-status-icon";
 import { CheckCounts, SegmentedProgress } from "@/components/segmented-progress";
@@ -17,6 +18,7 @@ import { VerdictBadge } from "@/components/verdict-badge";
 import { isActive, runHash, type Device, type RunView } from "@/lib/api";
 import { formatCost, formatDuration } from "@/lib/format";
 import { useBatch, useDevices, useNow, useProjects } from "@/lib/hooks";
+import { isHub } from "@/lib/mode";
 import { cn } from "@/lib/utils";
 
 export function Batch({ id }: { id: string }) {
@@ -29,7 +31,7 @@ export function Batch({ id }: { id: string }) {
 
   const back = (
     <Button asChild variant="ghost" size="sm" className="-ml-2 mb-2">
-      <a href="#/">
+      <a href="#/runs">
         <ArrowLeft />
         Runs
       </a>
@@ -112,10 +114,12 @@ export function Batch({ id }: { id: string }) {
               <span>{formatCost(batch.cost)}</span>
             </div>
           </div>
-          <Button variant="outline" className="strike" disabled={active || failedLanes.length === 0 || rerunning} onClick={() => void rerunFailed()}>
-            {rerunning ? <Loader2 className="animate-spin" /> : <RotateCcw />}
-            Re-run failed lanes
-          </Button>
+          {isHub() ? null : (
+            <Button variant="outline" className="strike" disabled={active || failedLanes.length === 0 || rerunning} onClick={() => void rerunFailed()}>
+              {rerunning ? <Loader2 className="animate-spin" /> : <RotateCcw />}
+              Re-run failed lanes
+            </Button>
+          )}
         </div>
       </div>
 
@@ -162,6 +166,7 @@ function Lane({ run, device, now }: { run: RunView; device: Device | undefined; 
           ) : (
             <span>{run.deviceName ?? run.deviceSerial ?? `any ${run.deviceRequest.platform}`}</span>
           )}
+          <UploadedBy hub={run.hub} />
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {run.verdict ? <VerdictBadge verdict={run.verdict} /> : <StatusBadge status={run.status} />}

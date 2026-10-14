@@ -1,0 +1,14 @@
+node_modules
+.git
+.github
+.omp
+.agent-memory
+data
+test
+docs
+dist
+coverage
+.env
+.env.*
+*.log
+tapocalypse.config.json

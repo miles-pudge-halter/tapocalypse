@@ -160,6 +160,25 @@ function playOnClose(frames: string[], code = 0): (p: FakeProc) => void {
     });
 }
 
+describe("codex spawn environment", () => {
+  test("the agent does not inherit the team hub's upload token or proxy headers", async () => {
+    process.env.TAPOCALYPSE_HUB_TOKEN = "tpu_secret";
+    process.env.TAPOCALYPSE_HUB_URL = "https://hub.example.com";
+    try {
+      const { spawn, calls } = fakeSpawn((p) => (p.onStdinClosed = playOnClose([])));
+      const session = createCodexHarness({ spawn }).spawn(makeOpts().opts);
+      expect(calls).toHaveLength(1);
+      expect(Object.keys(calls[0].env).filter((k) => k.startsWith("TAPOCALYPSE_HUB_"))).toEqual([]);
+      expect(calls[0].env.PATH).toBe(process.env.PATH);
+      await session.send("x");
+      await session.exited;
+    } finally {
+      delete process.env.TAPOCALYPSE_HUB_TOKEN;
+      delete process.env.TAPOCALYPSE_HUB_URL;
+    }
+  });
+});
+
 describe("codex session stream", () => {
   test("maps the exec stream to normalized events in order and settles", async () => {
     const frames = lines(await fixture("codex-exec.jsonl"));

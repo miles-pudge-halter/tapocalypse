@@ -37,7 +37,7 @@ export function RunDetail({ id, check, baseline }: { id: string; check?: string;
         <XCircle />
         <AlertTitle>Could not load run</AlertTitle>
         <AlertDescription>
-          {error}. <a href="#/" className="underline underline-offset-2">Back to runs</a>
+          {error}. <a href="#/runs" className="underline underline-offset-2">Back to runs</a>
         </AlertDescription>
       </Alert>
     );

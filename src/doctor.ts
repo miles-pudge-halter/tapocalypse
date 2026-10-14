@@ -1,9 +1,15 @@
-import { existsSync } from "node:fs";
-import { ADB_BIN, CONFIG_PATH, config, EMULATOR_BIN, GH_BIN, GIT_BIN } from "./config";
+import { existsSync, rmSync, statfsSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import { ADB_BIN, CONFIG_PATH, config, DATA_DIR, EMULATOR_BIN, GH_BIN, GIT_BIN } from "./config";
 import { type ExecResult, exec, parseAdbDevices } from "./devices/devices";
 import { getHarness, type HarnessReadiness, harnessBin, pickDefaultHarness, readinessOf } from "./harness";
 import { HARNESS_IDS, type Harness, type HarnessId } from "./harness/types";
+import { hubChecks } from "./hub/laptop-doctor";
+import { hubHosts, HUB_STORE_WARN_RUNS, hubIdentityHeader, hubRetention, isHub } from "./hub/mode";
+import { hubMachines, type HubMachine } from "./hub/status";
+import { listTokens } from "./hub/tokens";
 import { listProjects, projectEvents, type ProjectStatus } from "./projects/registry";
+import { listRuns } from "./runs/store";
 
 export interface DoctorCheck {
   id: string;
@@ -36,6 +42,8 @@ export interface DoctorEnv {
   projects: () => ProjectStatus[];
   /** Runs a probe command to completion; never throws (a missing binary is exit code 127). */
   run: (cmd: string[]) => Promise<ExecResult>;
+  /** The team-hub rows (laptop side); absent = none. */
+  hubChecks?: () => Promise<DoctorCheck[]>;
 }
 
 const PROBE_TIMEOUT_MS = 8_000;
@@ -62,6 +70,7 @@ export function defaultEnv(): DoctorEnv {
     configuredAvds: config.devicePool.android.avds,
     projects: listProjects,
     run: (cmd) => exec(cmd, { timeoutMs: PROBE_TIMEOUT_MS }),
+    hubChecks: () => hubChecks(),
   };
 }
 
@@ -310,6 +319,16 @@ function checkProjects(env: DoctorEnv): Promise<DoctorCheck> {
   });
 }
 
+/** The laptop side of the team hub (connection, credentials, queue, shared projects); a probe that throws is one error row. */
+async function teamHubChecks(env: DoctorEnv): Promise<DoctorCheck[]> {
+  if (!env.hubChecks) return [];
+  try {
+    return await env.hubChecks();
+  } catch (e) {
+    return [{ id: "hub", label: "Team hub", status: "error", detail: e instanceof Error ? e.message : String(e), required: false }];
+  }
+}
+
 /** Uncached report for an explicit environment. */
 export async function buildReport(env: DoctorEnv): Promise<DoctorReport> {
   const xcrun = checkXcrun(env);
@@ -333,7 +352,127 @@ export async function buildReport(env: DoctorEnv): Promise<DoctorReport> {
   const harnessList = HARNESS_IDS.flatMap((id) =>
     (byHarness.get(id) ?? []).map((c) => (c.id === id || c.id === authId(id) ? { ...c, required: id === selected } : c)),
   );
-  const checks = [os, bun, agentRuntimeCheck(env, readiness), ...harnessList, ...rest];
+  const checks = [os, bun, agentRuntimeCheck(env, readiness), ...harnessList, ...rest, ...(await teamHubChecks(env))];
+  return { checks };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Hub: nothing here touches a device or an agent, so the laptop checklist does not apply
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Everything the hub checks read from the outside world; tests inject their own. */
+export interface HubDoctorEnv {
+  dataDir: string;
+  hosts: string[];
+  identityHeader: string | null;
+  retention: { days?: number; maxRuns?: number };
+  runCount: () => number;
+  activeTokens: () => number;
+  machines: () => HubMachine[];
+  /** Free bytes on the volume holding `dir`; null when the platform cannot say. */
+  freeBytes: (dir: string) => number | null;
+  now: () => number;
+}
+
+export function defaultHubEnv(): HubDoctorEnv {
+  return {
+    dataDir: DATA_DIR,
+    hosts: hubHosts(),
+    identityHeader: hubIdentityHeader(),
+    retention: hubRetention(),
+    runCount: () => listRuns().length,
+    activeTokens: () => listTokens().filter((t) => t.revokedAt === null).length,
+    machines: () => hubMachines(),
+    freeBytes: (dir) => {
+      try {
+        const fs = statfsSync(dir);
+        return fs.bavail * fs.bsize;
+      } catch {
+        return null;
+      }
+    },
+    now: () => Date.now(),
+  };
+}
+
+const WARN_FREE_BYTES = 1024 ** 3;
+const MIN_FREE_BYTES = 100 * 1024 ** 2;
+
+function ago(ms: number): string {
+  if (ms < 60_000) return "just now";
+  if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m ago`;
+  if (ms < 86_400_000) return `${Math.floor(ms / 3_600_000)}h ago`;
+  return `${Math.floor(ms / 86_400_000)}d ago`;
+}
+
+/** The hub's checklist: data dir writable, free disk, store size against the 8k-run tripwire, tokens, proxy hosts, last upload per machine. */
+export async function buildHubReport(env: HubDoctorEnv): Promise<DoctorReport> {
+  const checks = await Promise.all([
+    guarded({ id: "data-dir", label: "Data directory writable", required: true }, () => {
+      const probe = path.join(env.dataDir, `.doctor-${process.pid}`);
+      try {
+        writeFileSync(probe, "ok");
+        rmSync(probe, { force: true });
+        return { status: "ok", detail: env.dataDir };
+      } catch (e) {
+        return {
+          status: "error",
+          detail: `${env.dataDir} is not writable: ${e instanceof Error ? e.message : String(e)}`,
+          fix: "Mount a writable volume at the data directory (the container runs as the non-root `bun` user, uid 1000)",
+        };
+      }
+    }),
+    guarded({ id: "disk", label: "Free disk space", required: true }, () => {
+      const free = env.freeBytes(env.dataDir);
+      if (free === null) return { status: "skip", detail: "Free space is not reported on this platform" };
+      const detail = `${(free / 1024 ** 3).toFixed(1)} GB free`;
+      if (free < MIN_FREE_BYTES) return { status: "error", detail, fix: "Uploads will fail: free space on the data volume or enlarge it" };
+      if (free < WARN_FREE_BYTES) return { status: "warn", detail, fix: "Under 1 GB left: free space, enlarge the volume or lower TAPOCALYPSE_HUB_RETENTION_DAYS" };
+      return { status: "ok", detail };
+    }),
+    guarded({ id: "store", label: "Run store size", required: false }, () => {
+      const runs = env.runCount();
+      if (runs < HUB_STORE_WARN_RUNS) return { status: "ok", detail: `${runs} run(s)` };
+      return {
+        status: "warn",
+        detail: `${runs} runs: the in-memory store boots slowly past about 10,000 runs`,
+        fix: "Shorten retention (TAPOCALYPSE_HUB_RETENTION_DAYS / _MAX_RUNS); a SQLite run index is the planned fix beyond that",
+      };
+    }),
+    guarded({ id: "tokens", label: "Upload tokens", required: false }, () => {
+      const n = env.activeTokens();
+      return n > 0
+        ? { status: "ok", detail: `${n} active token(s)` }
+        : { status: "warn", detail: "No active upload token: no machine can upload", fix: "Run `bun src/cli.ts hub token create <machine-name>` on the hub" };
+    }),
+    guarded({ id: "hosts", label: "Public host names", required: false }, () =>
+      env.hosts.length > 0
+        ? { status: "ok", detail: env.hosts.join(", ") }
+        : {
+            status: "warn",
+            detail: "TAPOCALYPSE_HUB_HOSTS is not set: only localhost is accepted, so requests that arrive through the access proxy get 403",
+            fix: "Set TAPOCALYPSE_HUB_HOSTS to the host name(s) the proxy forwards, e.g. qa.example.com",
+          },
+    ),
+    guarded({ id: "retention", label: "Retention", required: false }, () => {
+      const { days, maxRuns } = env.retention;
+      const parts = [days === undefined ? null : `${days} days`, maxRuns === undefined ? null : `newest ${maxRuns} runs`].filter((p) => p !== null);
+      return { status: "ok", detail: parts.length > 0 ? `keeps ${parts.join(", ")}` : "keeps everything" };
+    }),
+    guarded({ id: "uploads", label: "Last upload per machine", required: false }, () => {
+      const machines = env.machines().filter((m) => !m.revoked);
+      if (machines.length === 0) return { status: "ok", detail: "no machine has uploaded yet" };
+      const now = env.now();
+      const detail = machines.map((m) => `${m.name} ${m.lastUploadAt ? ago(now - Date.parse(m.lastUploadAt)) : "never"}`).join(", ");
+      const skewed = machines.filter((m) => m.clockSkewMs !== null);
+      if (skewed.length === 0) return { status: "ok", detail };
+      return {
+        status: "warn",
+        detail: `${detail}. Clock more than 5 minutes off: ${skewed.map((m) => m.name).join(", ")}`,
+        fix: "Fix the clock on those machines (ordering of uploaded runs uses the uploader's time)",
+      };
+    }),
+  ]);
   return { checks };
 }
 
@@ -344,8 +483,9 @@ projectEvents.on("change", () => {
   cache = null;
 });
 
-/** Cached for 10 s; `fresh` bypasses the cache (the "Re-check" button). Never throws. */
+/** Cached for 10 s; `fresh` bypasses the cache (the "Re-check" button). Never throws. A hub runs its own, much shorter checklist. */
 export function runDoctor(opts: { fresh?: boolean } = {}): Promise<DoctorReport> {
+  if (isHub()) return buildHubReport(defaultHubEnv());
   if (!opts.fresh && cache && Date.now() - cache.at < CACHE_TTL_MS) return cache.report;
   const report = buildReport(defaultEnv());
   cache = { at: Date.now(), report };

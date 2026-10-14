@@ -454,6 +454,19 @@ describe("claude steer and abort", () => {
 });
 
 describe("claude spawn configuration", () => {
+  test("the agent does not inherit the team hub's upload token or proxy headers", () => {
+    process.env.TAPOCALYPSE_HUB_TOKEN = "tpu_secret";
+    process.env.TAPOCALYPSE_HUB_HEADERS = '{"X-Proxy":"secret"}';
+    try {
+      const { env } = rig().spawned[0];
+      expect(Object.keys(env).filter((k) => k.startsWith("TAPOCALYPSE_HUB_"))).toEqual([]);
+      expect(env.PATH).toBe(process.env.PATH);
+    } finally {
+      delete process.env.TAPOCALYPSE_HUB_TOKEN;
+      delete process.env.TAPOCALYPSE_HUB_HEADERS;
+    }
+  });
+
   test("argv: stream-json in/out, isolated MCP and persona files, bypass permissions, native model/effort/limits; the token stays out", () => {
     const r = rig({
       model: "opus",

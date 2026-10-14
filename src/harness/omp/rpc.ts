@@ -1,5 +1,6 @@
 import type { Subprocess } from "bun";
 import { OMP_BIN } from "../../config";
+import { harnessEnv } from "../env";
 
 /** A decoded stdout frame (or a synthetic `_raw` / `_stderr` frame). */
 export type Frame = { type: string; [key: string]: unknown };
@@ -46,6 +47,7 @@ export class OmpRpc {
   constructor(opts: { bin?: string; args: string[]; cwd: string; onFrame: (f: Frame) => void; onExit: (code: number) => void }) {
     const proc = Bun.spawn([opts.bin ?? OMP_BIN, "--mode", "rpc", "--no-ui", ...opts.args], {
       cwd: opts.cwd,
+      env: harnessEnv(),
       stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",

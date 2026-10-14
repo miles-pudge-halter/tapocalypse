@@ -7,6 +7,7 @@ import {
   Boxes,
   Check,
   CheckCircle2,
+  Cloud,
   ChevronDown,
   FileText,
   Feather,
@@ -31,8 +32,12 @@ import { type FormEvent, type ReactNode, useEffect, useMemo, useState } from "re
 import { toast } from "sonner";
 import { CopyButton } from "@/components/copy-button";
 import { EmptyState } from "@/components/empty-state";
+import { HubQueueChip } from "@/components/hub/hub-queue-chip";
+import { ProjectShareField } from "@/components/hub/project-share-field";
+import { DetectedTag, Field, FieldError } from "@/components/field";
 import { PageHeader } from "@/components/page-header";
 import { useStartSmokeRun } from "@/components/setup-checklist";
+import { VerdictStrip } from "@/components/verdict-strip";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -57,6 +62,8 @@ import {
   api,
   type Detection,
   type Framework,
+  type HubStatus,
+  type HubValidation,
   type Platform,
   type Project,
   type ProjectInput,
@@ -65,8 +72,8 @@ import {
   type RunView,
   runHash,
 } from "@/lib/api";
-import { formatCost, formatRelative } from "@/lib/format";
-import { navigate, useActiveRuns, useNewRun, useNow, useProjects, useRuns, useStats, useSuites } from "@/lib/hooks";
+import { formatCost, formatRelative, PLATFORM_ICON, PLATFORM_LABEL } from "@/lib/format";
+import { navigate, useActiveRuns, useHubStatus, useNewRun, useNow, useProjects, useRuns, useStats, useSuites } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
 
 const FRAMEWORK_LABEL: Record<Framework, string> = {
@@ -89,8 +96,6 @@ const FRAMEWORK_ICON: Record<Framework, LucideIcon> = {
   unknown: FolderGit2,
 };
 
-const PLATFORM_LABEL: Record<Platform, string> = { android: "Android", ios: "iOS" };
-const PLATFORM_ICON: Record<Platform, LucideIcon> = { android: Bot, ios: Apple };
 const PLATFORMS: Platform[] = ["android", "ios"];
 const PACKAGE_EXAMPLE: Record<Platform, string> = { android: "com.example.myapp.dev", ios: "com.example.myapp" };
 
@@ -100,7 +105,7 @@ const STRIP_RUNS = 12;
 const CUSTOM = ":custom";
 const BUILTIN = ":builtin";
 const SAVE_ERROR = /^(\w+): (.+)$/s;
-const PROJECT_FIELDS: (keyof Project)[] = ["id", "name", "repoPath", "personaFile", "defaultPackage", "defaultPlatform", "defaultBranch"];
+const PROJECT_FIELDS: (keyof Project)[] = ["id", "name", "repoPath", "personaFile", "defaultPackage", "defaultPlatform", "defaultBranch", "share", "hubKey"];
 
 type FieldErrors = Partial<Record<keyof Project, string>>;
 
@@ -182,10 +187,13 @@ export function Projects({ openNew }: { openNew: boolean }) {
         title="Projects"
         description="The mobile apps Tapocalypse can test. Each project points at a repository on this machine."
         actions={
-          <Button onClick={() => openSheet(null)}>
-            <Plus />
-            Add project
-          </Button>
+          <>
+            <HubQueueChip />
+            <Button onClick={() => openSheet(null)}>
+              <Plus />
+              Add project
+            </Button>
+          </>
         }
       />
 
@@ -284,53 +292,6 @@ export function Projects({ openNew }: { openNew: boolean }) {
 
 // --- Project card ---
 
-/** Dot colour for the verdict strip: the verdict when there is one, else the status. */
-function dotClass(run: RunView): string {
-  switch (run.verdict) {
-    case "PASS":
-      return "bg-emerald-500";
-    case "FAIL":
-      return "bg-red-500";
-    case "PASS WITH ISSUES":
-      return "bg-orange-400";
-    case "BLOCKED":
-      return "bg-rose-800 dark:bg-rose-700";
-    case "PARTIAL":
-      return "border-2 border-orange-400 bg-transparent";
-    case null:
-      break;
-  }
-  if (run.status === "queued" || run.status === "preflight" || run.status === "running" || run.status === "finishing") {
-    return "animate-pulse bg-blue-500";
-  }
-  if (run.status === "error") return "border-2 border-red-500/60 bg-transparent";
-  return "bg-stone-400 dark:bg-stone-600";
-}
-
-function VerdictStrip({ runs }: { runs: RunView[] }) {
-  // The list is newest first; the strip reads oldest to newest, left to right.
-  const dots = runs.slice(0, STRIP_RUNS).reverse();
-  return (
-    <div className="flex items-center gap-1" role="list" aria-label="Most recent runs">
-      {dots.map((run) => (
-        <Tooltip key={run.id}>
-          <TooltipTrigger asChild>
-            <a
-              role="listitem"
-              href={runHash(run.id)}
-              aria-label={`${run.title}: ${run.verdict ?? run.status}`}
-              className={cn("size-3 rounded-full outline-none ring-offset-background focus-visible:ring-2 focus-visible:ring-ring", dotClass(run))}
-            />
-          </TooltipTrigger>
-          <TooltipContent>
-            {run.title} · {run.verdict ?? run.status}
-          </TooltipContent>
-        </Tooltip>
-      ))}
-    </div>
-  );
-}
-
 function SuitesCount({ projectId }: { projectId: string }) {
   const { suites, loading } = useSuites(projectId);
   if (loading) return null;
@@ -391,6 +352,41 @@ function SuitesDialog({ project, open, onClose }: { project: ProjectStatus; open
   );
 }
 
+/** "Shared" with this project's upload trouble: counted from its recent runs' sync states, plus the backfill when it is the only shared project. */
+function SharedBadges({ project, runs, status }: { project: ProjectStatus; runs: RunView[]; status: HubStatus | null }) {
+  const failed = runs.filter((r) => r.hubSync?.state === "failed" || r.hubSync?.state === "paused").length;
+  const waiting = runs.filter((r) => r.hubSync?.state === "queued" || r.hubSync?.state === "uploading" || r.hubSync?.state === "outdated").length;
+  const backfill = status?.sharedProjects.length === 1 ? status.queue.backfill : null;
+  const key = project.hubKey ?? status?.sharedProjects.find((p) => p.id === project.id)?.hubKey;
+  return (
+    <>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Badge variant="outline" className="gap-1">
+            <Cloud />
+            Shared
+          </Badge>
+        </TooltipTrigger>
+        <TooltipContent>Uploads to the team hub{key ? ` as ${key}` : ""}</TooltipContent>
+      </Tooltip>
+      {backfill ? (
+        <Badge variant="outline" className="border-blue-500/30 bg-blue-500/10 text-blue-700 dark:text-blue-300">
+          Uploading {backfill.done} of {backfill.total}
+        </Badge>
+      ) : (
+        <>
+          {failed > 0 && (
+            <Badge variant="outline" className="border-orange-500/30 bg-orange-500/10 text-orange-800 dark:text-orange-300">
+              {failed} failed
+            </Badge>
+          )}
+          {waiting > 0 && <Badge variant="outline">{waiting} waiting</Badge>}
+        </>
+      )}
+    </>
+  );
+}
+
 function ProjectCard({
   project,
   activeCount,
@@ -408,6 +404,7 @@ function ProjectCard({
   const detection = useDetection(project);
   const { runs } = useRuns({ project: project.id, limit: STRIP_RUNS });
   const { stats } = useStats(project.id, 7);
+  const { status: hubStatus } = useHubStatus();
   const { openNewRun } = useNewRun();
   const startSmokeRun = useStartSmokeRun();
   const [suitesOpen, setSuitesOpen] = useState(false);
@@ -481,6 +478,7 @@ function ProjectCard({
               {activeCount} active
             </Badge>
           )}
+          {project.share === true && <SharedBadges project={project} runs={runs} status={hubStatus} />}
         </div>
 
         {!ok && (
@@ -513,7 +511,7 @@ function ProjectCard({
         {ok &&
           (runs.length > 0 ? (
             <div className="space-y-2">
-              <VerdictStrip runs={runs} />
+              <VerdictStrip items={runs.slice(0, STRIP_RUNS).reverse()} />
               <p className="flex flex-wrap items-center gap-x-1.5 text-xs text-muted-foreground">
                 {passRate !== null && stats ? (
                   <span className="tabular-nums" title={`${stats.pass} pass of ${conclusive} runs with a verdict in the last 7 days`}>
@@ -709,6 +707,11 @@ interface FormState {
   customPersona: string;
   /** Branch regression baselines fall back to; empty = the repository's default branch. */
   defaultBranch: string;
+  share: boolean;
+  /** Empty = the key derived from the git remote. */
+  hubKey: string;
+  /** Upload the finished runs already on this machine when saving. */
+  backfill: boolean;
 }
 
 type Fields = Omit<ProjectInput, "id">;
@@ -725,6 +728,9 @@ function formFromProject(p: Project): FormState {
     persona: p.personaFile ?? BUILTIN,
     customPersona: "",
     defaultBranch: p.defaultBranch ?? "",
+    share: p.share === true,
+    hubKey: p.hubKey ?? "",
+    backfill: false,
   };
 }
 
@@ -741,6 +747,9 @@ function formFromDetection(d: Detection): FormState {
     persona: suggestion.personaFile ?? BUILTIN,
     customPersona: "",
     defaultBranch: "",
+    share: false,
+    hubKey: "",
+    backfill: false,
   };
 }
 
@@ -784,6 +793,9 @@ function buildFields(form: FormState, options: string[]): Built {
       defaultPackage: form.packageId.trim(),
       defaultPlatform: form.platform,
       defaultBranch: form.defaultBranch.trim(),
+      share: form.share,
+      // The key only matters while sharing; an empty one means "derive it from the remote".
+      ...(form.share ? { hubKey: form.hubKey.trim() } : {}),
     },
   };
 }
@@ -807,6 +819,7 @@ function ProjectForm({
   const [saveErrors, setSaveErrors] = useState<FieldErrors>({});
   const [warnings, setWarnings] = useState<string[]>([]);
   const [validating, setValidating] = useState(false);
+  const [hubInfo, setHubInfo] = useState<HubValidation | undefined>(undefined);
   const [saving, setSaving] = useState(false);
   const [generalError, setGeneralError] = useState<string | null>(null);
   /** Fields the user has left (or tried to submit) once; undetected values stay a neutral hint until then. */
@@ -837,6 +850,7 @@ function ProjectForm({
         (result) => {
           if (cancelled) return;
           setServerErrors(result.errors);
+          setHubInfo(result.hub);
           setWarnings(result.warnings);
           setGeneralError(null);
           setValidating(false);
@@ -910,11 +924,20 @@ function ProjectForm({
     setGeneralError(null);
     try {
       if (project) {
-        await api.updateProject(project.id, built.fields);
+        const pending = (hubInfo?.existingRuns ?? 0) - (hubInfo?.uploadedRuns ?? 0);
+        const backfill = form.share && form.backfill && pending > 0;
+        await api.updateProject(project.id, { ...built.fields, ...(backfill ? { backfill: true as const } : {}) });
         toast.success(`Saved ${form.name.trim()}`);
+        if (form.share && (!project.share || backfill)) {
+          toast.success(`Sharing ${form.name.trim()} with the team hub`, {
+            description: backfill ? `Uploading ${pending} existing runs in the background.` : "New runs upload when they finish.",
+          });
+        }
         onUpdated();
       } else {
-        onCreated(await api.createProject({ id: form.id, ...built.fields }));
+        const created = await api.createProject({ id: form.id, ...built.fields });
+        if (form.share) toast.success(`Sharing ${form.name.trim()} with the team hub`, { description: "New runs upload when they finish." });
+        onCreated(created);
       }
     } catch (err) {
       const message = errorMessage(err);
@@ -1200,6 +1223,17 @@ function ProjectForm({
           aria-describedby="pj-branch-hint"
         />
       </Field>
+
+      <ProjectShareField
+        projectId={form.id}
+        value={{ share: form.share, hubKey: form.hubKey, backfill: form.backfill }}
+        onChange={patch}
+        hub={hubInfo}
+        validating={validating}
+        serverError={errors.hubKey}
+        wasShared={project?.share === true}
+        editing={mode === "update"}
+      />
       </section>
 
       <Collapsible
@@ -1304,6 +1338,9 @@ function emptyForm(): FormState {
     persona: BUILTIN,
     customPersona: "",
     defaultBranch: "",
+    share: false,
+    hubKey: "",
+    backfill: false,
   };
 }
 
@@ -1425,56 +1462,6 @@ function DetectionSummary({ detection }: { detection: Detection }) {
       <Badge variant="outline" className={cn(!detection.isGitRepo && "text-muted-foreground")}>
         {detection.isGitRepo ? "Git repository" : "Not a git repository"}
       </Badge>
-    </div>
-  );
-}
-
-function DetectedTag() {
-  return (
-    <span className="inline-flex shrink-0 items-center gap-1 rounded border border-primary/40 bg-primary/15 px-1.5 py-px text-[10px] font-medium leading-none text-foreground dark:text-primary">
-      <Sparkles className="size-2.5" />
-      detected
-    </span>
-  );
-}
-
-function FieldError({ id, children }: { id: string; children: ReactNode }) {
-  return (
-    <p id={id} role="alert" className="text-xs text-destructive">
-      {children}
-    </p>
-  );
-}
-
-/** Label, helper text and an inline error for one input; `id` is the input's id, hint/error get `<id>-hint` / `<id>-error`. */
-function Field({
-  id,
-  label,
-  hint,
-  error,
-  detected,
-  children,
-}: {
-  id: string;
-  label: string;
-  hint?: ReactNode;
-  error?: string | undefined;
-  detected?: boolean;
-  children: ReactNode;
-}) {
-  return (
-    <div className="space-y-2">
-      <div className="flex items-center gap-2">
-        <Label htmlFor={id}>{label}</Label>
-        {detected && <DetectedTag />}
-      </div>
-      {children}
-      {hint && (
-        <p id={`${id}-hint`} className="text-xs text-muted-foreground">
-          {hint}
-        </p>
-      )}
-      {error && <FieldError id={`${id}-error`}>{error}</FieldError>}
     </div>
   );
 }

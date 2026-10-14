@@ -5,7 +5,7 @@ Back to the [README](../README.md). Everything the web UI does goes through this
 ## Conventions
 
 - Errors are JSON `{ "error": "<message>" }` with the matching status (400 invalid input, 403 forbidden host or origin, 404 unknown id, 409 conflict, 415 wrong content type). The device lease routes also add a machine-readable `code` (see [Lease errors](#lease-errors)).
-- `POST`/`PUT` routes that take a body need `Content-Type: application/json`. Request bodies are limited to 1 MiB.
+- `POST`/`PUT` routes that take a body need `Content-Type: application/json`. Request bodies are limited to 1 MiB (a [team hub](#team-hub) accepts up to 32 MiB on its upload routes).
 - A `Run` in responses carries everything in `run.json` (status, checks, verdict, `verdictSource`, `errorKind`, `usage`, `source`, `build`, `attempt`, `retryOf`/`retriedBy`, `harness`, `model`, `effort`, `storage`, …) plus `queuePosition`, `queueReason` (why a queued run is still waiting), `durationMs` and `reportFile` (the absolute path of the report, or `null`). `storage` is `"data"` for runs whose report and screenshots live in Tapocalypse's data folder (`<data dir>/runs/<id>/report.md`, `screenshots/`) and `"repo"` for runs from before that change, whose repo-relative paths keep working.
 - `harness` is `omp`, `claude` or `codex` (see [Agent runtimes](guide.md#agent-runtimes)); an unknown value is a 400. `model` is a harness-native string and `thinking` carries the reasoning level in that harness's terms (omp thinking, Claude Code `--effort`, Codex CLI `model_reasoning_effort`). A run records the `harness` it used, `effort` (the same level; omp runs also keep `thinking`), and runs from before harnesses existed read as `omp`.
 - Unknown fields in a request body or tool call are ignored, not rejected. In particular a `backend` that an old client still sends to `POST /api/runs`, `POST /api/batches` or the MCP start tools is dropped and never stored: runs no longer have a backend.
@@ -18,7 +18,7 @@ Back to the [README](../README.md). Everything the web UI does goes through this
 | Route | Purpose |
 | --- | --- |
 | `POST /api/runs` | Queue a run. Body: `{ projectId, title?, brief?, suiteId?, device?: { platform?, serial? }, harness?, packageId?, model?, thinking?, effort?, install?: { path }, source?, reuseChecks?, requestedBy? }`. Give a `brief` or a `suiteId`. Without `harness` the default is resolved (project, persona, config, first installed and signed in, else first installed, else omp). `reuseChecks` (default `true`) lets the prompt show the agent the checks of the test's previous runs so they keep their identity; `false` opts out ([details](guide.md#helping-the-agent-keep-identity)). Title ≤ 200 chars, brief ≤ 20 000. Returns 201 and the run. While the run waits for a device held by a coding agent, the run carries `queueHold: { serial, deviceName, holder, reason, expiresAt }` and `queueReason` names the holder |
-| `GET /api/runs` | Newest-first page `{ runs, hasMore }`. Query: `project`, `status` (comma list), `verdict` (comma list; `none` matches runs without one), `q` (title, branch, PR, ticket, commit), `batch`, `branch`, `pr`, `ticket`, `commit` (sha prefix), `regressed=1` (only finished runs with newly failing checks, see `regression` below), `limit` (default 100, max 500), `before` (a `createdAt` cursor) |
+| `GET /api/runs` | Newest-first page `{ runs, hasMore }`. Query: `project`, `status` (comma list), `verdict` (comma list; `none` matches runs without one), `q` (title, branch, PR, ticket, commit), `batch`, `branch`, `pr`, `ticket`, `commit` (sha prefix), `version` (the app's `build.version`), `machine` (comma list; hub only: runs uploaded by those machines), `regressed=1` (only finished runs with newly failing checks, see `regression` below), `limit` (default 100, max 500), `before` (a `createdAt` cursor) |
 | `GET /api/runs/:id` | One run |
 | `DELETE /api/runs/:id` | Delete a finished run and its folder (409 while it is queued or active) |
 | `POST /api/runs/:id/cancel` | Cancel a queued or active run |
@@ -37,7 +37,7 @@ Back to the [README](../README.md). Everything the web UI does goes through this
 | `POST /api/batches` | `{ projectId, title?, brief?, suiteId?, devices: [{ platform?, serial? }] (1-8), harness?, packageId?, model?, thinking?, effort?, install?, source?, reuseChecks?, requestedBy? }`. Returns 201 `{ batchId, runs }` |
 | `GET /api/batches/:id` | `{ id, projectId, title, runs, status: "active" \| "done", verdict, cost, startedAt, endedAt }` |
 | `GET /api/events` | Global server-sent events: every `run` update, every [`lease`](#lease-events) change and `projects` changes; drives the live lists |
-| `GET /api/stats?project=&days=7` | Totals for the last 1-90 days: runs, pass/fail/issues/other, cost, median duration, per-day buckets |
+| `GET /api/stats?project=&days=7` | Totals for the last 1-90 days: runs, pass/fail/issues/other, cost, median duration, per-day buckets (`byDay[]` also carries `issues` and `other` next to `pass` and `fail`) |
 
 ### Regressions, history and flaky checks
 
@@ -126,6 +126,86 @@ A `LeaseView` is `{ ref, serial, platform, avdName, holder, reason, source: "age
 | `held_by_agent` | 409 | Shutdown of a device an agent holds (HTTP only) |
 
 Over MCP, arguments that fail the tool's input schema (a missing `holder`, `ttlMinutes` outside 5-120, `waitSeconds` above 110) are rejected by the MCP SDK before the tool runs, with text starting `Input validation error:` and no `<code>:` prefix. Treat that text as `invalid_argument`. Rules the schema cannot express (both or neither of `serial` and `platform`) do carry the `invalid_argument:` prefix.
+
+### Overview and releases
+
+Stakeholder views of one project, available in both modes (a laptop answers from its own runs, a hub from everybody's). A *ref* names a slice of the project's runs: `version:<build.version>` or `branch:<name>`; `all` (the default) means no ref. Wire shapes (`RefSummary`, `ProjectOverview`, `ReleaseView`) are the types in `web/lib/api.ts`.
+
+| Route | Purpose |
+| --- | --- |
+| `GET /api/projects/:id/refs` | `{ refs }`: every version and branch with runs, versions first (semver, newest first), then branches by last activity. Each has `ref`, `release` (versions always; branches when named `release/*`, `releases/*`, `hotfix/*` or `release-*`), `isDefaultBranch`, `runs`, `firstAt`, `lastAt`, `machines`, `lanes` (`pass`, `issues`, `fail`, `blocked`, `other`: the latest result per test and device), `previous` (the release it is compared with) and `newlyFailing` (against `previous`, `null` without one) |
+| `GET /api/projects/:id/overview?ref=all&days=30` | The landing page of a project: `trend` (per day, zero-filled), `passRate` (`current` and `previous`, over pass + fail + issues), `counts` (`newlyFailing`, `flaky`, `suspects`, `failingNow`, `blockedNow`, `tests`), `lanes` (latest result per test and platform with a short history), `latestRelease` (what changed against the release before it) and the eight most `recent` runs. `ref` scopes it; `days` is 1-90. An unknown project is `404` with `code: "unknown_project"`, a ref nobody ran is `404` with `code: "unknown_ref"`. `latestRelease.counts.new` and `.removed` count distinct check keys (a check that is new on both Android and iOS counts once; `changes.items` keeps one row per lane) |
+| `GET /api/projects/:id/releases/:kind/:name?against=auto` | One release across every machine. `:kind` is `version` or `branch` (a branch name is URL-encoded, `release%2F2.4`); `against` is `auto` (the release before it) or an explicit ref (a release nobody ran is `404` with `code: "unknown_ref"`). Returns the `devices` as columns, `tests` as rows of `cells` (the latest result with every attempt behind it: rounds and re-runs are folded), `blockers` (latest result `FAIL` or `BLOCKED`: blocked counts because the check could not be tested), `untested` (lanes the previous release had and this one lacks), `changes` against the previous release and a `summary` |
+
+Unknown projects and refs are 404; a bad `ref`, `days` or `against` is 400.
+
+### Team hub
+
+How to run, secure and use a hub: [Team hub](hub.md). This section lists the routes. Everything is under `/api/hub/v1/`, except `GET /api/health` and the laptop-side routes.
+
+#### Both modes
+
+| Route | Purpose |
+| --- | --- |
+| `GET /api/health` | `{ ok, mode: "local" \| "hub", version, runs }`. Allowed for a `localhost` Host on a hub (container health check); the UI reads `mode` once before it renders |
+
+#### On a hub
+
+A hub allows only reads for viewers: `GET /api/runs`, `/api/runs/:id` (with `hub: { machine, uploader, receivedAt, localProjectId }`), `/events`, `/activity`, `/screenshots`, `/files/*`, `/report`, `/report.html`, `/compare`, `/baseline-candidates`, `/checks/:id/history`, `/api/batches/:id`, `/api/projects`, flaky and check history, `/api/stats`, `/api/events` (`run` and `projects` frames) and the [overview and releases](#overview-and-releases) routes. `GET /api/runs/:id/transcript` answers 404 (transcripts are never uploaded). Viewers do not see the hub's filesystem layout: `runDir` is `""`, `reportFile` is `null` and report entries carry `path: ""`. Every other route does not exist on a hub and answers `404 { "error": "not available on the team hub" }`: starting, cancelling, steering, re-running, deleting and exporting runs, sharing, project changes, check links, devices, leases, doctor, harnesses, models, templates, suites, legacy reports, `/mcp`, `/api/runs/:id/stderr`. A request whose `Host` is not in `TAPOCALYPSE_HUB_HOSTS` (or `localhost:<port>` / `127.0.0.1:<port>`) is 403, as is a write with a foreign `Origin`.
+
+Viewer-visible hub routes:
+
+| Route | Purpose |
+| --- | --- |
+| `GET /api/hub/v1/info` | `{ protocol, minProtocol, version, serverTime, machine, limits: { maxBlobBytes, maxDocBytes, maxScreenshots }, runs, projects, retentionDays, identityHeader, storeWarning }`. The connectivity and token probe for laptops: `machine` is the token's name, or `null` without a valid `Authorization: Bearer tpu_…`. `storeWarning` is true from 8,000 runs |
+| `GET /api/hub/v1/machines` | `{ machines: [{ name, uploader, lastUploadAt, runs30d, clockSkewMs, revoked }] }`. Never returns tokens or digests |
+
+Upload routes, authorized by an **upload token** (`Authorization: Bearer tpu_…`; the hub compares its SHA-256 digest in constant time). Bodies are parsed with zod; the largest accepted request is 32 MiB. Wire shapes: `src/hub/protocol.ts`, `HUB_PROTOCOL = 1`.
+
+| Route | Purpose |
+| --- | --- |
+| `POST /api/hub/v1/blobs/check` | `{ sha256: string[] }` (≤ 500) → `{ missing: string[] }`: which files the hub does not have yet |
+| `PUT /api/hub/v1/blobs/:sha256` | Raw bytes with `Content-Type` one of `image/webp`, `image/png`, `image/jpeg`, `image/gif`, `text/markdown`, `application/x-ndjson`, `text/html` (text types may be gzip). The hash of the decoded bytes must equal `:sha256` (400 otherwise), images are checked by magic bytes, at most `limits.maxBlobBytes` (413). Returns `{ sha256, status }`: 201 `created`, 200 already present. Idempotent |
+| `PUT /api/hub/v1/runs/:id` | The run: `{ protocol, clientVersion, sentAt, project, run, batch, report, activity, screenshots, transcript, redaction }`, gzip JSON (`Content-Encoding: gzip`, at most `limits.maxDocBytes` decoded). Returns `{ runId, status: "created" \| "updated" \| "unchanged", contentHash, url }`. The hub stores the run under the hub project for `project.hubKey`, keeps the machine's own keys as `origin`, recomputes regression keys, and refuses runs that are not finished. Only known fields are stored (unknown keys on the run, its checks, `source`, `source.pr` and `build` are dropped; `source.pr.url` must be `https`, else it becomes `null`). The first upload names the hub project and never renames it (`hub project rename` does); `project.defaultBranchSource` (`explicit` or `detected`) lets an explicit default branch beat a detected one, and between equals the run created last decides |
+| `GET /api/hub/v1/runs/:id/state` | `{ contentHash, machine }`, 404 if absent. Used by `hub push --verify` |
+| `DELETE /api/hub/v1/runs/:id` | 204. The machine that uploaded the run, or an admin token |
+| `POST /api/hub/v1/admin/rekey` | Admin token only. `{ projectId: string \| null }` → `{ changed }`: recompute regression keys (one project, or all). What `hub rekey` calls on a running hub |
+| `POST /api/hub/v1/admin/unpublish` | Admin token only. `{ runId?, projectId?, machine? }` → `{ removed: string[] }`. What the hub-side `hub unpublish` calls on a running hub |
+
+Errors of the upload routes:
+
+| Status | `code` | Meaning |
+| --- | --- | --- |
+| 401 | `unauthorized` | Missing, wrong or revoked token |
+| 400 | `invalid_run` | The run document or a referenced file is malformed (digest or size mismatch, bad file name, id in the body differs from the URL) |
+| 403 | `admin_required` | An `admin/*` route with a non-admin token |
+| 403 | `not_owner` | `DELETE` of a run another machine uploaded, with a non-admin token |
+| 409 | `id_conflict` | Another machine already uploaded a run with this id; never overwritten |
+| 413 | | Body or blob over the limit |
+| 415 | | Wrong `Content-Type` |
+| 422 | `missing_blobs` | The run references files the hub has not got: `{ missing: string[] }`. Upload them and retry |
+| 422 | `not_terminal` | The run is still queued or active |
+| 422 | `transcript_not_accepted` | The document carries a `transcript`: the hub never serves uploaded HTML |
+| 429 | `rate_limited` | The token made more than 120 run uploads or 600 file uploads in a minute; `Retry-After` says when to try again. Answered before the body is read |
+| 426 | `protocol_unsupported` | The laptop is too old: `{ minProtocol, protocol }`. The laptop pauses its queue |
+
+#### On a laptop
+
+Routes of the machine that uploads. They exist only in the normal (local) mode.
+
+| Route | Purpose |
+| --- | --- |
+| `GET /api/hub/status` | `HubStatus`: `configured`, `url`, `credentials` (where the token comes from, its last 4 characters; never the token), `connection` (`state`: `ok`, `unauthorized`, `proxy_login`, `unreachable`, `protocol_unsupported`, `not_a_hub` or `unknown`, the machine name and hub version), `queue` (`waiting`, `uploading`, `failed`, `parked`, `uploaded`, `backfill`), `paused` (`protocol_unsupported`, `unauthorized` or `id_conflict`, with detail), `lastUploadAt`, `sharedProjects` |
+| `PUT /api/hub/connection` | `{ url, token?, headers?, screenshots? }` saves `share.hub` (address, `screenshots`) in the config and the token and proxy headers in the credentials file (mode 600), tests the connection and returns the `HubStatus`. `headers` replaces the saved set; a `null` value keeps that header's saved value. The token is write-only. 400 for a bad URL, or when `TAPOCALYPSE_HUB_TOKEN` / `TAPOCALYPSE_HUB_HEADERS` already set what you try to change |
+| `DELETE /api/hub/connection` | Removes the address and the saved credentials; the queue is kept and uploads stop. Returns the `HubStatus` |
+| `POST /api/hub/test` | Test the connection again; returns the `HubStatus` |
+| `POST /api/hub/push` | `{ runIds?: string[], projectId?: string, failed?: true, since?: string, all?: true, verify?: true }` → `{ queued, verified?: { checked, requeued } }`: backfill a project (optionally only runs since an ISO date), retry failed uploads now, or upload specific old runs. `verify` first asks the hub which of the uploaded runs it still has and re-queues the missing ones. 409 `hub_not_configured` without a connected hub |
+| `POST /api/runs/:id/unpublish` | 204. Asks the hub to delete the copy this machine uploaded. 404 for a run that is neither local nor in the outbox, 409 `hub_not_configured`, 502 when the hub call fails |
+| `GET /api/runs/:id` | Runs of shared projects carry `hubSync: { state, url, uploadedAt, error, attempts, nextAttemptAt } \| null`; `state` is `waiting`, `local`, `queued`, `uploading`, `uploaded`, `outdated`, `failed`, `paused` or `parked` |
+
+`GET /api/events` also emits a `hub` frame: `{ status }` when the connection or queue changes, `{ runId, sync }` for one run.
+
+`POST /api/projects/validate` returns, for a project with a repository, `hub: { derivedKey, remoteUrl, subpath, existingRuns, uploadedRuns, conflictWith }`; `POST /api/projects` and `PUT /api/projects/:id` accept `share` and `hubKey` (and `backfill: true` when turning sharing on).
 
 ## MCP tools
 

@@ -72,7 +72,7 @@ export function useRunActions(run: RunView): RunActions {
     try {
       await api.deleteRun(run.id);
       toast.success("Run deleted");
-      navigate("#/");
+      navigate("#/runs");
       return true;
     } catch (err) {
       toast.error(`Delete failed: ${message(err)}`);

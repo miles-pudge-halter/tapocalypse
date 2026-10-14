@@ -9,6 +9,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { CompareSide, ComparePair } from "@/lib/api";
 import { formatDurationMs } from "@/lib/format";
+import { isHub } from "@/lib/mode";
 import { suggestionKey, type PairGroup } from "@/lib/regression";
 import { cn } from "@/lib/utils";
 
@@ -54,12 +55,16 @@ function Suggestion({ pair, actions }: { pair: ComparePair; actions: LinkActions
       <span className="min-w-0 break-words text-muted-foreground">
         Possibly the same as <span className="font-mono">{s.checkId}</span> “{s.title}” ({Math.round(s.similarity * 100)}% similar)
       </span>
-      <Button variant="outline" size="xs" disabled={actions.busy} onClick={() => void actions.link(pair)}>
-        Link
-      </Button>
-      <Button variant="ghost" size="xs" disabled={actions.busy} onClick={() => actions.dismiss(pair)}>
-        Not the same
-      </Button>
+      {isHub() ? null : (
+        <>
+          <Button variant="outline" size="xs" disabled={actions.busy} onClick={() => void actions.link(pair)}>
+            Link
+          </Button>
+          <Button variant="ghost" size="xs" disabled={actions.busy} onClick={() => actions.dismiss(pair)}>
+            Not the same
+          </Button>
+        </>
+      )}
     </div>
   );
 }

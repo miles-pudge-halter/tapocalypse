@@ -5,6 +5,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { api, type ComparePair, type RunComparison } from "@/lib/api";
+import { isHub } from "@/lib/mode";
 import { DISMISSED_KEY, addDismissed, linkTarget, readDismissed, suggestionKey } from "@/lib/regression";
 import { readStorage, writeStorage } from "@/lib/storage";
 
@@ -90,14 +91,18 @@ export function MatchBadge({ pair, actions }: { pair: ComparePair; actions: Link
         <p className="font-medium">Matched by similar title</p>
         <p className="break-words text-xs text-muted-foreground">Baseline: “{pair.baseline?.title ?? "—"}”</p>
         <p className="break-words text-xs text-muted-foreground">This run: “{pair.current?.title ?? "—"}”</p>
-        <div className="flex gap-2">
-          <Button size="xs" disabled={actions.busy} onClick={() => void actions.link(pair)}>
-            Confirm
-          </Button>
-          <Button size="xs" variant="ghost" disabled={actions.busy} onClick={() => void actions.unlink(pair)}>
-            Unlink
-          </Button>
-        </div>
+        {isHub() ? (
+          <p className="text-xs text-muted-foreground">Links are made in Tapocalypse on the machine that ran these checks; they reach the hub with its next upload.</p>
+        ) : (
+          <div className="flex gap-2">
+            <Button size="xs" disabled={actions.busy} onClick={() => void actions.link(pair)}>
+              Confirm
+            </Button>
+            <Button size="xs" variant="ghost" disabled={actions.busy} onClick={() => void actions.unlink(pair)}>
+              Unlink
+            </Button>
+          </div>
+        )}
       </HoverCardContent>
     </HoverCard>
   );

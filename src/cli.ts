@@ -7,6 +7,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { parseArgs, type ParseArgsOptionsConfig } from "node:util";
 import { HARNESS_IDS, type HarnessId } from "./harness/types";
+import type { HubLaptopCommand } from "./hub/laptop-cli";
 import type { ServiceAction } from "./service";
 import { VERDICTS, type CheckStatus, type RunStatus, type Verdict } from "./runs/types";
 
@@ -68,7 +69,8 @@ export interface RunOptions {
 export type Command =
   | { name: "help" }
   | { name: "version" }
-  | { name: "serve"; port: number | null; dev: boolean }
+  | { name: "serve"; port: number | null; dev: boolean; hub: boolean }
+  | { name: "hub"; args: string[] }
   | { name: "doctor" }
   | { name: "run"; options: RunOptions }
   | { name: "status"; id: string; json: boolean; url: string }
@@ -82,8 +84,9 @@ const SERVICE_ACTIONS = ["install", "uninstall", "start", "stop", "restart", "st
 export const USAGE = `tapocalypse - parallel, agent-driven QA runs on Android emulators and iOS simulators
 
 Usage:
-  tapocalypse serve [--port <n>] [--dev]
+  tapocalypse serve [--port <n>] [--dev] [--hub]
       Start the server and web UI (same as \`bun start\`). --dev enables Bun's development server (HMR, console forwarding).
+      --hub starts it as the read-only team hub (same as TAPOCALYPSE_MODE=hub): no devices or agents, runs arrive from teammates' machines.
   tapocalypse doctor
       Check prerequisites; exits 1 when a required one is missing.
   tapocalypse run --project <id> (--brief <text> | --brief-file <file|-> | --suite <id>) [options]
@@ -103,6 +106,12 @@ Usage:
       0 when there are none (also when there is no baseline yet; a note goes to stderr), 2 for an unknown or still-active run.
   tapocalypse service ${SERVICE_ACTIONS.join("|")}
       Manage the always-on background service (launchd on macOS, a systemd user unit on Linux) that keeps the server running.
+  tapocalypse hub login|status|push|unpublish|pack ...
+      Team hub, laptop side: connect this machine to a hub and upload finished runs of the projects you share
+      (\`hub login <url>\` first; \`hub push --dry-run\` shows what would be sent). See docs/hub.md.
+  tapocalypse hub token|rekey|project|unpublish ...    (on the hub itself, with TAPOCALYPSE_MODE=hub)
+      Hub administration: \`hub token create <name> [--admin]\` | \`list\` | \`revoke <name>\`, \`hub rekey [--project <id>]\`,
+      \`hub project list|rename <hubKey> <name>\`, \`hub unpublish <runId> | --project <id> | --machine <name>\`.
 
 Run options:
   --project <id>        Project id (see the Projects page)
@@ -184,9 +193,14 @@ export function parseCli(argv: string[], env: Record<string, string | undefined>
 
   switch (first) {
     case "serve": {
-      const { values, positionals } = tokenize(rest, { port: { type: "string" }, dev: { type: "boolean" } });
+      const { values, positionals } = tokenize(rest, { port: { type: "string" }, dev: { type: "boolean" }, hub: { type: "boolean" } });
       if (positionals.length > 0) throw new UsageError(`unexpected argument "${positionals[0]}"`);
-      return { name: "serve", port: values.port === undefined ? null : parsePort(values.port), dev: values.dev === true };
+      return { name: "serve", port: values.port === undefined ? null : parsePort(values.port), dev: values.dev === true, hub: values.hub === true };
+    }
+    case "hub": {
+      // Each handler (laptop sync commands, hub administration) parses its own arguments; they are loaded only when used.
+      if (rest.length === 0) throw new UsageError("usage: tapocalypse hub <login|status|push|unpublish|pack> (on a laptop) or <token|rekey|project|unpublish> (on the hub)");
+      return { name: "hub", args: rest };
     }
     case "doctor": {
       const { positionals } = tokenize(rest, {});
@@ -825,7 +839,7 @@ export class ApiClient {
     private readonly fetchFn: typeof fetch = fetch,
   ) {}
 
-  async request<T>(method: "GET" | "POST", pathname: string, body?: unknown): Promise<T> {
+  async request<T>(method: "GET" | "POST" | "PUT", pathname: string, body?: unknown): Promise<T> {
     return (await this.exchange(method, pathname, body)).data as T;
   }
 
@@ -834,7 +848,7 @@ export class ApiClient {
     return (await this.exchange("GET", pathname)).text;
   }
 
-  private async exchange(method: "GET" | "POST", pathname: string, body?: unknown): Promise<{ text: string; data: unknown }> {
+  private async exchange(method: "GET" | "POST" | "PUT", pathname: string, body?: unknown): Promise<{ text: string; data: unknown }> {
     let res: Response;
     try {
       res = await this.fetchFn(`${this.base}${pathname}`, {
@@ -1248,8 +1262,30 @@ export async function main(argv: string[], env: Record<string, string | undefine
       if (command.port !== null) process.env.TAPOCALYPSE_PORT = String(command.port);
       // server.ts runs Bun's development server (HMR, browser console forwarding) unless NODE_ENV is "production".
       process.env.NODE_ENV = command.dev ? "development" : "production";
+      // The mode is read lazily by every module, so it only has to be set before the server starts.
+      if (command.hub) process.env.TAPOCALYPSE_MODE = "hub";
       await import("./server");
       return null;
+    case "hub": {
+      try {
+        const [sub = "", ...args] = command.args;
+        // On the hub itself the subcommands administer it; on a laptop they drive the sync to a hub. Loaded on demand: they read config.
+        if (env.TAPOCALYPSE_MODE === "hub") {
+          const { hubAdminCommand } = await import("./hub/admin-cli");
+          return await hubAdminCommand(command.args, consoleIo);
+        }
+        const laptop = await import("./hub/laptop-cli");
+        const laptopCommand = laptop.HUB_LAPTOP_COMMANDS.find((c): c is HubLaptopCommand => c === sub);
+        if (!laptopCommand) {
+          console.error(`error: unknown hub command "${sub}". On a laptop: ${laptop.HUB_LAPTOP_COMMANDS.join(", ")}. Hub administration (token, rekey, project, unpublish) runs on the hub with TAPOCALYPSE_MODE=hub.`);
+          return EXIT.USAGE;
+        }
+        return await laptop.runHubLaptopCommand(laptopCommand, args, { io: consoleIo, env, api: (base) => new ApiClient(base) });
+      } catch (e) {
+        console.error(`error: ${oneLine(e instanceof Error ? e.message : String(e))}`);
+        return exitCodeForError(e);
+      }
+    }
     case "doctor":
       // scripts/doctor.ts runs its checks as a top-level side effect, so it can only be loaded on demand.
       await import("../scripts/doctor");

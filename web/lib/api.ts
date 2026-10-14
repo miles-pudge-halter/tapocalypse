@@ -55,7 +55,15 @@ export interface QueueHold {
   expiresAt: string;
 }
 
-export type RunView = Run & {
+/** Who uploaded a hub copy of a run (hub only). The machine is the upload token's name; the uploader comes from the access proxy and may be null. */
+export interface HubAttribution {
+  machine: string;
+  uploader: string | null;
+  receivedAt: string;
+  localProjectId: string;
+}
+
+export type RunView = Omit<Run, "hub"> & {
   queuePosition: number | null;
   durationMs: number | null;
   queueReason: string | null;
@@ -67,6 +75,10 @@ export type RunView = Run & {
   runDir: string;
   /** Auto-baseline comparison summary; terminal runs only, null when there is no baseline or no checks. */
   regression?: RunRegression | null;
+  /** Hub copy only: who uploaded it. Absent or null on laptops and for runs that were never uploaded. */
+  hub?: HubAttribution | null;
+  /** Laptop only: upload state when the project is shared and a hub is configured; null otherwise (always null on the hub). */
+  hubSync?: HubSync | null;
 };
 
 export interface BatchView {
@@ -91,8 +103,236 @@ export interface RunStats {
   other: number;
   cost: number | null;
   medianDurationMs: number | null;
-  byDay: { date: string; runs: number; pass: number; fail: number; cost: number | null }[];
+  byDay: { date: string; runs: number; pass: number; fail: number; issues: number; other: number; cost: number | null }[];
 }
+
+// --- team hub (mirrors the design contract; the server owns the shapes) ---
+
+/** `GET /api/health`, answered in both modes; fetched once before the shell renders. */
+export interface Health {
+  ok: boolean;
+  mode: "local" | "hub";
+  version: string;
+  runs: number;
+}
+
+/** A version (`build.versionName`) or a branch. URL form: `version:2.4.0` / `branch:release/2.4`. */
+export interface Ref {
+  kind: "version" | "branch";
+  name: string;
+}
+
+export interface RunBrief {
+  id: string;
+  title: string;
+  verdict: Verdict | null;
+  status: RunStatus;
+  createdAt: string;
+  endedAt: string | null;
+  deviceName: string | null;
+  platform: Platform;
+  branch: string | null;
+  commit: string | null;
+  versionName: string | null;
+  machine: string | null;
+  uploader: string | null;
+  /** Truthy = the "Report" / "HTML" links render. */
+  reportPath: string | null;
+  /** Non-pass decisive checks, at most 3, fail before blocked. */
+  failed: { id: string; title: string; status: CheckStatus }[];
+  failedMore: number;
+}
+
+export interface LaneCell {
+  /** Newest run with a verdict in scope. */
+  latest: RunBrief;
+  newerWithoutVerdict: number;
+  /** Oldest → newest, at most 10. */
+  history: { id: string; verdict: Verdict | null; status: RunStatus; createdAt: string }[];
+  newlyFailing: number;
+  flaky: number;
+}
+
+/** `GET /api/projects/:id/refs` → `{ refs }`. */
+export interface RefSummary {
+  ref: Ref;
+  release: boolean;
+  isDefaultBranch: boolean;
+  runs: number;
+  firstAt: string;
+  lastAt: string;
+  machines: string[];
+  lanes: { pass: number; issues: number; fail: number; blocked: number; other: number };
+  previous: Ref | null;
+  newlyFailing: number | null;
+}
+
+export interface ChangeItem {
+  transition: Transition;
+  checkKey: string;
+  title: string;
+  testKey: string;
+  testTitle: string;
+  platform: Platform;
+  current: { runId: string; checkId: string; status: CheckStatus | null } | null;
+  previous: { runId: string; checkId: string; status: CheckStatus | null } | null;
+}
+
+export interface ProjectOverview {
+  project: {
+    id: string;
+    name: string;
+    hubKey: string | null;
+    defaultBranch: string | null;
+    firstSeenAt: string | null;
+    lastUploadAt: string | null;
+    lastUploadBy: { machine: string; uploader: string | null } | null;
+  };
+  ref: Ref | null;
+  days: number;
+  trend: { date: string; runs: number; pass: number; issues: number; fail: number; other: number }[];
+  passRate: { current: number | null; previous: number | null; pass: number; decided: number };
+  counts: {
+    newlyFailing: number;
+    newlyFailingTests: number;
+    flaky: number;
+    suspects: number;
+    failingNow: number;
+    blockedNow: number;
+    tests: number;
+  };
+  lanes: { testKey: string; title: string; suiteId: string | null; checks: number; platforms: Partial<Record<Platform, LaneCell>> }[];
+  latestRelease: { ref: Ref; previous: Ref | null; counts: Record<Transition, number>; top: ChangeItem[] } | null;
+  recent: RunView[];
+}
+
+export interface ReleaseCell {
+  latest: RunBrief;
+  /** Newest first, at most 10. */
+  attempts: RunBrief[];
+  newlyFailing: number;
+  flaky: number;
+}
+
+export interface ReleaseView {
+  project: { id: string; name: string; hubKey: string | null };
+  ref: Ref;
+  previous: Ref | null;
+  /** The previous release was picked by the server's rule rather than `?against=`. */
+  auto: boolean;
+  span: { firstAt: string; lastAt: string };
+  runs: number;
+  machines: { name: string; uploader: string | null }[];
+  devices: { key: string; name: string; platform: Platform }[];
+  tests: {
+    testKey: string;
+    title: string;
+    suiteId: string | null;
+    cells: Record<string, ReleaseCell | null>;
+    platforms: Partial<Record<Platform, ReleaseCell>>;
+    worst: Verdict | null;
+  }[];
+  blockers: { testKey: string; title: string; deviceKey: string; cell: ReleaseCell }[];
+  untested: { testKey: string; title: string; platform: Platform }[];
+  changes: { counts: Record<Transition, number>; items: ChangeItem[] } | null;
+  summary: { tests: number; cells: number; pass: number; issues: number; fail: number; blocked: number; other: number };
+}
+
+/** `GET /api/hub/v1/info` as the viewer sees it (the protocol fields plus the stored totals). */
+export interface HubInfo {
+  protocol: number;
+  version: string;
+  runs: number;
+  projects: number;
+  retentionDays: number | null;
+  identityHeader: boolean;
+  /** At 8,000 runs or more. */
+  storeWarning: boolean;
+}
+
+/** `GET /api/hub/v1/machines` entry; never carries a token digest. */
+export interface HubMachine {
+  name: string;
+  uploader: string | null;
+  lastUploadAt: string | null;
+  runs30d: number;
+  clockSkewMs: number | null;
+  revoked: boolean;
+}
+
+/** Hub-side view of a project on `GET /api/projects` (hub mode only). */
+export interface HubProjectInfo {
+  hubKey: string;
+  runs: number;
+  machines: { name: string; uploader: string | null }[];
+  firstSeenAt: string | null;
+  lastUploadAt: string | null;
+  lastUploadBy: { machine: string; uploader: string | null } | null;
+}
+
+export type HubSyncState = "waiting" | "local" | "queued" | "uploading" | "uploaded" | "outdated" | "failed" | "paused" | "parked";
+export type HubErrorCode = "unauthorized" | "proxy_login" | "protocol_unsupported" | "id_conflict" | "unreachable" | "too_large" | "not_a_hub" | "other";
+
+/** Per-run upload state on a laptop (`RunView.hubSync`). */
+export interface HubSync {
+  state: HubSyncState;
+  url: string | null;
+  uploadedAt: string | null;
+  error: { code: HubErrorCode; detail: string } | null;
+  attempts: number;
+  nextAttemptAt: string | null;
+}
+
+export type HubConnectionState = "ok" | "unauthorized" | "proxy_login" | "unreachable" | "protocol_unsupported" | "not_a_hub" | "unknown";
+
+/** `GET /api/hub/status` (laptop). Secrets never appear: only where they come from and the last 4 token characters. */
+export interface HubStatus {
+  configured: boolean;
+  url: string | null;
+  screenshots: "webp" | "original";
+  credentials: {
+    file: string;
+    token: "file" | "env" | null;
+    tokenHint: string | null;
+    headers: { source: "file" | "env" | null; names: string[] };
+  };
+  connection: {
+    state: HubConnectionState;
+    machine: string | null;
+    hubVersion: string | null;
+    minProtocol: number | null;
+    checkedAt: string | null;
+    detail: string | null;
+  };
+  queue: { waiting: number; uploading: string | null; failed: number; parked: number; uploaded: number; backfill: { total: number; done: number } | null };
+  paused: { reason: "protocol_unsupported" | "unauthorized" | "id_conflict"; detail: string; at: string } | null;
+  lastUploadAt: string | null;
+  sharedProjects: { id: string; name: string; hubKey: string }[];
+}
+
+/** `PUT /api/hub/connection`. `headers` omitted keeps the saved set; present replaces it, and a null value keeps that name's saved value. */
+export interface HubConnectionInput {
+  url: string;
+  token?: string;
+  headers?: Record<string, string | null>;
+  screenshots?: "webp" | "original";
+}
+
+/** The hub block `POST /api/projects/validate` adds for a project that is (about to be) shared. */
+export interface HubValidation {
+  derivedKey: string | null;
+  remoteUrl: string | null;
+  subpath: string | null;
+  existingRuns: number;
+  uploadedRuns: number;
+  conflictWith: { id: string; name: string } | null;
+}
+
+/** A project as `GET /api/projects` lists it; on the hub it also carries what the hub knows about it. */
+export type ProjectView = ProjectStatus & { hub?: HubProjectInfo };
+
+/** Validation result of the project form; `hub` is present when the form asks about sharing. */
+export type ProjectValidation = ValidationResult & { hub?: HubValidation };
 
 // --- regression intelligence (mirrors src/regression/types.ts; `RunView` here is the wire type) ---
 
@@ -399,6 +639,8 @@ export interface RunListParams {
   q?: string;
   batch?: string;
   branch?: string;
+  version?: string;
+  machine?: string[];
   pr?: number;
   ticket?: string;
   commit?: string;
@@ -507,9 +749,9 @@ async function sendCheckLink(method: "POST" | "DELETE", projectId: string, a: Ch
 }
 
 export const api = {
-  projects: () => request<ProjectStatus[]>("/api/projects"),
-  createProject: (input: ProjectInput) => post<ProjectStatus>("/api/projects", input),
-  updateProject: (id: string, patch: Partial<ProjectInput>) =>
+  projects: () => request<ProjectView[]>("/api/projects"),
+  createProject: (input: ProjectInput & { backfill?: true }) => post<ProjectStatus>("/api/projects", input),
+  updateProject: (id: string, patch: Partial<ProjectInput> & { backfill?: true }) =>
     request<ProjectStatus>(`/api/projects/${encodeURIComponent(id)}`, {
       method: "PUT",
       headers: { "content-type": "application/json" },
@@ -519,7 +761,7 @@ export const api = {
     await ensureOk(await fetch(`/api/projects/${encodeURIComponent(id)}`, { method: "DELETE" }));
   },
   validateProject: (input: Partial<ProjectInput>, mode: "create" | "update", existingId?: string) =>
-    post<ValidationResult>("/api/projects/validate", { input, mode, existingId }),
+    post<ProjectValidation>("/api/projects/validate", { input, mode, existingId }),
   detectProject: (repoPath: string) => post<Detection>("/api/projects/detect", { repoPath }),
   devices: () => request<Device[]>("/api/devices"),
   doctor: (fresh = false) => request<DoctorReport>(`/api/doctor${fresh ? "?fresh=1" : ""}`),
@@ -531,6 +773,8 @@ export const api = {
     if (params.q) q.set("q", params.q);
     if (params.batch) q.set("batch", params.batch);
     if (params.branch) q.set("branch", params.branch);
+    if (params.version) q.set("version", params.version);
+    if (params.machine?.length) q.set("machine", params.machine.join(","));
     if (params.pr !== undefined) q.set("pr", String(params.pr));
     if (params.ticket) q.set("ticket", params.ticket);
     if (params.commit) q.set("commit", params.commit);
@@ -635,6 +879,34 @@ export const api = {
   shareRun: (id: string) => post<ShareResult>(`/api/runs/${encodeURIComponent(id)}/share`, {}),
   report: (projectId: string, name: string) =>
     request<ReportDoc>(`/api/projects/${encodeURIComponent(projectId)}/reports/${encodeURIComponent(name)}`),
+  hubInfo: () => request<HubInfo>("/api/hub/v1/info"),
+  hubMachines: async () => (await request<{ machines: HubMachine[] }>("/api/hub/v1/machines")).machines,
+  refs: async (projectId: string) => (await request<{ refs: RefSummary[] }>(`/api/projects/${encodeURIComponent(projectId)}/refs`)).refs,
+  overview: (projectId: string, ref: Ref | null) =>
+    request<ProjectOverview>(`/api/projects/${encodeURIComponent(projectId)}/overview?ref=${encodeURIComponent(refParam(ref))}`),
+  release: (projectId: string, ref: Ref, against: string | null) =>
+    request<ReleaseView>(
+      `/api/projects/${encodeURIComponent(projectId)}/releases/${ref.kind}/${encodeURIComponent(ref.name)}${against ? `?against=${encodeURIComponent(against)}` : ""}`,
+    ),
+  hubStatus: () => request<HubStatus>("/api/hub/status"),
+  hubConnect: (input: HubConnectionInput) =>
+    request<HubStatus>("/api/hub/connection", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(input),
+    }),
+  hubDisconnect: () => request<HubStatus>("/api/hub/connection", { method: "DELETE" }),
+  hubTest: () => post<HubStatus>("/api/hub/test", {}),
+  hubPush: (input: { runIds?: string[]; projectId?: string; failed?: true }) => post<{ queued: number }>("/api/hub/push", input),
+  async unpublishRun(id: string) {
+    await ensureOk(
+      await fetch(`/api/runs/${encodeURIComponent(id)}/unpublish`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      }),
+    );
+  },
 };
 
 export const ACTIVE_STATUSES: RunStatus[] = ["queued", "preflight", "running", "finishing"];
@@ -706,4 +978,43 @@ export function flakyHash(projectId: string): string {
 
 export function batchHash(id: string): string {
   return `#/batches/${encodeURIComponent(id)}`;
+}
+
+/** `ref=` query value: `all` (no ref), `version:2.4.0`, `branch:release/2.4`. */
+export function refParam(ref: Ref | null): string {
+  return ref ? `${ref.kind}:${ref.name}` : "all";
+}
+
+/** Inverse of `refParam`; null for `all`, empty or malformed values. */
+export function parseRef(value: string | null | undefined): Ref | null {
+  if (!value) return null;
+  const cut = value.indexOf(":");
+  if (cut < 0) return null;
+  const kind = value.slice(0, cut);
+  const name = value.slice(cut + 1);
+  if ((kind !== "version" && kind !== "branch") || !name) return null;
+  return { kind, name };
+}
+
+export type OverviewShow = "failing" | "newly_failing" | "flaky";
+export const OVERVIEW_SHOWS: readonly OverviewShow[] = ["failing", "newly_failing", "flaky"];
+
+export function overviewHash(projectId: string, opts: { ref?: Ref | null; show?: OverviewShow | null } = {}): string {
+  const q = new URLSearchParams();
+  if (opts.ref) q.set("ref", refParam(opts.ref));
+  if (opts.show) q.set("show", opts.show);
+  const qs = q.toString();
+  return `#/p/${encodeURIComponent(projectId)}/overview${qs ? `?${qs}` : ""}`;
+}
+
+export function releasesHash(projectId: string): string {
+  return `#/p/${encodeURIComponent(projectId)}/releases`;
+}
+
+export function releaseHash(projectId: string, ref: Ref, opts: { against?: string | null; group?: "device" | "platform" } = {}): string {
+  const q = new URLSearchParams();
+  if (opts.against) q.set("against", opts.against);
+  if (opts.group && opts.group !== "device") q.set("group", opts.group);
+  const qs = q.toString();
+  return `#/p/${encodeURIComponent(projectId)}/releases/${ref.kind}/${encodeURIComponent(ref.name)}${qs ? `?${qs}` : ""}`;
 }

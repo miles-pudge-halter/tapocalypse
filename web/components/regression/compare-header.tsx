@@ -110,7 +110,7 @@ export function CompareHeader({
   return (
     <header className="space-y-3">
       <nav aria-label="Breadcrumb" className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
-        <a href="#/" className="hover:text-foreground hover:underline">
+        <a href="#/runs" className="hover:text-foreground hover:underline">
           Runs
         </a>
         <span aria-hidden>/</span>

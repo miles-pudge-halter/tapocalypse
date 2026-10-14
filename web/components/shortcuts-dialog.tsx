@@ -2,6 +2,7 @@ import { useSyncExternalStore } from "react";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Kbd, KbdGroup } from "@/components/ui/kbd";
 import { useShortcut } from "@/lib/hooks";
+import { isHub } from "@/lib/mode";
 
 const listeners = new Set<() => void>();
 let isOpen = false;
@@ -23,26 +24,51 @@ interface ShortcutRow {
   label: string;
 }
 
-const GROUPS: { title: string; rows: ShortcutRow[] }[] = [
-  {
-    title: "General",
-    rows: [
-      { keys: [MOD_KEY_LABEL, "K"], label: "Open the command palette" },
-      { keys: ["n"], label: "New run" },
-      { keys: ["/"], label: "Focus search on the current page" },
-      { keys: [MOD_KEY_LABEL, "B"], label: "Collapse or expand the sidebar" },
-      { keys: ["?"], label: "Show this list" },
-    ],
-  },
-  {
-    title: "Go to",
-    rows: [
-      { keys: ["g", "r"], label: "Runs" },
-      { keys: ["g", "d"], label: "Devices" },
-      { keys: ["g", "p"], label: "Projects" },
-      { keys: ["g", "s"], label: "Setup" },
-    ],
-  },
+interface Group {
+  title: string;
+  rows: ShortcutRow[];
+}
+
+/** The General and Go to groups differ between a laptop and the read-only hub. */
+function leadingGroups(): Group[] {
+  const common: ShortcutRow[] = [
+    { keys: [MOD_KEY_LABEL, "K"], label: "Open the command palette" },
+    { keys: ["/"], label: "Focus search or the filter on the current page" },
+    { keys: [MOD_KEY_LABEL, "B"], label: "Collapse or expand the sidebar" },
+    { keys: ["?"], label: "Show this list" },
+  ];
+  if (isHub()) {
+    return [
+      { title: "General", rows: common },
+      {
+        title: "Team hub",
+        rows: [
+          { keys: ["g", "o"], label: "Overview" },
+          { keys: ["g", "e"], label: "Releases" },
+          { keys: ["g", "r"], label: "Runs" },
+          { keys: ["g", "p"], label: "Projects" },
+          { keys: ["g", "a"], label: "About this hub" },
+        ],
+      },
+    ];
+  }
+  return [
+    { title: "General", rows: [common[0] as ShortcutRow, { keys: ["n"], label: "New run" }, ...common.slice(1)] },
+    {
+      title: "Go to",
+      rows: [
+        { keys: ["g", "o"], label: "Overview" },
+        { keys: ["g", "e"], label: "Releases" },
+        { keys: ["g", "r"], label: "Runs" },
+        { keys: ["g", "d"], label: "Devices" },
+        { keys: ["g", "p"], label: "Projects" },
+        { keys: ["g", "s"], label: "Setup" },
+      ],
+    },
+  ];
+}
+
+const SHARED_GROUPS: Group[] = [
   {
     title: "Run",
     rows: [
@@ -71,6 +97,7 @@ const GROUPS: { title: string; rows: ShortcutRow[] }[] = [
   },
 ];
 
+
 export function ShortcutsDialog() {
   const open = useSyncExternalStore(
     (listener) => {
@@ -88,7 +115,7 @@ export function ShortcutsDialog() {
           <DialogDescription>Single-key shortcuts are ignored while you type in a field.</DialogDescription>
         </DialogHeader>
         <div className="space-y-4">
-          {GROUPS.map((group) => (
+          {[...leadingGroups(), ...SHARED_GROUPS].map((group) => (
             <section key={group.title}>
               <h3 className="mb-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">{group.title}</h3>
               <ul className="divide-y rounded-md border">

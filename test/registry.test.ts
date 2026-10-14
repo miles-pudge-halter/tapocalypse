@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { CONFIG_PATH, HttpError } from "../src/config";
+import { hubKeyFor, setHubIdentityDeps } from "../src/hub/identity";
 import {
   createProject,
   deleteProject,
@@ -10,7 +11,9 @@ import {
   initProjects,
   listProjects,
   projectEvents,
+  type ProjectStatus,
   resolvePersonaPath,
+  setProjectSource,
   updateProject,
   validateProject,
 } from "../src/projects/registry";
@@ -359,5 +362,100 @@ describe("resolvePersonaPath", () => {
   test("custom persona resolves inside the repo", () => {
     const p = createProject(input({ personaFile: "agents/qa.md" }));
     expect(resolvePersonaPath(p)).toBe(path.join(repo, "agents", "qa.md"));
+  });
+});
+
+describe("sharing with the team hub", () => {
+  let other: string;
+  /** Fake git: `remotes` maps a repo path to its origin URL; unmapped repos have no remote. */
+  const useRemotes = (remotes: Record<string, string>) =>
+    setHubIdentityDeps({ git: async (cwd, args) => (args[0] === "remote" ? (remotes[cwd] ?? null) : "") });
+  const warm = (...repos: string[]) => Promise.all(repos.map((repoPath) => hubKeyFor({ repoPath })));
+
+  beforeAll(() => {
+    other = path.join(tmp, "other");
+    fs.mkdirSync(path.join(other, ".git"), { recursive: true });
+  });
+  afterAll(() => setHubIdentityDeps());
+
+  test("share and hubKey are validated, persisted, survive a reload and can be cleared", () => {
+    useRemotes({});
+    expect(thrown(() => createProject(input({ share: "yes" }))).message).toStartWith("share:");
+    expect(thrown(() => createProject(input({ hubKey: "Not A Key" }))).message).toStartWith("hubKey:");
+
+    const created = createProject(input({ share: true, hubKey: "github.com/acme/app#com.acme.shop" }));
+    expect(created).toMatchObject({ status: "ok", share: true, hubKey: "github.com/acme/app#com.acme.shop" });
+    expect(readFileConfig().projects).toMatchObject([{ share: true, hubKey: "github.com/acme/app#com.acme.shop" }]);
+    initProjects();
+    expect(getProject("my-app")).toMatchObject({ share: true, hubKey: "github.com/acme/app#com.acme.shop" });
+
+    updateProject("my-app", { share: false, hubKey: null });
+    const stored = (readFileConfig().projects as Record<string, unknown>[])[0]!;
+    expect("share" in stored || "hubKey" in stored).toBe(false);
+  });
+
+  test("sharing a repo with no remote needs an explicit hubKey", async () => {
+    useRemotes({});
+    await warm(repo);
+    expect(thrown(() => createProject(input({ share: true }))).message).toStartWith("hubKey:");
+    expect(validateProject(input({ share: true }), "create").errors.hubKey).toContain("remote");
+    expect(createProject(input({ share: true, hubKey: "local/my-app" })).status).toBe("ok");
+    expect(createProject(input({ id: "not-shared", name: "Not shared", share: false })).status).toBe("ok");
+  });
+
+  test("a second shared project deriving the same key is invalid until it gets its own hubKey", async () => {
+    useRemotes({ [repo]: "git@github.com:acme/app.git", [other]: "https://github.com/Acme/App.git" });
+    await warm(repo, other);
+    createProject(input({ share: true }));
+    expect(thrown(() => createProject(input({ id: "kiosk", name: "Kiosk", repoPath: other, share: true })))).toMatchObject({ status: 400 });
+    const fixed = createProject(input({ id: "kiosk", name: "Kiosk", repoPath: other, share: true, hubKey: "github.com/acme/app#com.acme.kiosk" }));
+    expect(fixed.status).toBe("ok");
+    expect(listProjects().map((p: ProjectStatus) => [p.id, p.status])).toEqual([["my-app", "ok"], ["kiosk", "ok"]]);
+  });
+
+  test("an unshared project never clashes, and the earlier of two clashing projects stays valid", async () => {
+    useRemotes({ [repo]: "git@github.com:acme/app.git", [other]: "git@github.com:acme/app.git" });
+    await warm(repo, other);
+    resetConfig([
+      { id: "first", name: "First", repoPath: repo, defaultPackage: "com.example.app", defaultPlatform: "android", share: true },
+      { id: "second", name: "Second", repoPath: other, defaultPackage: "com.example.app", defaultPlatform: "android", share: true },
+      { id: "third", name: "Third", repoPath: other, defaultPackage: "com.example.app", defaultPlatform: "android" },
+    ]);
+    const byId = Object.fromEntries(listProjects().map((p) => [p.id, p]));
+    expect(byId.first!.status).toBe("ok");
+    expect(byId.second!.status).toBe("invalid");
+    expect(byId.second!.problems.join(" ")).toContain("first");
+    expect(byId.third!.status).toBe("ok");
+    expect(getProject("second")).toBeUndefined();
+  });
+
+  test("a remote learned in the background flips an existing shared project to invalid and announces it", async () => {
+    useRemotes({});
+    resetConfig([{ id: "late", name: "Late", repoPath: repo, defaultPackage: "com.example.app", defaultPlatform: "android", share: true }]);
+    const changed = Promise.withResolvers<void>();
+    const onChange = () => changed.resolve();
+    projectEvents.on("change", onChange);
+    try {
+      expect(listProjects()[0]!.status).toBe("ok"); // git has not been asked yet
+      await changed.promise;
+    } finally {
+      projectEvents.off("change", onChange);
+    }
+    expect(listProjects()[0]).toMatchObject({ status: "invalid" });
+    expect(listProjects()[0]!.problems.join(" ")).toContain("hubKey");
+  });
+
+  test("setProjectSource replaces the config-backed registry until it is cleared", () => {
+    const hubProject = { id: "hub-app", name: "Hub App", repoPath: "", personaFile: null, defaultPackage: "com.example.app", defaultPlatform: "android" as const };
+    createProject(input());
+    setProjectSource({ list: () => [{ ...hubProject, status: "ok", problems: [] }], get: (id) => (id === "hub-app" ? hubProject : undefined) });
+    try {
+      expect(listProjects().map((p) => p.id)).toEqual(["hub-app"]);
+      expect(getProject("hub-app")?.name).toBe("Hub App");
+      expect(getProject("my-app")).toBeUndefined();
+    } finally {
+      setProjectSource(null);
+    }
+    expect(getProject("my-app")?.name).toBe("My App");
   });
 });

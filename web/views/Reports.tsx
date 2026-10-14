@@ -147,7 +147,7 @@ export function ReportList({ projectId: routeProjectId }: { projectId?: string |
 function ReportShare({ runId }: { runId: string }) {
   const { run, loading } = useRunSummary(runId, true);
   if (loading) return <Skeleton className="h-8 w-24" />;
-  return run ? <ShareButton runId={run.id} disabled={isActive(run.status)} align="start" /> : null;
+  return run ? <ShareButton runId={run.id} disabled={isActive(run.status)} align="start" reportPath={run.reportPath} hubSync={run.hubSync} /> : null;
 }
 
 function ReportViewBody({ projectId, name }: { projectId: string; name: string }) {
@@ -210,7 +210,7 @@ export function ReportView({ projectId: routeProjectId, name }: { projectId?: st
   return (
     <div className="space-y-6">
       <a
-        href={projectId ? reportsHref(projectId) : "#/"}
+        href={projectId ? reportsHref(projectId) : "#/runs"}
         className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground"
       >
         <ArrowLeft className="size-4" />

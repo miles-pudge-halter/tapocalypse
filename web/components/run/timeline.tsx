@@ -8,6 +8,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { isActive, type Activity, type RunView } from "@/lib/api";
 import { useNow, useShortcut } from "@/lib/hooks";
 import { cn } from "@/lib/utils";
+import { isHub } from "@/lib/mode";
 import { SteerComposer } from "./steer-composer";
 import { buildTimeline, countProblems, filterTimeline, TERMINAL_CHECK_STATUSES, type TimelineFilter } from "./timeline-model";
 import { SectionHeader, TimelineRowView, type TimeMode } from "./timeline-rows";
@@ -324,7 +325,7 @@ export function Timeline({
         ) : null}
       </div>
 
-      {run.status === "running" ? <SteerComposer runId={run.id} harness={run.harness} /> : null}
+      {run.status === "running" && !isHub() ? <SteerComposer runId={run.id} harness={run.harness} /> : null}
     </div>
   );
 }

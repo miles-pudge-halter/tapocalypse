@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { ChevronDown, ExternalLink, FileText, Info, Loader2, RotateCcw, Trash2, XCircle } from "lucide-react";
 
+import { HubSyncChip } from "@/components/hub/sync-chip";
+import { UploadedBy } from "@/components/hub/uploaded-by";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -19,6 +21,7 @@ import { VerdictBadge } from "@/components/verdict-badge";
 import { batchHash, isActive, reportHash, transcriptUrl, type Device, type RunView } from "@/lib/api";
 import { deviceDisplayName } from "@/lib/format";
 import { useHarness, useNow } from "@/lib/hooks";
+import { isHub } from "@/lib/mode";
 import { DetailsSheet } from "./details-sheet";
 import { ShareButton } from "./share-button";
 import { failedChecks, type RunActions } from "./use-run-actions";
@@ -37,6 +40,7 @@ export function RunHeader({
   connected: boolean;
   actions: RunActions;
 }) {
+  const hub = isHub();
   const active = isActive(run.status);
   const now = useNow(active ? 1000 : 60_000);
   const { label: harnessLabel } = useHarness(run.harness);
@@ -50,7 +54,7 @@ export function RunHeader({
   return (
     <header className="space-y-2">
       <nav aria-label="Breadcrumb" className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
-        <a href="#/" className="hover:text-foreground hover:underline">
+        <a href="#/runs" className="hover:text-foreground hover:underline">
           Runs
         </a>
         {run.batchId ? (
@@ -85,7 +89,7 @@ export function RunHeader({
         ) : null}
 
         <div className="ml-auto flex flex-wrap items-center gap-2">
-          {active ? (
+          {hub ? null : active ? (
             <Button variant="outline" size="sm" className="text-destructive" onClick={() => setCancelOpen(true)}>
               <XCircle />
               Cancel
@@ -124,12 +128,12 @@ export function RunHeader({
               </a>
             </Button>
           ) : null}
-          <ShareButton runId={run.id} disabled={active} />
+          <ShareButton runId={run.id} disabled={active} reportPath={run.reportPath} hubSync={run.hubSync} />
           <Button variant="outline" size="sm" onClick={() => setDetailsOpen(true)}>
             <Info />
             Details
           </Button>
-          {!active ? (
+          {!active && !hub ? (
             <Button
               variant="ghost"
               size="icon-sm"
@@ -146,7 +150,13 @@ export function RunHeader({
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground">
         {deviceText ? <span>{deviceText}</span> : <span>no device yet</span>}
         <span aria-hidden>·</span>
-        <span>by {run.requestedBy}</span>
+        {hub && run.hub ? <UploadedBy hub={run.hub} withTime /> : <span>by {run.requestedBy}</span>}
+        {!hub && run.hubSync ? (
+          <>
+            <span aria-hidden>·</span>
+            <HubSyncChip run={run} />
+          </>
+        ) : null}
       </div>
 
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">

@@ -12,7 +12,6 @@ import {
   type ShareStatus,
   type Platform,
   type PoolView,
-  type ProjectStatus,
   type ReportDoc,
   type ReportEntry,
   type RunStats,
@@ -29,9 +28,24 @@ import {
   type CheckHistory,
   type CompareResponse,
   type FlakyResponse,
+  type HubInfo,
+  type HubMachine,
+  type HubStatus,
+  type HubSync,
+  type ProjectOverview,
+  type ProjectView,
+  type RefSummary,
+  type ReleaseView,
   type Transition,
+  OVERVIEW_SHOWS,
+  refParam,
+  type OverviewShow,
+  type Ref,
 } from "./api";
 import { createLeaseCache, parseWatched } from "./leases";
+import { isHub } from "./mode";
+import { HARNESS_LABEL } from "./format";
+import { missingKind } from "./hub";
 import { GROUP_ORDER } from "./regression";
 import { readStorage, writeStorage } from "./storage";
 
@@ -48,19 +62,29 @@ export interface RunFilters {
   group?: RunGroup;
   /** Only finished runs with newly failing checks versus their baseline (`regressed=1`). */
   regressed?: boolean;
+  /** Limits the list to one branch / app version (links from the overview and release pages). */
+  branch?: string;
+  version?: string;
+  /** Hub only: upload machine names. */
+  machine?: string[];
 }
 
 export type Route =
+  | { name: "home" }
   | { name: "runs"; filters: RunFilters }
   | { name: "run"; id: string; check?: string; baseline?: string }
   | { name: "compare"; id: string; baselineId: string; show?: Transition; pair?: string }
   | { name: "batch"; id: string }
   | { name: "devices" }
-  | { name: "setup" }
+  | { name: "setup"; section?: string }
   | { name: "projects"; openNew: boolean }
   | { name: "reports"; projectId: string }
   | { name: "flaky"; projectId: string }
-  | { name: "report"; projectId: string; reportName: string };
+  | { name: "report"; projectId: string; reportName: string }
+  | { name: "overview"; projectId: string; ref: string | null; show?: OverviewShow }
+  | { name: "releases"; projectId: string }
+  | { name: "release"; projectId: string; ref: Ref; against: string | null; group: "device" | "platform" }
+  | { name: "about" };
 
 const RUN_STATUSES: readonly RunStatus[] = [
   "queued",
@@ -98,10 +122,16 @@ function parseFilters(params: URLSearchParams): RunFilters {
   const group = params.get("group");
   if (group && (GROUPS as readonly string[]).includes(group)) filters.group = group as RunGroup;
   if (params.get("regressed") === "1") filters.regressed = true;
+  const branch = params.get("branch");
+  if (branch) filters.branch = branch;
+  const version = params.get("version");
+  if (version) filters.version = version;
+  const machine = params.get("machine")?.split(",").filter(Boolean);
+  if (machine?.length) filters.machine = machine;
   return filters;
 }
 
-/** Hash for the Runs page carrying `filters`; `#/` when there are none. */
+/** Hash for the Runs page carrying `filters`. */
 export function runsHash(filters: RunFilters): string {
   const q = new URLSearchParams();
   if (filters.status?.length) q.set("status", filters.status.join(","));
@@ -110,11 +140,14 @@ export function runsHash(filters: RunFilters): string {
   if (filters.q) q.set("q", filters.q);
   if (filters.group) q.set("group", filters.group);
   if (filters.regressed) q.set("regressed", "1");
+  if (filters.branch) q.set("branch", filters.branch);
+  if (filters.version) q.set("version", filters.version);
+  if (filters.machine?.length) q.set("machine", filters.machine.join(","));
   const qs = q.toString();
-  return qs ? `#/runs?${qs}` : "#/";
+  return qs ? `#/runs?${qs}` : "#/runs";
 }
 
-function parseHash(hash: string): Route {
+export function parseHash(hash: string): Route {
   const [pathPart = "", query = ""] = hash.replace(/^#/, "").split("?");
   const params = new URLSearchParams(query);
   const parts = pathPart.split("/").filter(Boolean);
@@ -135,15 +168,42 @@ function parseHash(hash: string): Route {
     }
     if ((seg[0] === "batches" || seg[0] === "batch") && seg[1]) return { name: "batch", id: seg[1] };
     if (seg[0] === "devices") return { name: "devices" };
-    if (seg[0] === "setup") return { name: "setup" };
+    if (seg[0] === "about") return { name: "about" };
+    if (seg[0] === "setup") return { name: "setup", section: params.get("section") ?? undefined };
     if (seg[0] === "projects") return { name: "projects", openNew: params.get("new") === "1" };
     if (seg[0] === "p" && seg[1] && seg[2] === "flaky") return { name: "flaky", projectId: seg[1] };
+    if (seg[0] === "p" && seg[1] && seg[2] === "releases") {
+      const kind = seg[3];
+      if ((kind === "version" || kind === "branch") && seg[4]) {
+        // A branch typed with raw slashes arrives as several segments: rejoin them.
+        const name = seg.slice(4).join("/");
+        return {
+          name: "release",
+          projectId: seg[1],
+          ref: { kind, name },
+          against: params.get("against"),
+          group: params.get("group") === "platform" ? "platform" : "device",
+        };
+      }
+      return { name: "releases", projectId: seg[1] };
+    }
+    if (seg[0] === "p" && seg[1] && seg[2] === "overview") {
+      const show = params.get("show");
+      return {
+        name: "overview",
+        projectId: seg[1],
+        ref: params.get("ref") && params.get("ref") !== "all" ? params.get("ref") : null,
+        show: show && (OVERVIEW_SHOWS as readonly string[]).includes(show) ? (show as OverviewShow) : undefined,
+      };
+    }
     if (seg[0] === "p" && seg[1] && seg[2] === "reports") {
       return seg[3] ? { name: "report", projectId: seg[1], reportName: seg[3] } : { name: "reports", projectId: seg[1] };
     }
   } catch {
     // malformed escape sequence: fall through to the runs page
   }
+  // `#/` alone is the home page; a query (the old Runs-page links) or an unknown path still means the list.
+  if (parts.length === 0 && query === "") return { name: "home" };
   return { name: "runs", filters: parseFilters(params) };
 }
 
@@ -307,34 +367,43 @@ interface AsyncState<T> {
   data: T | null;
   loading: boolean;
   error: string | null;
+  /** HTTP status of the failed request, when it was an API error. */
+  errorStatus: number | null;
+  errorCode: string | null;
+  /** When the data last arrived (ms since the epoch); drives "Updated 3m ago" labels. */
+  fetchedAt: number | null;
 }
 
-/** Fetches on mount and whenever `key` changes; stale responses from a previous key are dropped. */
-function useAsync<T>(fetcher: () => Promise<T>, key: string, intervalMs?: number): AsyncState<T> & { refresh(): void } {
-  const [state, setState] = useState<AsyncState<T>>({ data: null, loading: true, error: null });
+/**
+ * Fetches on mount and whenever `key` changes; stale responses from a previous key are dropped.
+ * While `enabled` is false nothing is fetched and the state is an empty, settled one (hub mode skips routes the hub blocks).
+ */
+function useAsync<T>(fetcher: () => Promise<T>, key: string, intervalMs?: number, enabled = true): AsyncState<T> & { refresh(): void } {
+  const [state, setState] = useState<AsyncState<T>>({ data: null, loading: enabled, error: null, errorStatus: null, errorCode: null, fetchedAt: null });
   const [tick, setTick] = useState(0);
   const refresh = useCallback(() => setTick((t) => t + 1), []);
 
   useEffect(() => {
+    if (!enabled) return;
     let cancelled = false;
     const load = () =>
       fetcher().then(
-        (data) => !cancelled && setState({ data, loading: false, error: null }),
-        (e: unknown) => !cancelled && setState((s) => ({ data: s.data, loading: false, error: errorMessage(e) })),
+        (data) => !cancelled && setState({ data, loading: false, error: null, errorStatus: null, errorCode: null, fetchedAt: Date.now() }),
+        (e: unknown) => !cancelled && setState((s) => ({ ...s, loading: false, error: errorMessage(e), errorStatus: e instanceof ApiError ? e.status : null, errorCode: e instanceof ApiError ? e.code : null })),
       );
-    setState((s) => ({ data: s.data, loading: true, error: null }));
+    setState((s) => ({ ...s, loading: true, error: null, errorStatus: null, errorCode: null }));
     void load();
     const timer = intervalMs ? setInterval(load, intervalMs) : undefined;
     return () => {
       cancelled = true;
       if (timer) clearInterval(timer);
     };
-  }, [key, tick, intervalMs]);
+  }, [key, tick, intervalMs, enabled]);
 
   // Switching key must not show the previous key's data.
   useEffect(() => {
-    setState({ data: null, loading: true, error: null });
-  }, [key]);
+    setState({ data: null, loading: enabled, error: null, errorStatus: null, errorCode: null, fetchedAt: null });
+  }, [key, enabled]);
 
   return { ...state, refresh };
 }
@@ -342,7 +411,7 @@ function useAsync<T>(fetcher: () => Promise<T>, key: string, intervalMs?: number
 // --- useProjects: fetched once, then replaced by every `projects` event on the shared EventSource ---
 
 interface ProjectsState {
-  projects: ProjectStatus[];
+  projects: ProjectView[];
   loading: boolean;
   error: string | null;
 }
@@ -366,7 +435,7 @@ function onProjectsEvent(e: Event): void {
   try {
     const data: unknown = JSON.parse((e as MessageEvent<string>).data);
     if (Array.isArray(data)) {
-      setProjectsState({ projects: data as ProjectStatus[], loading: false, error: null });
+      setProjectsState({ projects: data as ProjectView[], loading: false, error: null });
       return;
     }
   } catch {
@@ -400,7 +469,7 @@ function subscribeProjects(listener: () => void): () => void {
   };
 }
 
-export function useProjects(): { projects: ProjectStatus[]; loading: boolean; error: string | null; refresh(): void } {
+export function useProjects(): { projects: ProjectView[]; loading: boolean; error: string | null; refresh(): void } {
   const state = useSyncExternalStore(subscribeProjects, () => projectsState);
   return { ...state, refresh: refreshProjects };
 }
@@ -439,7 +508,7 @@ export function useDevices(intervalMs = 10_000): {
   error: string | null;
   refresh(): void;
 } {
-  const { data, loading, error, refresh } = useAsync(api.devices, "devices", intervalMs);
+  const { data, loading, error, refresh } = useAsync(api.devices, "devices", intervalMs, !isHub());
   useLeasesChanged(refresh);
   useEffect(() => {
     if (data) leaseCache.seed(data.flatMap((d) => (d.lease ? [d.lease] : [])));
@@ -448,7 +517,7 @@ export function useDevices(intervalMs = 10_000): {
 }
 
 export function usePool(intervalMs = 5_000): { pool: PoolView | null; loading: boolean; error: string | null; refresh(): void } {
-  const { data, loading, error, refresh } = useAsync(api.pool, "pool", intervalMs);
+  const { data, loading, error, refresh } = useAsync(api.pool, "pool", intervalMs, !isHub());
   useRunsChanged(refresh, 600);
   useLeasesChanged(refresh);
   return { pool: data, loading, error, refresh };
@@ -456,7 +525,7 @@ export function usePool(intervalMs = 5_000): { pool: PoolView | null; loading: b
 
 /** Agent and run leases (public view, no secrets), refreshed by `lease` events. */
 export function useLeases(intervalMs = 15_000): { leases: LeaseView[]; loading: boolean; error: string | null; refresh(): void } {
-  const { data, loading, error, refresh } = useAsync(api.leases, "leases", intervalMs);
+  const { data, loading, error, refresh } = useAsync(api.leases, "leases", intervalMs, !isHub());
   useLeasesChanged(refresh);
   useEffect(() => {
     if (data) leaseCache.seed(data);
@@ -490,7 +559,10 @@ function loadDoctor(fresh: boolean): void {
 
 function subscribeDoctor(listener: () => void): () => void {
   doctorListeners.add(listener);
-  if (doctorListeners.size === 1 && !doctorState.report) loadDoctor(false);
+  if (isHub()) {
+    // The hub has no devices or harnesses to check, and its doctor route is not served to viewers.
+    if (doctorState.loading) doctorState = { report: null, loading: false, error: null };
+  } else if (doctorListeners.size === 1 && !doctorState.report) loadDoctor(false);
   return () => void doctorListeners.delete(listener);
 }
 
@@ -522,7 +594,6 @@ const PAGE_SIZE = 100;
 
 export interface RunQuery extends RunFilters {
   batch?: string;
-  branch?: string;
   pr?: number;
   ticket?: string;
   commit?: string;
@@ -538,7 +609,7 @@ interface RunsState {
 }
 
 function runQueryKey(f: RunQuery): string {
-  return JSON.stringify([f.status, f.verdict, f.project, f.q, f.batch, f.branch, f.pr, f.ticket, f.commit, f.limit, f.regressed]);
+  return JSON.stringify([f.status, f.verdict, f.project, f.q, f.batch, f.branch, f.pr, f.ticket, f.commit, f.limit, f.regressed, f.version, f.machine]);
 }
 
 function mergeRun(existing: RunView, incoming: RunView): RunView {
@@ -594,6 +665,15 @@ export function useRuns(filters: RunQuery = {}): {
     }
     void fetchList();
   });
+
+  // A laptop's upload state changes without a run event: patch the row in place.
+  useEffect(
+    () =>
+      listenHubSync((runId, sync) =>
+        setState((s) => (s.runs.some((r) => r.id === runId) ? { ...s, runs: s.runs.map((r) => (r.id === runId ? { ...r, hubSync: sync } : r)) } : s)),
+      ),
+    [],
+  );
 
   const loadMore = useCallback(async () => {
     const { runs, hasMore, loadingMore } = stateRef.current;
@@ -702,7 +782,7 @@ export function useStats(
 }
 
 export function useModels(harness?: HarnessId): { models: string[]; loading: boolean; error: string | null } {
-  const { data, loading, error } = useAsync(() => api.models(harness), `models:${harness ?? ""}`);
+  const { data, loading, error } = useAsync(() => api.models(harness), `models:${harness ?? ""}`, undefined, !isHub());
   return { models: data ?? [], loading, error };
 }
 
@@ -713,7 +793,7 @@ export function useHarnesses(): {
   loading: boolean;
   error: string | null;
 } {
-  const { data, loading, error } = useAsync(api.harnesses, "harnesses");
+  const { data, loading, error } = useAsync(api.harnesses, "harnesses", undefined, !isHub());
   return { harnesses: data?.harnesses ?? [], defaultId: data?.default ?? null, loading, error };
 }
 
@@ -721,11 +801,12 @@ export function useHarnesses(): {
 export function useHarness(id: HarnessId): { info: HarnessInfo | null; label: string | undefined; loading: boolean } {
   const { harnesses, loading } = useHarnesses();
   const info = harnesses.find((h) => h.id === id) ?? null;
+  if (isHub()) return { info: null, label: HARNESS_LABEL[id] ?? id, loading: false };
   return { info, label: info?.label ?? (loading ? undefined : id), loading };
 }
 
 export function useTemplates(): { templates: Template[]; loading: boolean; error: string | null } {
-  const { data, loading, error } = useAsync(api.templates, "templates");
+  const { data, loading, error } = useAsync(api.templates, "templates", undefined, !isHub());
   return { templates: data ?? [], loading, error };
 }
 
@@ -733,20 +814,153 @@ export function useSuites(projectId: string): { suites: Suite[]; loading: boolea
   const { data, loading, error, refresh } = useAsync(
     () => (projectId ? api.suites(projectId) : Promise.resolve<Suite[]>([])),
     `suites:${projectId}`,
+    undefined,
+    !isHub(),
   );
   return { suites: data ?? [], loading, error, refresh };
 }
 
 export function useMcpStatus(intervalMs = 5_000): { status: McpStatus | null; loading: boolean; error: string | null } {
-  const { data, loading, error } = useAsync(api.mcpStatus, "mcp-status", intervalMs);
+  const { data, loading, error } = useAsync(api.mcpStatus, "mcp-status", intervalMs, !isHub());
   return { status: data, loading, error };
 }
 
 /** Whether report links can be uploaded (`share.s3` configured on the server); the download needs no setup. */
 export function useShareStatus(): { status: ShareStatus | null; loading: boolean; error: string | null; refresh(): void } {
-  const { data, loading, error, refresh } = useAsync(api.shareStatus, "share-status");
+  const { data, loading, error, refresh } = useAsync(api.shareStatus, "share-status", undefined, !isHub());
   return { status: data, loading, error, refresh };
 }
+
+// --- team hub ---
+
+/** Like `useRunsChanged`, but only for events about `projectId` (and reconnects, which may have missed some). */
+function useProjectRunsChanged(projectId: string, cb: () => void, delayMs = 2000): void {
+  useRunsChanged((run) => {
+    if (!run || run.projectId === projectId) cb();
+  }, delayMs);
+}
+
+/** A project's overview for one ref (null = all branches); refetches 2 s (debounced) after a run of the project changes. */
+export function useOverview(
+  projectId: string,
+  ref: Ref | null,
+): { overview: ProjectOverview | null; loading: boolean; error: string | null; fetchedAt: number | null; missing: "ref" | "project" | null; refresh(): void } {
+  const { projects } = useProjects();
+  const { data, loading, error, errorStatus, errorCode, fetchedAt, refresh } = useAsync(() => api.overview(projectId, ref), `overview:${projectId}:${refParam(ref)}`);
+  useProjectRunsChanged(projectId, refresh);
+  return { overview: data, loading, error, fetchedAt, missing: missingKind({ status: errorStatus, code: errorCode }, projects.some((p) => p.id === projectId)), refresh };
+}
+
+/** Versions and branches that have runs in a project, newest first. */
+export function useRefs(projectId: string): { refs: RefSummary[]; loading: boolean; error: string | null; fetchedAt: number | null; refresh(): void } {
+  const { data, loading, error, fetchedAt, refresh } = useAsync(() => api.refs(projectId), `refs:${projectId}`);
+  useProjectRunsChanged(projectId, refresh);
+  return { refs: data ?? [], loading: loading && data === null, error, fetchedAt, refresh };
+}
+
+/** One release across every machine (`against` = a ref param to compare with, null = automatic). */
+export function useRelease(
+  projectId: string,
+  ref: Ref,
+  against: string | null,
+): { release: ReleaseView | null; loading: boolean; error: string | null; fetchedAt: number | null; missing: "ref" | "project" | null; refresh(): void } {
+  const { projects } = useProjects();
+  const { data, loading, error, errorStatus, errorCode, fetchedAt, refresh } = useAsync(() => api.release(projectId, ref, against), `release:${projectId}:${refParam(ref)}:${against ?? "auto"}`);
+  useProjectRunsChanged(projectId, refresh);
+  return { release: data, loading, error, fetchedAt, missing: missingKind({ status: errorStatus, code: errorCode }, projects.some((p) => p.id === projectId)), refresh };
+}
+
+/** Machines that upload to this hub; refetched after uploads and every minute. Hub only (no fetch on a laptop). */
+export function useHubMachines(): { machines: HubMachine[]; loading: boolean; error: string | null; fetchedAt: number | null } {
+  const { data, loading, error, fetchedAt, refresh } = useAsync(api.hubMachines, "hub-machines", 60_000, isHub());
+  useRunsChanged(refresh, 2000);
+  return { machines: data ?? [], loading: loading && data === null, error, fetchedAt };
+}
+
+/** Hub totals and settings for the About page. Hub only. */
+export function useHubInfo(): { info: HubInfo | null; loading: boolean; error: string | null } {
+  const { data, loading, error } = useAsync(api.hubInfo, "hub-info", undefined, isHub());
+  return { info: data, loading, error };
+}
+
+type HubEvent = { kind: "status"; status: HubStatus } | { kind: "sync"; runId: string; sync: HubSync | null };
+
+/** Narrows a laptop's `hub` event: the whole status, or one run's upload state. */
+function parseHubEvent(e: Event): HubEvent | null {
+  try {
+    const data: unknown = JSON.parse((e as MessageEvent<string>).data);
+    if (!data || typeof data !== "object") return null;
+    if ("status" in data && data.status && typeof data.status === "object") return { kind: "status", status: data.status as HubStatus };
+    if ("runId" in data && typeof data.runId === "string" && "sync" in data) return { kind: "sync", runId: data.runId, sync: (data.sync as HubSync | null) ?? null };
+  } catch {
+    // malformed payload
+  }
+  return null;
+}
+
+/** Calls `handler` with the new upload state of a run whenever the laptop's sync worker reports one. */
+function listenHubSync(handler: (runId: string, sync: HubSync | null) => void): () => void {
+  return listenEvent("hub", (e) => {
+    const event = parseHubEvent(e);
+    if (event?.kind === "sync") handler(event.runId, event.sync);
+  });
+}
+
+interface HubStatusState {
+  status: HubStatus | null;
+  loading: boolean;
+  error: string | null;
+}
+
+const hubStatusListeners = new Set<() => void>();
+let hubStatusState: HubStatusState = { status: null, loading: true, error: null };
+
+function setHubStatusState(next: Partial<HubStatusState>): void {
+  hubStatusState = { ...hubStatusState, ...next };
+  for (const l of hubStatusListeners) l();
+}
+
+function refreshHubStatus(): void {
+  api.hubStatus().then(
+    (status) => setHubStatusState({ status, loading: false, error: null }),
+    (e: unknown) => setHubStatusState({ loading: false, error: errorMessage(e) }),
+  );
+}
+
+let stopHubStatusFeed: (() => void) | null = null;
+
+function startHubStatusFeed(): () => void {
+  refreshHubStatus();
+  const offHub = listenEvent("hub", (e) => {
+    const event = parseHubEvent(e);
+    if (event?.kind === "status") setHubStatusState({ status: event.status, loading: false, error: null });
+  });
+  const offOpen = listenEvent("open", refreshHubStatus);
+  return () => {
+    offHub();
+    offOpen();
+  };
+}
+
+function subscribeHubStatus(listener: () => void): () => void {
+  hubStatusListeners.add(listener);
+  if (hubStatusListeners.size === 1 && !isHub()) stopHubStatusFeed = startHubStatusFeed();
+  return () => {
+    hubStatusListeners.delete(listener);
+    if (hubStatusListeners.size === 0) {
+      stopHubStatusFeed?.();
+      stopHubStatusFeed = null;
+    }
+  };
+}
+
+/** The laptop's hub connection and upload queue, live through `hub` events. Never fetches on a hub. */
+export function useHubStatus(): HubStatusState & { refresh(): void; set(status: HubStatus): void } {
+  const state = useSyncExternalStore(subscribeHubStatus, () => (isHub() ? HUB_STATUS_OFF : hubStatusState));
+  return { ...state, refresh: refreshHubStatus, set: (status) => setHubStatusState({ status, loading: false, error: null }) };
+}
+
+const HUB_STATUS_OFF: HubStatusState = { status: null, loading: false, error: null };
 
 // --- New run sheet store ---
 
@@ -1254,7 +1468,13 @@ export function useRunEvents(id: string): {
       // readyState CLOSED means the browser gave up (e.g. 404 for an unknown run); CONNECTING means it is retrying.
       if (source.readyState === EventSource.CLOSED) setError("Connection to run stream lost");
     });
-    return () => source.close();
+    const offSync = listenHubSync((runId, sync) => {
+      if (runId === idRef.current) setRun((r) => (r ? { ...r, hubSync: sync } : r));
+    });
+    return () => {
+      source.close();
+      offSync();
+    };
   }, [id, commit]);
 
   const loadEarlier = useCallback(async () => {

@@ -51,7 +51,7 @@ function ContextHeader({ run, projectName, runHref }: { run: RunView | null; pro
   return (
     <header className="mb-3 space-y-3">
       <nav aria-label="Breadcrumb" className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
-        <a href="#/" className="hover:text-foreground hover:underline">
+        <a href="#/runs" className="hover:text-foreground hover:underline">
           Runs
         </a>
         {run && projectName ? (
@@ -167,7 +167,7 @@ export function Compare({ id, baselineId, show, pair: pairParam }: { id: string;
   const contextProject = contextRun ? (projects.find((p) => p.id === contextRun.projectId)?.name ?? contextRun.projectId) : null;
   /** A run that does not exist has nothing to go "back" to. */
   const back = context.error ? (
-    <a href="#/" className="underline underline-offset-2">
+    <a href="#/runs" className="underline underline-offset-2">
       Back to runs
     </a>
   ) : (
