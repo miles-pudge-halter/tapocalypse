@@ -1,6 +1,6 @@
 # Tapocalypse team hub: the same app in read-only hub mode. Build: `docker build -t tapocalypse-hub .`
 # Bun >= 1.3.14 because laptops encode screenshots with Bun.Image and the hub shares their package.json engines range.
-FROM oven/bun:1.3.14-slim@sha256:d56a2534ffd262e92c12fd3249d3924d296d97086da773f821d7d0477435ea04
+FROM oven/bun:1.4.3-slim@sha256:14a223fa35747ec728bce300ef85888bc5f7958164d15bbba6a54b22b52a3288
 
 WORKDIR /app
 COPY package.json bun.lock bunfig.toml tsconfig.json components.json ./
