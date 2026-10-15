@@ -12,14 +12,15 @@ const PROJECT_VIEWS = new Set(["flaky", "refs", "overview", "reports", "releases
  */
 export function hubRouteAllowed(method: string, parts: string[]): boolean {
   if (method !== "GET" && method !== "HEAD") return false;
-  const [root, a, b, c, d, e] = parts;
+  const [root, a, b, c, d] = parts;
   if (root !== "api") return false;
   if (parts.length === 2) return a === "health" || a === "events" || a === "stats" || a === "runs" || a === "projects";
   if (a === "runs" && b) {
     if (c === "files") return parts.length >= 5;
     if (parts.length === 3) return true;
     if (parts.length === 4) return RUN_VIEWS.has(c!);
-    return parts.length === 6 && c === "checks" && e === "history";
+    // A check id typed with raw slashes spreads over several segments between /checks/ and /history.
+    return parts.length >= 6 && c === "checks" && parts.at(-1) === "history";
   }
   if (a === "batches") return parts.length === 3;
   if (a === "projects" && b) {
@@ -27,7 +28,7 @@ export function hubRouteAllowed(method: string, parts: string[]): boolean {
     if (c === "releases") return parts.length === 4 || (parts.length >= 6 && !!d);
     if (parts.length === 4) return PROJECT_VIEWS.has(c!);
     if (parts.length === 5) return c === "reports";
-    return parts.length === 6 && c === "checks" && e === "history";
+    return parts.length >= 6 && c === "checks" && parts.at(-1) === "history";
   }
   return false;
 }

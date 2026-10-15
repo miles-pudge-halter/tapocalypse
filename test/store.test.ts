@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { appendEvent, appendStderr, createRun, deleteRun, getRun, listRuns, type NewRun, readActivity, runDir, saveRun, subscribeRuns } from "../src/runs/store";
 
@@ -333,4 +334,43 @@ describe("readActivity per harness", () => {
       }
     });
   });
+});
+
+describe("store directories", () => {
+  test("a fresh data dir and its runs/ are owner-only (0700) whatever the umask, and an existing 0755 one is tightened at start", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "tpc-store-dirs-"));
+    try {
+      const script = `
+        process.umask(0o022);
+        const fs = await import("node:fs");
+        const { DATA_DIR } = await import("./src/config");
+        const { createRun, runDir } = await import("./src/runs/store");
+        const path = await import("node:path");
+        const modeOf = (p) => (fs.statSync(p).mode & 0o777).toString(8);
+        const run = createRun(JSON.parse(process.env.NEW_RUN));
+        console.log(JSON.stringify({ data: modeOf(DATA_DIR), runs: modeOf(path.dirname(runDir(run.id))) }));
+      `;
+      const start = async (dataDir: string) => {
+        const proc = Bun.spawn([process.execPath, "-e", script], {
+          cwd: path.resolve(import.meta.dir, ".."),
+          env: { ...process.env, TAPOCALYPSE_CONFIG: path.join(root, "c.json"), TAPOCALYPSE_DATA_DIR: dataDir, NEW_RUN: JSON.stringify(newRun("private dir")) },
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+        expect({ code, err }).toEqual({ code: 0, err: "" });
+        return JSON.parse(out.trim().split("\n").at(-1) ?? "{}") as { data: string; runs: string };
+      };
+
+      expect(await start(path.join(root, "fresh"))).toMatchObject({ data: "700", runs: "700" });
+
+      const existing = path.join(root, "existing");
+      fs.mkdirSync(path.join(existing, "runs"), { recursive: true, mode: 0o755 });
+      fs.chmodSync(existing, 0o755);
+      fs.chmodSync(path.join(existing, "runs"), 0o755);
+      expect(await start(existing)).toMatchObject({ data: "700", runs: "700" });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
 });

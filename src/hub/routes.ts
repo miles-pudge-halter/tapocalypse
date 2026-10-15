@@ -5,13 +5,16 @@ import { listRuns } from "../runs/store";
 import { readCappedBody } from "./body";
 import { ingestLiveRun, ingestRun, missingBlobs, putBlob, rekeyAll, rekeyProject, runState, unpublishRun, unpublishRuns, type Uploader } from "./ingest";
 import { HUB_PROTOCOL_MIN, hubIdentityHeader, hubLimits } from "./mode";
-import { BlobCheckBody, HUB_PROTOCOL, LIVE_MAX_BYTES, RunId, Sha256 } from "./protocol";
+import { removeHubProject, setHubDefaultBranch } from "./projects";
+import { BlobCheckBody, HUB_PROTOCOL, HubKey, LIVE_MAX_BYTES, RunId, Sha256 } from "./protocol";
 import { hubMachines, hubSummary } from "./status";
 import { verifyToken } from "./tokens";
 
 const MAX_SMALL_BODY_BYTES = 64 * 1024;
 const IDENTITY_MAX = 200;
 const AdminRekeyBody = z.object({ projectId: z.string().min(1).max(64).nullable() });
+const AdminProjectRemoveBody = z.strictObject({ hubKey: HubKey });
+const AdminDefaultBranchBody = z.strictObject({ hubKey: HubKey, branch: z.string().max(200).nullable() });
 const AdminUnpublishBody = z.strictObject({ runId: z.string().max(200).optional(), projectId: z.string().max(64).optional(), machine: z.string().max(64).optional() });
 
 /** `GET /api/health`: the boot gate of the UI and the container healthcheck. Both modes. */
@@ -47,10 +50,11 @@ function requireUploader(req: Request): Uploader {
 /**
  * Writes one token may make per minute: a run document costs keying work, a blob costs disk. A backfill of a few hundred runs
  * fits; a leaked token cannot grind the hub. `live` is its own budget: a laptop sends progress at most every 3 s per run
- * (and a heartbeat a minute), which must neither starve nor be starved by finished-run uploads.
+ * (and a heartbeat a minute), which must neither starve nor be starved by finished-run uploads. `meta` covers the cheap routes
+ * that still tell a token something (blob existence, run ownership) or change something (DELETE): no scanning, no oracle.
  */
 const RATE_WINDOW_MS = 60_000;
-const RATE_LIMITS = { run: 120, blob: 600, live: 240 } as const;
+const RATE_LIMITS = { run: 120, blob: 600, live: 240, meta: 600 } as const;
 const rateWindows = new Map<string, { start: number; count: number }>();
 
 /** A 429 once `uploader` has used up this minute's budget for `kind`, else null. Answered before any body is read. */
@@ -83,7 +87,7 @@ async function jsonBody(req: Request, maxBytes: number): Promise<unknown> {
   return safeJson(new TextDecoder().decode(await readCappedBody(req, { maxBytes, allowGzip: true })));
 }
 
-/** `POST /api/hub/v1/admin/rekey|unpublish`: what the admin CLI asks of a running hub so its in-memory store never goes stale. */
+/** `POST /api/hub/v1/admin/rekey|unpublish|project-remove|project-default-branch`: what the admin CLI asks of a running hub so its in-memory store never goes stale. */
 async function adminRoute(req: Request, action: string): Promise<Response> {
   if (req.method !== "POST") return notAllowed("POST");
   if (!requireUploader(req).admin) throw new HttpError(403, "an admin token is required", "admin_required");
@@ -97,6 +101,18 @@ async function adminRoute(req: Request, action: string): Promise<Response> {
     const parsed = AdminUnpublishBody.safeParse(body);
     if (!parsed.success) throw new HttpError(400, "body must select runs with runId, projectId and/or machine");
     return Response.json({ removed: unpublishRuns(parsed.data) });
+  }
+  if (action === "project-remove") {
+    const parsed = AdminProjectRemoveBody.safeParse(body);
+    if (!parsed.success) throw new HttpError(400, "body must be { hubKey: string }");
+    removeHubProject(parsed.data.hubKey);
+    return Response.json({ removed: parsed.data.hubKey });
+  }
+  if (action === "project-default-branch") {
+    const parsed = AdminDefaultBranchBody.safeParse(body);
+    if (!parsed.success) throw new HttpError(400, "body must be { hubKey: string, branch: string | null }");
+    const { defaultBranch } = setHubDefaultBranch(parsed.data.hubKey, parsed.data.branch);
+    return Response.json({ defaultBranch });
   }
   throw new HttpError(404, "not found");
 }
@@ -129,7 +145,8 @@ export async function hubV1Route(req: Request, parts: string[]): Promise<Respons
 
   if (resource === "blobs" && id === "check" && parts.length === 5) {
     if (method !== "POST") return notAllowed("POST");
-    requireUploader(req);
+    const limited = overRate(requireUploader(req), "meta");
+    if (limited) return limited;
     const body = BlobCheckBody.safeParse(await smallJson(req));
     if (!body.success) throw new HttpError(400, "body must be { sha256: string[] } of up to 500 hex digests");
     return Response.json({ missing: missingBlobs([...new Set(body.data.sha256)]) });
@@ -155,7 +172,10 @@ export async function hubV1Route(req: Request, parts: string[]): Promise<Respons
       return Response.json(result, { status: result.status === "created" ? 201 : 200 });
     }
     if (method === "DELETE") {
-      unpublishRun(id, requireUploader(req));
+      const uploader = requireUploader(req);
+      const limited = overRate(uploader, "meta");
+      if (limited) return limited;
+      unpublishRun(id, uploader);
       return new Response(null, { status: 204 });
     }
     return notAllowed("PUT, DELETE");
@@ -173,7 +193,8 @@ export async function hubV1Route(req: Request, parts: string[]): Promise<Respons
 
   if (resource === "runs" && id && action === "state" && parts.length === 6) {
     if (method !== "GET") return notAllowed("GET");
-    requireUploader(req);
+    const limited = overRate(requireUploader(req), "meta");
+    if (limited) return limited;
     const state = runState(id);
     if (!state) throw new HttpError(404, `unknown run ${id}`);
     return Response.json(state);

@@ -29,6 +29,16 @@ server.registerTool(
   (args) => text(`shot:${args.device}`),
 );
 
+// Lets a test see which environment variables the gateway handed the child. Only with `--dump-env`, so the tool count
+// other tests rely on stays the same.
+if (process.argv.includes("--dump-env")) {
+  server.registerTool(
+    "mobile_dump_env",
+    { description: "Names of the environment variables of this process", inputSchema: z.object({}) },
+    () => text(JSON.stringify(Object.keys(process.env).sort())),
+  );
+}
+
 server.registerTool(
   "mobile_click_on_screen_at_coordinates",
   { description: "Click on the screen at x,y", inputSchema: z.object({ device, x: z.number(), y: z.number() }) },

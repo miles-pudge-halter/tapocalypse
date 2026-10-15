@@ -12,3 +12,5 @@ coverage
 .env.*
 *.log
 tapocalypse.config.json
+hub-credentials.json
+share-credentials.json

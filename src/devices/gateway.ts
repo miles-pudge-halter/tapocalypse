@@ -9,7 +9,8 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { z } from "zod";
 import pkg from "../../package.json";
 import { DATA_DIR } from "../config";
-import { MOBILE_MCP_PACKAGE } from "../harness/types";
+import { harnessEnv } from "../harness/env";
+import { MOBILE_MCP_PACKAGE, MOBILE_MCP_VERSION } from "../harness/types";
 import type { LeaseStore } from "./leases";
 
 export interface JsonSchemaObject extends JsonSchemaType {
@@ -439,17 +440,30 @@ export class Gateway {
   }
 }
 
-/** The command that starts one mobile-mcp child: the same `npx` spec runs use, or `MOBILE_MCP_BIN` (space-separated argv, for tests and pinned installs). */
+/** The command that starts one mobile-mcp child: `npx` at the pinned version, or `MOBILE_MCP_BIN` (space-separated argv, for tests and own installs). */
 function mobileMcpCommand(): string[] {
   const bin = process.env.MOBILE_MCP_BIN?.trim();
-  return bin ? bin.split(/\s+/) : ["npx", "-y", `${MOBILE_MCP_PACKAGE}@latest`];
+  return bin ? bin.split(/\s+/) : ["npx", "-y", `${MOBILE_MCP_PACKAGE}@${MOBILE_MCP_VERSION}`];
+}
+
+export interface MobileMcpSpawn {
+  command: string;
+  args: string[];
+  cwd: string;
+  env: Record<string, string>;
+}
+
+/** What one child is started with. Its environment is `harnessEnv`: the hub token and the S3 keys of this server are not its business. */
+export function mobileMcpSpawn(cwd: string, base: Record<string, string | undefined> = process.env): MobileMcpSpawn {
+  const [command = "npx", ...args] = mobileMcpCommand();
+  const env: Record<string, string> = {};
+  for (const [name, value] of Object.entries(harnessEnv(base))) if (value !== undefined) env[name] = value;
+  return { command, args, cwd, env };
 }
 
 /** The real child: a stdio MCP client over mobile-mcp. */
 export async function spawnMobileMcp(cwd: string): Promise<GatewayClient> {
-  const [command = "npx", ...args] = mobileMcpCommand();
-  const env: Record<string, string> = {};
-  for (const [name, value] of Object.entries(process.env)) if (value !== undefined) env[name] = value;
+  const { command, args, env } = mobileMcpSpawn(cwd);
   const transport = new StdioClientTransport({ command, args, cwd, env, stderr: "pipe" });
   let stderrTail = "";
   transport.stderr?.on("data", (chunk: Buffer | string) => {

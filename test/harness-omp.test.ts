@@ -92,6 +92,7 @@ function spawn(over: Partial<SpawnOptions> = {}, timing: Partial<OmpTiming> = {}
     runDir,
     persona: "persona",
     personaFile: path.join(runDir, "persona.md"),
+    device: { serial: "emulator-5554", platform: "android" },
     model: null,
     effort: null,
     mcpServers: [{ name: "tpc", transport: "http", url: "http://127.0.0.1:4310/mcp/runs/r1", headers: { Authorization: "Bearer SECRET-RUN-TOKEN" } }],

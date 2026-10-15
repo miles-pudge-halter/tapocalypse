@@ -138,6 +138,7 @@ function makeOpts(over: Partial<SpawnOptions> = {}) {
     runDir: tempRunDir(),
     persona: "You are a QA agent.",
     personaFile: "/data/runs/run1/persona.md",
+    device: { serial: "emulator-5554", platform: "android" },
     model: null,
     effort: null,
     mcpServers: [TPC, MOBILE],

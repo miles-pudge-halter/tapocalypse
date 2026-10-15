@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { config, ConfigSchema, findEmulator, HubConfigSchema, REPO_ROOT, resolveConfigPath, resolveDataDir } from "../src/config";
+import { config, ConfigSchema, ensurePrivateDir, findEmulator, HubConfigSchema, REPO_ROOT, resolveConfigPath, resolveDataDir } from "../src/config";
 
 const HOME = "/home/me";
 const legacyConfig = path.join(REPO_ROOT, "tapocalypse.config.json");
@@ -65,5 +67,41 @@ describe("team hub address", () => {
 
   test("a config file naming an insecure hub address is refused as a whole", () => {
     expect(ConfigSchema.safeParse({ ...config, share: { hub: { url: "http://hub.example.com" } } }).success).toBe(false);
+  });
+});
+
+describe("private data directory", () => {
+  const mode = (p: string) => fs.statSync(p).mode & 0o777;
+  const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "tpc-private-"));
+
+  test("ensurePrivateDir creates the directory 0700 (its missing parents keep the default mode)", () => {
+    const root = tmp();
+    const umask = process.umask(0o022);
+    try {
+      const dir = path.join(root, "a", "data");
+      ensurePrivateDir(dir);
+      expect(mode(dir)).toBe(0o700);
+      expect(mode(path.join(root, "a"))).toBe(0o755);
+    } finally {
+      process.umask(umask);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("ensurePrivateDir tightens an existing 0755 directory and leaves its contents alone", () => {
+    const root = tmp();
+    try {
+      const dir = path.join(root, "data");
+      fs.mkdirSync(dir, { mode: 0o755 });
+      fs.chmodSync(dir, 0o755);
+      const file = path.join(dir, "keep.txt");
+      fs.writeFileSync(file, "x", { mode: 0o644 });
+      fs.chmodSync(file, 0o644);
+      ensurePrivateDir(dir);
+      expect(mode(dir)).toBe(0o700);
+      expect(mode(file)).toBe(0o644);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

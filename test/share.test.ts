@@ -346,3 +346,82 @@ describe("share credentials", () => {
     expect(shareStatus(share, { env: {}, configDir: dir })).toEqual({ configured: true, provider: "s3", expiresInDays: 7, problem: null });
   });
 });
+
+describe("what the shared and downloaded HTML never contains", () => {
+  const HOME = os.homedir();
+  const SERIAL = "emulator-5554";
+  const SECRET = "zq7Kd2LmPw9x";
+  const dirty = (run: Run): Run => {
+    const repo = path.join(os.tmpdir(), "acme-shop-repo");
+    Object.assign(run, {
+      title: `Checkout on ${SERIAL} from ${HOME}/Projects/acme-shop`,
+      summary: `Failed: accessToken=${SECRET} after /Users/bob.smith/notes and ${repo}/lib/a.dart`,
+      deviceName: null,
+      deviceSerial: SERIAL,
+      deviceLabel: "Pixel_8_API_35",
+      deviceRequest: { platform: "android", serial: SERIAL },
+      checks: [{ id: "C1", title: `Open ${HOME}/x`, status: "fail", note: `adb -s ${SERIAL} failed; Authorization: Token ${SECRET}; Cookie: sid=${SECRET}`, updatedAt: "t" }],
+      source: { path: repo, branch: "main", commit: "abcdef1234567", commitSubject: `fix --password ${SECRET}`, dirty: false, remoteUrl: null, pr: { number: 7, title: `redis://:${SECRET}@cache.example` }, prStatus: "none", tickets: ["ACME-12"], labels: {} },
+    });
+    return run;
+  };
+  const REPORT = [
+    "# Report",
+    `Ran on ${SERIAL} (Pixel_8_API_35) with \`${HOME}/Projects/acme-shop/lib/a.dart\` and ${HOME}/.tapocalypse/x`,
+    "",
+    `curl -u deploy:${SECRET} https://x.example --token ${SECRET}`,
+    "",
+    "```json",
+    `{"clientSecret":"${SECRET}","maxTokens":4096}`,
+    "```",
+    "",
+    "Saw <repo>/lib/a.dart go missing.",
+  ].join("\n");
+  const leaks = (html: string): string[] => [SECRET, SERIAL, "Pixel_8_API_35", HOME + "/", "bob.smith", "acme-shop-repo"].filter((leak) => html.includes(leak));
+
+  test("title, summary, meta rows, checks and the report markdown are redacted like an upload", async () => {
+    const run = dirty(stage(makeRun(), REPORT));
+    const { html } = await renderStandaloneReport(run, project);
+    expect(leaks(html)).toEqual([]);
+    expect(html).toContain("<h1>Checkout on &lt;device&gt; from ~/Projects/acme-shop</h1>");
+    expect(html).toContain("&lt;device&gt; (android)");
+    expect(html).toContain("Authorization: «redacted:authorization»");
+    expect(html).toContain("maxTokens");
+    expect(html).toContain("4096");
+    // The placeholders survive the markdown renderer as text, in prose and in code.
+    expect(html).toContain("Saw &lt;repo&gt;/lib/a.dart go missing.");
+    expect(html).toContain("~/Projects/acme-shop/lib/a.dart");
+  });
+
+  test("shareRun uploads the redacted document", async () => {
+    const stored = makeStoredRun({ testKey: uniqueTest(), at: 0, title: "t" });
+    fs.mkdirSync(runArtefactDir(stored.id), { recursive: true });
+    fs.writeFileSync(path.join(runArtefactDir(stored.id), "report.md"), REPORT);
+    const run = updateRun(stored, (r) => {
+      dirty(r);
+      r.reportPath = "report.md";
+      r.storage = "data";
+    });
+    const writes: string[] = [];
+    const client: ShareClient = { write: async (_key, data) => (writes.push(String(data)), String(data).length), presign: (key) => key };
+    await shareRun(run.id, { share: { s3: { bucket: "b", prefix: "p/", expiresInDays: 1 } }, client, env: { S3_ACCESS_KEY_ID: "id", S3_SECRET_ACCESS_KEY: "secret" } });
+    expect(writes).toHaveLength(1);
+    expect(leaks(writes[0]!)).toEqual([]);
+    expect(writes[0]).toContain("Failed: accessToken=«redacted:secret-assignment»");
+  });
+
+  test("a run that came from a hub upload is not re-redacted with this machine's own paths", async () => {
+    const hubRun = makeRun({
+      title: "Uploaded /tmp/acme/x.png",
+      summary: "see /tmp/acme/y.png",
+      hub: { machine: "ann-mbp", uploader: null, receivedAt: "2026-03-01T10:03:00.000Z", localProjectId: "acme-app", clockSkewMs: null, contentHash: "h", clientVersion: "1", keys: { testKey: null, checks: {}, checkHints: null } },
+    });
+    const { html } = await renderStandaloneReport(stage(hubRun, "# R\n\nlog in /tmp/acme/z.png and token=" + SECRET + "\n"), project);
+    expect(html).toContain("Uploaded /tmp/acme/x.png");
+    expect(html).toContain("see /tmp/acme/y.png");
+    expect(html).toContain("/tmp/acme/z.png");
+    expect(html).not.toContain(SECRET); // the secret backstop still applies
+    const local = await renderStandaloneReport(stage(makeRun({ title: "Uploaded /tmp/acme/x.png" }), null), project);
+    expect(local.html).toContain("Uploaded &lt;tmp&gt;/acme/x.png");
+  });
+});

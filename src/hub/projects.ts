@@ -4,6 +4,7 @@ import { HttpError } from "../config";
 import { type Project, projectEvents, type ProjectStatus, setProjectSource } from "../projects/registry";
 import { listRuns } from "../runs/store";
 import { readJsonCached, writeJsonAtomic } from "./files";
+import { listLiveRuns } from "./live";
 import { hubDir } from "./mode";
 import { HubKey, type HubProjectMetaT } from "./protocol";
 
@@ -25,6 +26,10 @@ const Entry = z.object({
   lastUploadBy: UploadBy.nullable().default(null),
   /** An admin set the name with `hub project rename`. Uploads never rename a project (the first upload names it); this only marks an admin-chosen name. */
   nameLocked: z.boolean().default(false),
+  /** An admin set the default branch with `hub project set-default-branch`: uploads no longer change it. */
+  defaultBranchLocked: z.boolean().default(false),
+  /** The token (machine) whose upload first named this hub key; it counts against that token's new-key budget. Null for projects from before this was recorded. */
+  createdBy: z.string().nullable().default(null),
 });
 export type HubProjectEntry = z.infer<typeof Entry>;
 
@@ -65,7 +70,7 @@ function allocateId(meta: Pick<HubProjectMetaT, "hubKey" | "subpath">, taken: Re
 /** The default branch after an upload: an explicit setting beats a detected one, and between equals the run created last wins, so backfilling an old run cannot flip it. */
 function nextDefaultBranch(existing: HubProjectEntry, meta: HubProjectMetaT, runCreatedAt: string): Pick<HubProjectEntry, "defaultBranch" | "defaultBranchSource" | "defaultBranchRunAt"> {
   const keep = { defaultBranch: existing.defaultBranch, defaultBranchSource: existing.defaultBranchSource, defaultBranchRunAt: existing.defaultBranchRunAt };
-  if (!meta.defaultBranch) return keep;
+  if (existing.defaultBranchLocked || !meta.defaultBranch) return keep;
   const source = meta.defaultBranchSource ?? "detected";
   const take = { defaultBranch: meta.defaultBranch, defaultBranchSource: source, defaultBranchRunAt: runCreatedAt };
   if (existing.defaultBranch === null) return take;
@@ -74,15 +79,26 @@ function nextDefaultBranch(existing: HubProjectEntry, meta: HubProjectMetaT, run
   return runCreatedAt >= (existing.defaultBranchRunAt ?? "") ? take : keep;
 }
 
+/** How many hub keys one token may introduce per 24 hours (uploads and live updates together). */
+const NEW_KEYS_PER_DAY = 20;
+const DAY_MS = 24 * 3600 * 1000;
+
 /**
  * The hub project for an upload's `hubKey`, created on first sight: two machines' local ids ("app", "acme-app") land in one project.
- * The first upload names it and only `hub project rename` changes the name afterwards; the default branch follows `nextDefaultBranch`.
+ * The first upload names it, supplies its repository URL and subpath, and only `hub project rename` changes the name afterwards;
+ * the default branch follows `nextDefaultBranch` unless an admin locked it. A token that already introduced 20 new keys in the
+ * last 24 hours gets 429 `too_many_projects` for a 21st.
  */
 export function touchHubProject(meta: HubProjectMetaT, by: { machine: string; uploader: string | null }, runCreatedAt: string, now: Date = new Date()): HubProjectEntry {
   const entries = load();
   const at = now.toISOString();
   const existing = entries.find((e) => e.hubKey === meta.hubKey);
   if (!existing) {
+    const since = now.getTime() - DAY_MS;
+    const introduced = entries.filter((e) => e.createdBy === by.machine && Date.parse(e.firstSeenAt) > since).length;
+    if (introduced >= NEW_KEYS_PER_DAY) {
+      throw new HttpError(429, `this token already created ${NEW_KEYS_PER_DAY} new projects in the last 24 hours; retry later or ask an admin`, "too_many_projects");
+    }
     const created: HubProjectEntry = {
       hubKey: meta.hubKey,
       id: allocateId(meta, new Set(entries.map((e) => e.id))),
@@ -97,6 +113,8 @@ export function touchHubProject(meta: HubProjectMetaT, by: { machine: string; up
       lastUploadAt: at,
       lastUploadBy: by,
       nameLocked: false,
+      defaultBranchLocked: false,
+      createdBy: by.machine,
     };
     save([...entries, created]);
     return created;
@@ -104,8 +122,8 @@ export function touchHubProject(meta: HubProjectMetaT, by: { machine: string; up
   const next: HubProjectEntry = {
     ...existing,
     ...nextDefaultBranch(existing, meta, runCreatedAt),
-    remoteUrl: meta.remoteUrl ?? existing.remoteUrl,
-    subpath: meta.subpath ?? existing.subpath,
+    remoteUrl: existing.remoteUrl ?? meta.remoteUrl,
+    subpath: existing.subpath ?? meta.subpath,
     lastUploadAt: at,
     lastUploadBy: by,
   };
@@ -123,6 +141,31 @@ export function renameHubProject(hubKey: string, name: string): HubProjectEntry 
   const next = { ...found, name: trimmed, nameLocked: true };
   save(entries.map((e) => (e.hubKey === hubKey ? next : e)));
   return next;
+}
+
+/** `hub project set-default-branch`: pins the branch (`null` clears it and unlocks, so the next upload detects one again). */
+export function setHubDefaultBranch(hubKey: string, branch: string | null): HubProjectEntry {
+  const trimmed = branch === null ? null : branch.trim();
+  if (trimmed !== null && (!trimmed || trimmed.length > 200)) throw new HttpError(400, "branch must be 1-200 characters");
+  const entries = load();
+  const found = entries.find((e) => e.hubKey === hubKey);
+  if (!found) throw new HttpError(404, `unknown hub project ${hubKey}`);
+  const next: HubProjectEntry =
+    trimmed === null
+      ? { ...found, defaultBranch: null, defaultBranchSource: null, defaultBranchRunAt: null, defaultBranchLocked: false }
+      : { ...found, defaultBranch: trimmed, defaultBranchSource: "explicit", defaultBranchRunAt: null, defaultBranchLocked: true };
+  save(entries.map((e) => (e.hubKey === hubKey ? next : e)));
+  return next;
+}
+
+/** `hub project remove`: forgets a project that has no stored and no live runs; 409 `project_not_empty` otherwise. */
+export function removeHubProject(hubKey: string): void {
+  const entries = load();
+  const found = entries.find((e) => e.hubKey === hubKey);
+  if (!found) throw new HttpError(404, `unknown hub project ${hubKey}`);
+  const runs = listRuns({ projectId: found.id }).length + listLiveRuns().filter((r) => r.projectId === found.id).length;
+  if (runs > 0) throw new HttpError(409, `${hubKey} still has ${runs} run(s); remove them first with \`hub unpublish --project ${found.id}\``, "project_not_empty");
+  save(entries.filter((e) => e.hubKey !== hubKey));
 }
 
 export const listHubProjects = (): HubProjectEntry[] => load();

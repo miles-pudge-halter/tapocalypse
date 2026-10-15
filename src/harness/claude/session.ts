@@ -1,4 +1,5 @@
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import type { RunUsage } from "../../runs/types";
@@ -67,8 +68,66 @@ const settingsSchema = z.object({
   permissions: z.enum(["bypass", "allowlist"]).default("bypass"),
 });
 
-/** `dontAsk` denies everything outside this list; the mounted MCP servers are added per run. */
-const ALLOWLIST_TOOLS = ["Bash(adb *)", "Bash(xcrun simctl *)", "Read", "Write", "Edit"];
+/**
+ * Permission rules for `permissions: "allowlist"`. Syntax (Claude Code docs, "Configure permissions",
+ * https://code.claude.com/docs/en/permissions#permission-rule-syntax):
+ * - `Read(//abs/path/**)` / `Edit(//abs/path/**)`: gitignore patterns where `//` anchors at the filesystem root (a single
+ *   leading `/` is relative to the settings source, not absolute). `Edit` rules cover every built-in tool that edits or writes
+ *   files, and the targets of Bash redirections (`> file`); path rules for `Write` are never consulted, so none are used.
+ * - `Bash(adb -s <serial> *)`: the text before the first `*` is matched as written, so the `*` goes after the subcommand;
+ *   `*` matches any text including spaces, and a trailing ` *` also matches the bare command.
+ * - deny rules are evaluated before allow rules and an allow can never carve an exception out of a deny.
+ * - Bash rules match the command text, not the program: `git -C . push` escapes `Bash(git push *)`. They narrow what an
+ *   agent attempts, they are not a sandbox (the docs point to sandboxing for that).
+ * Under `dontAsk` whatever is neither allowed here nor read-only inside a working directory is denied.
+ */
+function allowlistRules(opts: SpawnOptions): { allow: string[]; deny: string[] } {
+  const { serial, platform } = opts.device;
+  // The id goes into rule text: anything with a space, wildcard or parenthesis could widen or break the rule.
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(serial) || serial.includes("..")) throw new Error(`device id ${JSON.stringify(serial)} cannot be scoped in an allowlist`);
+
+  const withReal = (p: string): string[] => {
+    const abs = path.resolve(p);
+    let real = abs;
+    try {
+      if (existsSync(abs)) real = realpathSync(abs);
+    } catch {
+      // keep the lexical path
+    }
+    return real === abs ? [abs] : [abs, real];
+  };
+  // Escapes backslashes and gitignore wildcards; a leading `/` plus the absolute path (itself starting with `/`) is the `//` anchor.
+  const rule = (tool: "Read" | "Edit", dir: string): string => `${tool}(/${dir.replace(/[\\*?[\]]/g, "\\$&")}/**)`;
+  const unique = (items: string[]): string[] => [...new Set(items)];
+
+  const runDirs = withReal(opts.runDir);
+  const allow = unique([
+    ...opts.mcpServers.map((s) => `mcp__${s.name}__*`),
+    ...[...withReal(opts.cwd), ...runDirs, ...withReal(os.tmpdir())].map((dir) => rule("Read", dir)),
+    ...runDirs.map((dir) => rule("Edit", dir)),
+    // The persona has iOS runs look for crash reports that name the app.
+    ...(platform === "ios" ? [rule("Read", path.join(os.homedir(), "Library", "Logs", "DiagnosticReports"))] : []),
+  ]);
+  const deny: string[] = [];
+  if (platform === "android") {
+    const adb = `Bash(adb -s ${serial}`;
+    // Enumerated, not `adb -s X *`: a global option in front of the subcommand (`-P`, `-H`) would slip past the deny rules below,
+    // and the blanket would also allow bugreport, backup, sideload, forward, reverse, sync. These are what the persona uses.
+    allow.push(`${adb} shell *)`, `${adb} exec-out *)`, `${adb} logcat *)`, `${adb} get-state)`, `${adb} wait-for-device)`);
+    for (const sub of ["push", "pull", "install", "install-multiple", "install-multi-package", "uninstall", "shell pm install", "shell pm uninstall"]) deny.push(`${adb} ${sub} *)`);
+  } else {
+    const simctl = "Bash(xcrun simctl";
+    allow.push(`${simctl} list *)`);
+    for (const sub of ["launch", "terminate", "openurl", "privacy", "get_app_container"]) allow.push(`${simctl} ${sub} ${serial} *)`);
+    // `spawn` runs any host binary inside the simulator; the persona only needs its log.
+    allow.push(`${simctl} spawn ${serial} log *)`);
+    for (const dir of runDirs) allow.push(`${simctl} io ${serial} screenshot ${dir}/*)`);
+    for (const sub of ["install", "uninstall"]) deny.push(`${simctl} ${sub} *)`);
+    // The allow rule is a prefix match: keep `<run folder>/../../x.png` from escaping the folder.
+    deny.push(`${simctl} io * screenshot *..*)`);
+  }
+  return { allow, deny };
+}
 
 function mcpConfig(servers: McpServerSpec[]): object {
   const entries = servers.map((s) => [
@@ -89,6 +148,7 @@ export function prepareClaude(opts: SpawnOptions): string[] {
   writeFileSync(mcpFile, JSON.stringify(mcpConfig(opts.mcpServers), null, 2), { mode: 0o600 });
   chmodSync(mcpFile, 0o600);
 
+  const rules = settings.permissions === "allowlist" ? allowlistRules(opts) : { allow: [], deny: [] };
   const argv = [
     settings.bin ?? "claude",
     "-p",
@@ -106,10 +166,11 @@ export function prepareClaude(opts: SpawnOptions): string[] {
     "--disallowedTools",
     "Agent",
     "AskUserQuestion",
+    ...rules.deny,
   ];
   if (settings.permissions === "allowlist") {
     // The run folder (screenshots, report) is outside the repo the agent works in.
-    argv.push("--add-dir", opts.runDir, "--permission-mode", "dontAsk", "--allowedTools", ...opts.mcpServers.map((s) => `mcp__${s.name}__*`), ...ALLOWLIST_TOOLS);
+    argv.push("--add-dir", opts.runDir, "--permission-mode", "dontAsk", "--allowedTools", ...rules.allow);
   } else {
     argv.push("--permission-mode", "bypassPermissions");
   }

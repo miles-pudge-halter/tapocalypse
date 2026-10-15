@@ -158,6 +158,8 @@ The allowlist used in the recipes is one anchored regular expression on the path
 
 Keep it anchored and narrow. Do not widen it to `^/api/hub/v1/.*`: that would also let anonymous callers read `GET /api/hub/v1/machines`.
 
+**Encoded paths are refused.** The hub answers `400 { "code": "ambiguous_path" }` to any request whose path, exactly as it arrived, contains `%2f`, `%2e` or `%5c` (any case) or a backslash. A proxy and the hub must never read one path two ways; the hub's own URLs never contain these. The query string is not checked. If you see this error, a proxy rule or a client is rewriting or encoding the path: send it as plain `/` and `.` characters.
+
 ### Recipe A: nginx path split + oauth2-proxy (recommended)
 
 `compose.hub.yml` and `nginx.hub.conf` are this recipe. nginx is the only entry point. It sends the [upload routes](#put-an-access-proxy-in-front) straight to the hub (the hub checks the upload token) and everything else to [oauth2-proxy](https://oauth2-proxy.github.io/oauth2-proxy/), which logs viewers in with your identity provider (Google, Microsoft, GitHub, Keycloak, any OIDC) and forwards them to the hub. oauth2-proxy has **no skip-auth rule**, so no route of the hub can be skipped past the login.
@@ -411,8 +413,19 @@ TAPOCALYPSE_MODE=hub TAPOCALYPSE_DATA_DIR=/srv/tapocalypse bun src/cli.ts hub to
 - `hub token list` shows names, admin flag, creation and last-used times and revoked state, never tokens or digests. `create` prints the token alone on standard output (the explanation goes to standard error), so `TOKEN=$(… hub token create alice-laptop)` works.
 - `hub token revoke <name>` stops the token immediately. Runs it uploaded stay. The laptop's queue pauses with "the hub rejected this machine's upload token" until a new token is saved there.
 - **Rotating:** create a new token (a revoked name can be reused, an active name cannot), save it on the laptop (`tapocalypse hub login`), revoke the old one. Runs keep the name of the token that uploaded them.
-- **A leaked token** lets someone upload runs under that machine's name and read nothing else (uploads are the only thing a token authorizes). Revoke it, then remove anything suspicious on the hub with `hub unpublish --machine <name>` (or one run: `hub unpublish <runId>`; `--project <id>` narrows it).
-- **What a token can do, and what it cannot.** A token is not scoped to a project: it may upload runs under *any* hub key, so a leaked or malicious token can add runs to every project and so move its regression baselines and pass rates until you unpublish them. Each token is limited to 120 run uploads and 600 file uploads a minute (`429` with `Retry-After`), files are at most 16 MB each, and unreferenced files are removed after 7 days. It cannot change a project's name, delete another machine's runs (admin tokens can) or read anything. Treat a token like a password for the machine; give admin tokens to nobody who does not need them.
+- **A leaked token** lets someone upload runs under that machine's name and learn only what *What a token can do* below says (it reads no run content). Revoke it, then remove anything suspicious on the hub with `hub unpublish --machine <name>` (or one run: `hub unpublish <runId>`; `--project <id>` narrows it).
+- **What a token can do.**
+  - Upload runs under *any* hub key. A token is not scoped to a project, so a leaked or malicious token can add runs to every project and so move its regression baselines and pass rates until you unpublish them.
+  - Create new hub projects, but at most **20 new hub keys per token per 24 hours** (uploads and live updates together); the 21st gets `429 too_many_projects`. The count is stored with the project, survives a restart, and removing a project (`hub project remove`) frees its slot.
+  - Learn two small facts: whether a run id exists on the hub and which machine uploaded it (`GET /api/hub/v1/runs/<id>/state`, and the `403`/`404` of `DELETE`), and whether a file with a given SHA-256 is stored (`POST /api/hub/v1/blobs/check`). Both are rate-limited so they cannot be used to scan.
+  - Delete the runs it uploaded (an admin token may delete any run).
+- **What a token cannot do.**
+  - Read run content, reports or screenshots. The upload routes answer a token only with the two facts above, `info` and the result of its own uploads.
+  - Change a project once it exists: the first upload names it (`hub project rename` is admin-only), and the first upload's repository URL and subpath stay (a later upload only fills one that is still empty). It cannot change a default branch an admin pinned with `hub project set-default-branch`.
+  - Delete another machine's runs, or use the `admin/*` routes (admin tokens only).
+  - Put a run in the future. `startedAt` and `endedAt` must be ISO datetimes or `null` (otherwise `422 invalid_run`), and any uploader time (`createdAt`, `startedAt`, `endedAt`, a batch's `createdAt`) later than the hub's clock plus 5 minutes is replaced by the time the hub received the upload. Retention, ordering and the default branch therefore only ever see sane times; the skew itself is still recorded and shown in About this hub.
+  - Make the hub work without limit. Each token is limited, per minute, to 120 run uploads, 600 file uploads, 240 live updates and 600 `meta` calls (`blobs/check`, `runs/<id>/state` and `DELETE runs/<id>`), each with `429` and `Retry-After`. Files are at most 16 MB each, and unreferenced files are removed after 7 days. The scheduled re-key of a project (see [Projects that merge across machines](#projects-that-merge-across-machines)) runs at most once every 5 minutes, however many uploads arrive.
+- Treat a token like a password for the machine; give admin tokens to nobody who does not need them.
 - Token usage (`last used`) is kept in `<data>/hub/token-usage.json`, not in `tokens.json`, so a `hub token revoke` can never be undone by the running hub.
 - Tokens never appear in logs, in `GET` responses or in the UI.
 
@@ -427,6 +440,8 @@ tapocalypse hub status                              # connection, upload queue, 
 
 `hub login` needs the Tapocalypse server running (`bun start` or `tapocalypse service start`): it hands the address and the token to that server, which saves them next to **its own** config (the address in the config, the token in `hub-credentials.json`, mode 600) and then tests the connection, so it works however the server was started (another `TAPOCALYPSE_CONFIG`, a background service). It prints where the server keeps the token and exits non-zero with the hub's reason when the connection test fails. The address must be `https://` (plain `http://` is accepted only for `localhost`). Add `--header "Name: value"` (repeatable) for an access proxy that wants a static header, and `--screenshots original` to keep PNGs. Or in the UI: **Setup → Connect to a team hub** (address and token, plus optional proxy headers), which does the same.
 
+**Moving to a different hub.** The saved token and proxy headers belong to the hub they were entered for, so they never follow a changed address to another host. If the new address has a different origin (scheme, host or port) than the saved one, `hub login` and **Setup → Connect to a team hub** need the new hub's upload token in the same request (`400 token_required_for_new_hub` without it), and the saved proxy headers are dropped unless you send new ones; keeping a saved header value (`null` in the API) is refused across origins. A change inside one origin (another path, a trailing slash) keeps the token and headers as before, and so does the first connection. **With `TAPOCALYPSE_HUB_TOKEN` set in the environment, a move to a hub with a different origin through Setup or `hub login` is refused**, because the token that would travel is the environment's and the form cannot replace it: change `share.hub.url` in the config file and the environment variable (and `TAPOCALYPSE_HUB_HEADERS`, if you use it) yourself, then restart.
+
 Where things are kept:
 
 | What | Where |
@@ -435,7 +450,7 @@ Where things are kept:
 | Upload token and secret proxy headers | `hub-credentials.json` next to the config file, mode `600` (a file others can read is refused). `TAPOCALYPSE_HUB_TOKEN` and `TAPOCALYPSE_HUB_HEADERS` (a JSON object) in the environment override it |
 | Upload queue and what was uploaded | `<data dir>/hub-outbox.json` |
 
-Use the file, not shell exports, when Tapocalypse runs as a [service](guide.md#running-as-a-service): the launchd or systemd unit carries no secrets of your shell.
+Use the file, not shell exports, when Tapocalypse runs as a [service](guide.md#running-as-a-service): `tapocalypse service install` never writes `TAPOCALYPSE_HUB_TOKEN` or `TAPOCALYPSE_HUB_HEADERS` into the launchd or systemd unit (it warns on stderr that it skipped them, and the unit file is mode 0600), so the service finds the token only in `hub-credentials.json`. Agents never see these variables either: they are removed from every agent's environment.
 
 Then opt projects in. A project shares **only** when you turn it on:
 
@@ -463,15 +478,21 @@ If your proxy lets machines through with static headers (for example a service t
 - the raw `events.jsonl` (hundreds of megabytes of base64 images and the occasional access token);
 - the transcript (`transcript.html`), the agent session, `stderr.log`;
 - `tpc-mcp.json` / `mcp.json` (the run's progress token), the plugin folder, the persona file;
-- device serials and UDIDs (`deviceSerial`, `deviceLabel`); the install path is reduced to its file name.
+- device serials and UDIDs (`deviceSerial`, `deviceLabel`, the requested serial): the fields are left out, and the same ids, as a whole word, become `<device>` wherever they appear in text; the install path is reduced to its file name.
 
 **Redacted before upload** (counted per kind in `hub push --dry-run` and in the upload itself):
 
 - **Paths:** your home folder becomes `~`, other people's (`/Users/<name>`, `/home/<name>`) `~other`; the project's repo, the run's source folder and any git worktree become `<repo>`; Tapocalypse's data folder becomes `<data>`; temp folders become `<tmp>`.
 - **Your account name:** command output such as `ls -l` or `lsof` prints it; as a whole word it becomes `<user>`. Email addresses keep it, and generic accounts (`root`, `runner`, `ubuntu`, …) and names shorter than 3 characters are left alone.
-- **Secret shapes:** `Bearer …` tokens, JWTs, `sk-…`, `sk-ant-…`, `ghp_…` and other GitHub tokens, `AKIA…` AWS keys, `AIza…` Google keys, Slack `xox…` tokens, private-key blocks, and JSON fields named `token`, `secret`, `password`, `authorization` or `api_key`, become `«redacted:<kind>»`.
+- **Devices:** the run's device serial, the serial that was requested, and the AVD name or simulator UDID become `<device>` as whole words (ids shorter than 4 characters are left alone, so ordinary words are not mangled).
+- **Secret shapes**, which become `«redacted:<kind>»`:
+  - Tokens and keys: `Bearer …` tokens, JWTs, `sk-…`, `sk-ant-…`, Stripe, `ghp_…` and other GitHub tokens, GitLab, npm and Hugging Face tokens, `AKIA…` AWS keys, `AIza…` Google keys, Slack `xox…` tokens, and private-key blocks (PGP included).
+  - Headers: the whole value of an `Authorization` header, whatever its scheme (the header name stays), and of `Cookie` and `Set-Cookie` headers.
+  - Command lines: `--password`, `--passwd`, `--token`, `--secret`, `--api-key` and `--apikey` (also with a prefix such as `--db-password`), followed by `=` or a space and a value; `curl -u user:pass` (the user stays, the password goes; any `-u a:b` is treated alike, so `docker -u 1000:1000` is masked too); credentials in a URL, including an empty user (`redis://:pw@host`).
+  - Named values: `name=value`, `name: value` and JSON fields (also inside a JSON-encoded command string, with escaped quotes, however deeply encoded) whose name ends in a secret word: `token`, `secret`, `password`, `passwd`, `authorization`, `api_key`, `cookie`, `session`, `session_id`, `sid`, `credentials`, in snake_case, kebab-case, `camelCase` or `UPPER_CASE` (`accessToken`, `refreshToken`, `idToken`, `clientSecret`, `secretAccessKey`, `apiKey`, `AccountKey`, `SharedAccessKey`, `DB_PASSWORD`). The name must *end* in the word, so counters such as `maxTokens`, `inputTokens`, `tokenCount` and `tokensIn` stay. Because `session` and `authorization` count, a prose line such as `session: login flow` also loses its value.
+- **Share links and downloads use the same redactor.** A [shared single-file report](guide.md#sharing-a-report) (Copy share link, Download HTML report, `tapocalypse share`, `report --html`, `qa_share_report`) rewrites its title, summary, facts, check titles and notes, report text and screenshot names exactly like a hub upload, with the same paths, `<user>`, `<device>` and secret masks.
 
-Pattern redaction is a backstop, not a guarantee: an agent could write a secret in a shape that is not on the list into a check note or the report. Look at `hub pack` output for a run you are unsure about, and keep the hub's viewers to people who may see your QA evidence.
+Pattern redaction is a backstop, not a guarantee: an agent could write a secret in a shape that is not on the list into a check note or the report (not covered today: `--proxy-user`, cookies passed with `-b` unless their name is a secret word, `Digest` headers with quoted values, which are only partly masked, and non-string JSON values for secret fields), and a secret that is visible in a screenshot is not looked for. Look at `hub pack` output for a run you are unsure about, and keep the hub's viewers to people who may see your QA evidence.
 
 ### Projects that merge across machines
 
@@ -480,9 +501,12 @@ Two teammates call the same app `app` and `acme-shop`. The hub merges them by a 
 - A repository with **no git remote** cannot share until you give an explicit `hubKey` (the form suggests `local/<project id>`; such runs do not merge with a teammate's).
 - Two projects on one machine that derive the same key (one repo, two apps) need an explicit `hubKey` on the second, for example `github.com/acme/shop#com.acme.kiosk`.
 - The hub gives each key a project id (a slug of the last path segment) that never changes. **The first upload names the project** and no later upload from any machine renames it, so a backfill from another laptop cannot flip it; admins change it with `hub project rename <hubKey> "<name>"` (`hub project list` shows the ids and keys).
-- **The default branch** (used for baselines) follows the same stability rule: an explicitly set default branch beats one a laptop merely detected, and between equals the machine with the newest run decides, so backfilling an old run never changes it.
+- **The first writer also keeps the repository URL and subpath.** A later upload only fills one of them that is still empty; it never replaces it.
+- **The default branch** (used for baselines) follows the same stability rule: an explicitly set default branch beats one a laptop merely detected, and between equals the machine with the newest run decides, so backfilling an old run never changes it. An admin can pin it: `hub project set-default-branch <hubKey> <branch>` sets the branch and locks it, so no upload changes it until `hub project set-default-branch <hubKey> --clear` removes the branch and the lock and detection resumes.
+- **Removing a project.** `hub project remove <hubKey>` forgets a project that has no runs, stored or live; otherwise it fails with `409 project_not_empty` and names `hub unpublish --project <id>`, which removes the runs first. A later upload of the same key creates the project again, and counts against that token's 20 new keys per 24 hours.
+- **Admin commands** run on the hub, with its data directory: `hub token create|list|revoke`, `hub project list|rename|remove|set-default-branch`, `hub rekey` and `hub unpublish`. They work on the files directly, or, when the hub is running, through `POST /api/hub/v1/admin/*` with a temporary admin token the command creates and removes itself, so the running hub's memory never goes stale.
 
-Regression identity is **recomputed on the hub** across everybody's runs: a machine's own check keys travel with the run but are only used to translate its manual links and `was` hints. Backfilled runs that are older than ones already on the hub trigger a debounced re-key of the project (oldest first). After an upgrade that changes the key rules, force it with `hub rekey [--project <id>]`. Laptops keep their own local keys; compare and history on a laptop stay "my runs".
+Regression identity is **recomputed on the hub** across everybody's runs: a machine's own check keys travel with the run but are only used to translate its manual links and `was` hints. Backfilled runs that are older than ones already on the hub trigger a debounced re-key of the project (oldest first), at most one pass per project every 5 minutes: a change that arrives sooner waits, and one trailing pass then covers all of them. After an upgrade that changes the key rules, force it with `hub rekey [--project <id>]` (it runs at once, whatever the 5-minute spacing). Laptops keep their own local keys; compare and history on a laptop stay "my runs".
 
 ### Live progress
 
@@ -521,11 +545,11 @@ Everything is plain files under the data volume, and `run.json` is the source of
 
 ## Upgrades and version skew
 
-- **Upgrade the hub:** `git pull && docker compose -f compose.hub.yml up -d --build`. Data is additive and old `run.json` files keep loading. After an upgrade that changes how check keys are derived (the release notes say so), run `hub rekey`.
+- **Upgrade the hub:** `git pull && docker compose -f compose.hub.yml up -d --build`. `compose.hub.yml` and the `Dockerfile` pin their images by digest (the tag stays for reading), so an upgrade of nginx or oauth2-proxy is a change to that file, which Dependabot proposes. Data is additive and old `run.json` files keep loading. After an upgrade that changes how check keys are derived (the release notes say so), run `hub rekey`.
 - **Laptops and the hub may differ in version.** The upload protocol is versioned (`/api/hub/v1/`, `protocol` in every body). The hub answers `426 { "code": "protocol_unsupported", "minProtocol" }` when a laptop is too old; the laptop then **pauses its queue** (banner in Setup, a warning in `tapocalypse doctor`) with "update Tapocalypse on this machine" and resumes after you update and press *Test again* or run `tapocalypse hub status`.
 - A **newer laptop** can upload to an older hub: fields the hub does not know are dropped (the hub stores a whitelist of run, check, source and build fields), so nothing breaks, but a field added by a newer version only appears once the hub is updated and the run uploaded again.
 - Update laptops first when you raise the hub's minimum protocol on purpose; otherwise order does not matter.
-- **Clock skew:** if a laptop's clock differs from the hub's by more than 5 minutes, the hub records it and lists the machine in About this hub. Ordering of the machine's runs still follows its own timestamps.
+- **Clock skew:** if a laptop's clock differs from the hub's by more than 5 minutes, the hub records it and lists the machine in About this hub. Ordering of the machine's runs still follows its own timestamps, with one limit: a run time more than 5 minutes ahead of the hub's clock is replaced by the time the hub received the upload (so a laptop whose clock runs fast cannot place runs in the future, where retention and the default-branch rule would trust them).
 
 ## How big can a hub get
 
@@ -546,12 +570,17 @@ Start with `docker compose -f compose.hub.yml logs hub` and the hub doctor (`doc
 | **"This machine is too old for the hub"** (`protocol_unsupported`, 426) | Update Tapocalypse on the laptop; see [Upgrades](#upgrades-and-version-skew) |
 | Run chip says **"Not uploaded: id taken on hub"** (`id_conflict`, 409) | Another machine already uploaded a run with this id. The run stays local; nothing on the hub was overwritten. Re-run it to get a new id |
 | Upload fails with **413** / `too_large` | A file or run document is over the hub's limits (blob 16 MB, run document 2 MB), or the proxy's body limit is lower (nginx: `client_max_body_size 32m`). Raise `TAPOCALYPSE_HUB_MAX_BLOB_MB` and the proxy limit together |
-| Runs are on the hub but a **teammate's regressions look wrong** | Check keys are recomputed on the hub. After a backfill, wait for the debounced re-key (about 30 s), or run `hub rekey --project <id>` |
+| Runs are on the hub but a **teammate's regressions look wrong** | Check keys are recomputed on the hub. After a backfill, wait for the debounced re-key (about 30 s, and at most one pass per project every 5 minutes), or run `hub rekey --project <id>`, which runs at once |
 | A project's runs **do not merge** across machines | Different hub keys. Compare `tapocalypse hub status` on both machines; set the same `hubKey` on the project, or fix the git remote |
 | Nothing uploads and the queue is empty | The project is not shared, or the run is not finished. Check the project's *Share with team hub*, then `tapocalypse hub push --dry-run` |
 | After restoring a backup some runs are missing | Run `tapocalypse hub push --verify` on each laptop |
 | Requests fail with **500** `hub_state_corrupt` ("tokens.json is corrupt") | A hub state file (`tokens.json`, `projects.json`) no longer parses. The hub refuses to run on it instead of treating it as empty and overwriting it; a copy is kept next to it as `*.corrupt`. Restore it from a [backup](#backups) or repair the JSON, and the hub picks it up without a restart |
-| Upload fails with **429** | A token exceeded 120 run or 600 file uploads in a minute. The laptop backs off and retries on its own |
+| Upload fails with **429** `rate_limited` | A token exceeded its per-minute budget: 120 run uploads, 600 file uploads, 240 live updates or 600 `meta` calls (`blobs/check`, `runs/<id>/state`, `DELETE runs/<id>`). `Retry-After` says when to try again; the laptop backs off and retries on its own |
+| Upload fails with **429** `too_many_projects` | This token introduced more than 20 new hub keys in 24 hours (uploads and live updates together), usually a backfill of many projects at once, or hub keys that keep changing. Wait, or ask an admin to remove projects that should not exist (`hub project remove <hubKey>` frees a slot). Check `hub status` for the keys this machine shares |
+| Live progress is refused with **429** `too_many_live_runs` | 32 runs of one machine or 512 of the whole hub are live already. Nothing is lost: the run appears when it finishes, and runs already live keep updating |
+| `hub login` / Setup fails with **400** `token_required_for_new_hub` | The new address has a different origin than the saved one, so the saved token and proxy headers are not carried over. Enter the new hub's token (and proxy headers) in the same request. If `TAPOCALYPSE_HUB_TOKEN` is set in the environment, the form cannot replace it: change `share.hub.url` in the config file and the environment variable, then restart |
+| `hub project remove` fails with **409** `project_not_empty` | The project still has stored or live runs. Remove them first with `hub unpublish --project <id>` (live runs disappear after 30 minutes of silence), then try again |
+| A request fails with **400** `ambiguous_path` | The path contains `%2f`, `%2e`, `%5c` or a backslash. Something between the client and the hub is encoding or rewriting the path; send plain `/` and `.`, or fix the proxy rule |
 | Hub container is `unhealthy` | `docker compose logs hub`. Usual causes: the volume is not writable by the `bun` user (UID 1000), or no free disk |
 | **Hub memory keeps growing** | Look at the run count in About this hub; at 8,000 runs plan for the SQLite store and raise `mem_limit`. Lower `TAPOCALYPSE_HUB_RETENTION_DAYS` meanwhile |
 
@@ -571,6 +600,6 @@ Hub environment variables (all start with `TAPOCALYPSE_`, so `tapocalypse servic
 | `TAPOCALYPSE_HUB_RETENTION_MAX_RUNS` | Keep only the newest N runs |
 | `TAPOCALYPSE_HUB_MAX_BLOB_MB` | Largest accepted file, default `16` |
 
-Laptop environment variables: `TAPOCALYPSE_HUB_TOKEN` (upload token; wins over the credentials file).
+Laptop environment variables: `TAPOCALYPSE_HUB_TOKEN` (upload token; wins over the credentials file). While it is set, `hub login` and Setup refuse a move to a hub with a different origin ([Connect a laptop](#connect-a-laptop)). It is never copied into a service unit and never reaches an agent.
 
 Routes and wire shapes: [HTTP API](api.md#team-hub). Laptop settings: [Configuration](configuration.md#team-hub-sharing).

@@ -4,7 +4,7 @@ import { marked } from "marked";
 import sanitizeHtml from "sanitize-html";
 import { HttpError } from "../config";
 import type { Project } from "../projects/registry";
-import { LEGACY_REPORTS_DIR, reportFile, reportLocation } from "../runs/artefacts";
+import { artefactType, LEGACY_REPORTS_DIR, reportFile, reportLocation } from "../runs/artefacts";
 import { getRun, listRuns } from "../runs/store";
 import type { Verdict } from "../runs/types";
 
@@ -167,8 +167,13 @@ function reportRunId(project: Project, name: string): string | null {
   return getRun(id)?.projectId === project.id ? id : null;
 }
 
-/** Legacy reports folder: runs from before artefacts moved to the data dir wrote it into the repo. */
-const reportsRoot = (project: Project) => path.join(project.repoPath, project.reportsDir ?? LEGACY_REPORTS_DIR);
+/**
+ * Legacy reports folder (`<repo>/<reportsDir|qa>`): runs from before artefacts moved to the data dir wrote it into the repo.
+ * Null when the project has no repository or the folder resolves (symlinks followed) outside it: such a folder is not served,
+ * listed or rendered, so a `qa` link in a cloned repo cannot expose another directory.
+ */
+export const legacyReportsRoot = (project: Project): string | null =>
+  project.repoPath ? resolveUnder(project.repoPath, project.reportsDir ?? LEGACY_REPORTS_DIR) : null;
 
 const HEADING_PROBE_BYTES = 4096;
 
@@ -217,8 +222,8 @@ function dataReports(project: Project): (ReportEntry & { ms: number })[] {
 }
 
 function legacyReports(project: Project): (ReportEntry & { ms: number })[] {
-  if (!project.repoPath) return [];
-  const dir = reportsRoot(project);
+  const dir = legacyReportsRoot(project);
+  if (!dir) return [];
   let names: string[];
   try {
     names = fs.readdirSync(dir);
@@ -332,9 +337,9 @@ export function renderReport(project: Project, name: string): RenderedReport {
     file = reportFile(run, project);
   } else {
     if (!REPORT_NAME_RE.test(name)) throw notFound();
-    // A hub project has no repository; an empty repoPath must not resolve against the server's working directory.
-    if (!project.repoPath) throw notFound();
-    file = resolveUnder(reportsRoot(project), name);
+    const root = legacyReportsRoot(project);
+    // A hub project has no repository, and a reports folder that leaves the repo is not a reports folder.
+    file = root ? resolveUnder(root, name) : null;
   }
   if (!file) throw notFound();
   let md: string;
@@ -355,11 +360,12 @@ export function renderReport(project: Project, name: string): RenderedReport {
 /** Absolute path of a servable file under the project's reports dir, or null. */
 export function reportFilePath(project: Project, rel: string): string | null {
   if (!FILE_EXTENSIONS[path.extname(rel).toLowerCase()]) return null;
-  if (!project.repoPath) return null;
-  const file = resolveUnder(reportsRoot(project), rel);
+  const root = legacyReportsRoot(project);
+  const file = root ? resolveUnder(root, rel) : null;
   if (!file) return null;
   try {
-    return fs.statSync(file).isFile() ? file : null;
+    // `file` is symlink-resolved: its own extension (and image bytes) decide, not the name that was asked for.
+    return fs.statSync(file).isFile() && artefactType(file) ? file : null;
   } catch {
     return null;
   }

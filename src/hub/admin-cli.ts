@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { parseArgs } from "node:util";
 import { config, HttpError } from "../config";
 import { rekeyAll, rekeyProject, unpublishRuns } from "./ingest";
-import { hubProjectById, listHubProjects, renameHubProject } from "./projects";
+import { hubProjectById, listHubProjects, removeHubProject, renameHubProject, setHubDefaultBranch } from "./projects";
 import { createToken, listTokens, removeToken, revokeToken } from "./tokens";
 
 export interface AdminIo {
@@ -21,6 +21,9 @@ export const HUB_ADMIN_USAGE = `Hub administration (run on the hub: \`docker com
   tapocalypse hub rekey [--project <id>]          Recompute regression keys over the merged history, oldest first.
   tapocalypse hub project list                    Hub projects: id, hub key, name.
   tapocalypse hub project rename <hubKey> <name>  Pin a project's display name.
+  tapocalypse hub project remove <hubKey>         Forget a project that has no runs (stored or live).
+  tapocalypse hub project set-default-branch <hubKey> <branch>|--clear
+                                                  Pin the default branch (uploads no longer change it); --clear unpins it.
   tapocalypse hub unpublish <runId>               Remove one uploaded run (alias: hub runs rm <runId>).
   tapocalypse hub unpublish --project <id> [--machine <name>]
   tapocalypse hub unpublish --machine <name>      Remove every run of a project and/or machine.`;
@@ -104,7 +107,25 @@ async function project(args: string[], io: AdminIo): Promise<number> {
     io.out(`${renamed.hubKey} is now called ${renamed.name}`);
     return EXIT.OK;
   }
-  throw new Usage('usage: tapocalypse hub project list | rename <hubKey> "<name>"');
+  if (action === "remove") {
+    if (rest.length !== 1) throw new Usage("usage: tapocalypse hub project remove <hubKey>");
+    const hubKey = rest[0]!;
+    if ((await viaRunningHub<{ removed: string }>("/api/hub/v1/admin/project-remove", { hubKey })) === null) removeHubProject(hubKey);
+    io.out(`removed project ${hubKey}`);
+    return EXIT.OK;
+  }
+  if (action === "set-default-branch") {
+    const { values, positionals } = parseArgs({ args: rest, options: { clear: { type: "boolean" } }, allowPositionals: true, strict: true });
+    const [hubKey, branch] = positionals;
+    if (!hubKey || positionals.length > 2 || (values.clear === true) === (branch !== undefined)) {
+      throw new Usage("usage: tapocalypse hub project set-default-branch <hubKey> <branch> | <hubKey> --clear");
+    }
+    const next = branch ?? null;
+    const result = (await viaRunningHub<{ defaultBranch: string | null }>("/api/hub/v1/admin/project-default-branch", { hubKey, branch: next })) ?? { defaultBranch: setHubDefaultBranch(hubKey, next).defaultBranch };
+    io.out(result.defaultBranch ? `${hubKey} default branch is now ${result.defaultBranch} (pinned)` : `${hubKey} default branch cleared; the next upload detects one again`);
+    return EXIT.OK;
+  }
+  throw new Usage('usage: tapocalypse hub project list | rename <hubKey> "<name>" | remove <hubKey> | set-default-branch <hubKey> <branch>|--clear');
 }
 
 async function unpublish(args: string[], io: AdminIo): Promise<number> {

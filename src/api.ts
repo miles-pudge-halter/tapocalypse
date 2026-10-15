@@ -50,7 +50,7 @@ import { suggestProjectFolders } from "./projects/suggest";
 import { relink, unlink } from "./regression/index";
 import { listReports, renderReport, reportFilePath } from "./reports/reports";
 import { CSP as STANDALONE_CSP, renderStandaloneReport, shareRun, shareStatus } from "./reports/share";
-import { exportRun, reportFile, screenshotFile } from "./runs/artefacts";
+import { artefactResponse, exportRun, reportFile, screenshotFile } from "./runs/artefacts";
 import { readActivity, listRuns, runDir } from "./runs/store";
 import type { Activity, Platform, Run } from "./runs/types";
 import { computeStats } from "./stats";
@@ -392,11 +392,27 @@ async function startBoot(platform: Platform, target: string): Promise<void> {
   void boot.catch((e: unknown) => console.error(`boot ${target} failed:`, e instanceof Error ? e.message : e));
 }
 
+/** An encoded slash, dot or backslash (or a raw backslash): spellings that proxies and this server may read as different paths. */
+const AMBIGUOUS_PATH_RE = /%2f|%2e|%5c|\\/i;
+
+/**
+ * Hub only: refuses a request whose path, exactly as it arrived in `req.url` (before `new URL` / `decodeURIComponent` /
+ * the per-segment routing see it), contains such a spelling, so the access proxy and the hub can never disagree about which
+ * file or route a path names. The query string is not part of the path.
+ */
+function refuseAmbiguousPath(req: Request): void {
+  const afterScheme = req.url.slice(req.url.indexOf("//") + 2);
+  const start = afterScheme.indexOf("/");
+  const raw = start < 0 ? "" : afterScheme.slice(start).split(/[?#]/, 1)[0]!;
+  if (AMBIGUOUS_PATH_RE.test(raw)) throw new HttpError(400, "path contains an encoded slash, dot or backslash", "ambiguous_path");
+}
+
 async function route(req: Request, url: URL): Promise<Response> {
   const { pathname } = url;
   const method = req.method;
   const parts = pathname.split("/").filter(Boolean).map(decodeURIComponent);
   guardRequest(req, parts);
+  if (isHub()) refuseAmbiguousPath(req);
 
   if (method === "GET" && parts.length === 2 && parts[0] === "api" && parts[1] === "health") return json(healthView(isHub() ? "hub" : "local"));
   if (isHub()) {
@@ -418,11 +434,7 @@ async function route(req: Request, url: URL): Promise<Response> {
   }
 
   if (method === "GET" && parts[0] === "files" && parts.length >= 3) {
-    const p = project(parts[1]);
-    const abs = reportFilePath(p, parts.slice(2).join("/"));
-    const file = abs ? Bun.file(abs) : null;
-    if (!file || !(await file.exists())) throw new HttpError(404, "not found");
-    return new Response(file, { headers: NOSNIFF });
+    return artefactResponse(reportFilePath(project(parts[1]), parts.slice(2).join("/")));
   }
 
   if (parts[0] !== "api") throw new HttpError(404, "not found");
@@ -476,9 +488,10 @@ async function route(req: Request, url: URL): Promise<Response> {
       project(parts[2]);
       return json(flakyView(parts[2], parseInput(FlakyQuery, query(url))));
     }
-    if (parts[3] === "checks" && parts[5] === "history" && parts.length === 6 && method === "GET") {
+    if (parts[3] === "checks" && parts.length >= 6 && parts.at(-1) === "history" && method === "GET") {
       project(parts[2]);
-      return json(historyView({ projectId: parts[2], checkKey: parts[4] }, parseInput(HistoryQuery, query(url))));
+      // A check key may carry slashes, sent unencoded: everything between `checks` and `history` is the key.
+      return json(historyView({ projectId: parts[2], checkKey: parts.slice(4, -1).join("/") }, parseInput(HistoryQuery, query(url))));
     }
   }
 
@@ -729,15 +742,12 @@ async function route(req: Request, url: URL): Promise<Response> {
         run(id);
         return json(baselineCandidates(id, parseInput(CandidatesQuery, query(url))));
       }
-      if (parts.length === 6 && action === "checks" && parts[5] === "history" && method === "GET") {
-        return json(historyView({ runId: id, checkId: parts[4] }, parseInput(HistoryQuery, query(url))));
+      if (parts.length >= 6 && action === "checks" && parts.at(-1) === "history" && method === "GET") {
+        return json(historyView({ runId: id, checkId: parts.slice(4, -1).join("/") }, parseInput(HistoryQuery, query(url))));
       }
       if (parts.length >= 5 && action === "files" && method === "GET") {
         const r = run(id);
-        const abs = screenshotFile(r, getProject(r.projectId) ?? null, parts.slice(4).join("/"));
-        const file = abs ? Bun.file(abs) : null;
-        if (!file || !(await file.exists())) throw new HttpError(404, "not found");
-        return new Response(file, { headers: NOSNIFF });
+        return artefactResponse(screenshotFile(r, getProject(r.projectId) ?? null, parts.slice(4).join("/")));
       }
     }
   }

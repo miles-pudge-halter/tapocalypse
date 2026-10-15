@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { leaseKey, LeaseStore } from "../src/devices/leases";
+import { MOBILE_MCP_VERSION } from "../src/harness/types";
 import {
   DROPPED_TOOLS,
   GATED_PREFIX_DESCRIPTION,
@@ -10,6 +11,7 @@ import {
   type GatewayClient,
   type GatewayDeps,
   gateSchema,
+  mobileMcpSpawn,
   rewriteArgs,
   spawnMobileMcp,
   stopOnLeaseEnd,
@@ -736,6 +738,72 @@ describe("spawnMobileMcp (MOBILE_MCP_BIN stand-in)", () => {
     } finally {
       if (before === undefined) delete process.env.MOBILE_MCP_BIN;
       else process.env.MOBILE_MCP_BIN = before;
+    }
+  }, 30_000);
+});
+
+describe("mobile-mcp child launch", () => {
+  const MOBILE_MCP_BIN = process.env.MOBILE_MCP_BIN;
+  const withoutBin = <T>(fn: () => T): T => {
+    delete process.env.MOBILE_MCP_BIN;
+    try {
+      return fn();
+    } finally {
+      if (MOBILE_MCP_BIN !== undefined) process.env.MOBILE_MCP_BIN = MOBILE_MCP_BIN;
+    }
+  };
+
+  test("the npx spec pins an exact mobile-mcp version, never a moving tag", () => {
+    expect(MOBILE_MCP_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
+    const spec = withoutBin(() => mobileMcpSpawn("/work", { PATH: "/bin" }));
+    expect(spec.command).toBe("npx");
+    expect(spec.args).toEqual(["-y", `@mobilenext/mobile-mcp@${MOBILE_MCP_VERSION}`]);
+    expect(spec.cwd).toBe("/work");
+  });
+
+  test("MOBILE_MCP_BIN still replaces the whole command", () => {
+    process.env.MOBILE_MCP_BIN = "/opt/mcp/bin --flag";
+    try {
+      expect(mobileMcpSpawn("/work", { PATH: "/bin" })).toMatchObject({ command: "/opt/mcp/bin", args: ["--flag"] });
+    } finally {
+      if (MOBILE_MCP_BIN === undefined) delete process.env.MOBILE_MCP_BIN;
+      else process.env.MOBILE_MCP_BIN = MOBILE_MCP_BIN;
+    }
+  });
+
+  test("the child's environment has the hub token, proxy headers and S3 keys stripped, and keeps what adb/npx need", () => {
+    const env = {
+      PATH: "/bin",
+      ANDROID_HOME: "/sdk",
+      TAPOCALYPSE_HUB_TOKEN: "tpu_x",
+      TAPOCALYPSE_HUB_HEADERS: "{}",
+      S3_ACCESS_KEY_ID: "id",
+      S3_SECRET_ACCESS_KEY: "secret",
+      S3_SESSION_TOKEN: "tok",
+      GONE: undefined,
+    };
+    expect(mobileMcpSpawn("/work", env).env).toEqual({ PATH: "/bin", ANDROID_HOME: "/sdk" });
+  });
+
+  test("a real child does not inherit the server's secrets", async () => {
+    const FAKE = path.resolve(import.meta.dir, "support/fake-mobile-mcp.ts");
+    const saved = { bin: process.env.MOBILE_MCP_BIN, token: process.env.TAPOCALYPSE_HUB_TOKEN, s3: process.env.S3_SECRET_ACCESS_KEY };
+    process.env.MOBILE_MCP_BIN = `${process.execPath} ${FAKE} --dump-env`;
+    process.env.TAPOCALYPSE_HUB_TOKEN = "tpu_secret";
+    process.env.S3_SECRET_ACCESS_KEY = "s3-secret";
+    try {
+      const gw = new Gateway({ spawnClient: spawnMobileMcp });
+      const dumped = await gw.call("k", "Pixel_8", undefined, "mobile_dump_env", {});
+      const names: string[] = JSON.parse(text(dumped));
+      expect(names).toContain("PATH");
+      expect(names).not.toContain("TAPOCALYPSE_HUB_TOKEN");
+      expect(names).not.toContain("S3_SECRET_ACCESS_KEY");
+      await gw.stopAll();
+    } finally {
+      for (const [name, value] of [["MOBILE_MCP_BIN", saved.bin], ["TAPOCALYPSE_HUB_TOKEN", saved.token], ["S3_SECRET_ACCESS_KEY", saved.s3]] as const) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
     }
   }, 30_000);
 });

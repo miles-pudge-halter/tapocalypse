@@ -174,6 +174,7 @@ function rig(
     runDir,
     persona: "You are a QA agent.",
     personaFile,
+    device: { serial: "emulator-5554", platform: "android" },
     model: null,
     effort: null,
     mcpServers: [progressServer, mobileServer],
@@ -511,12 +512,122 @@ describe("claude spawn configuration", () => {
     for (const flag of ["--model", "--effort", "--max-turns", "--max-budget-usd", "--allowedTools"]) expect(argv).not.toContain(flag);
   });
 
-  test("permissions: allowlist swaps bypass for dontAsk plus an allowlist of the mounted servers, adb/simctl and file tools", () => {
-    const argv = rig({ settings: { permissions: "allowlist" } }).spawned[0].cmd;
-    expect(argv).not.toContain("bypassPermissions");
-    expect(argv.slice(argv.indexOf("--permission-mode"), argv.indexOf("--permission-mode") + 2)).toEqual(["--permission-mode", "dontAsk"]);
-    const at = argv.indexOf("--allowedTools");
-    expect(argv.slice(at + 1, at + 8)).toEqual(["mcp__tpc__*", "mcp__mobile_mcp__*", "Bash(adb *)", "Bash(xcrun simctl *)", "Read", "Write", "Edit"]);
+  // Claude Code permission rules: https://code.claude.com/docs/en/permissions#permission-rule-syntax
+  const flagValues = (argv: string[], flag: string): string[] => {
+    const at = argv.indexOf(flag);
+    if (at < 0) return [];
+    const end = argv.findIndex((a, i) => i > at && a.startsWith("--"));
+    return argv.slice(at + 1, end < 0 ? undefined : end);
+  };
+  /** `//` + path without its leading slash is how a rule anchors at the filesystem root. */
+  const absRule = (tool: string, dir: string): string => `${tool}(/${dir}/**)`;
+
+  describe("permissions: allowlist", () => {
+    const allow = (over: Partial<SpawnOptions> = {}) => {
+      const r = rig({ settings: { permissions: "allowlist" }, ...over });
+      const argv = r.spawned[0].cmd;
+      return { r, argv, allowed: flagValues(argv, "--allowedTools"), denied: flagValues(argv, "--disallowedTools") };
+    };
+
+    test("swaps bypass for dontAsk and allows the mounted MCP servers", () => {
+      const { argv, allowed } = allow();
+      expect(argv).not.toContain("bypassPermissions");
+      expect(argv.slice(argv.indexOf("--permission-mode"), argv.indexOf("--permission-mode") + 2)).toEqual(["--permission-mode", "dontAsk"]);
+      expect(allowed.slice(0, 2)).toEqual(["mcp__tpc__*", "mcp__mobile_mcp__*"]);
+    });
+
+    test("every file rule is scoped to an absolute path: no bare Read/Write/Edit, no Write path rules (Claude only consults Read and Edit rules)", () => {
+      const { allowed } = allow();
+      for (const bare of ["Read", "Write", "Edit", "Bash", "Bash(*)"]) expect(allowed).not.toContain(bare);
+      expect(allowed.filter((a) => a.startsWith("Write"))).toEqual([]);
+      for (const rule of allowed.filter((a) => /^(Read|Edit)/.test(a))) expect(rule).toMatch(/^(Read|Edit)\(\/\/[^*]+\/\*\*\)$/);
+    });
+
+    test("reads only the repo, the run folder and the system temp dir; edits and writes only the run folder", () => {
+      const { r, allowed } = allow();
+      const reads = allowed.filter((a) => a.startsWith("Read("));
+      const edits = allowed.filter((a) => a.startsWith("Edit("));
+      expect(reads).toContain(absRule("Read", "/work/app"));
+      expect(reads).toContain(absRule("Read", r.runDir));
+      expect(reads).toContain(absRule("Read", os.tmpdir()));
+      expect(reads).toHaveLength(new Set(reads).size);
+      expect(edits).toContain(absRule("Edit", r.runDir));
+      for (const edit of edits) expect([r.runDir, fs.realpathSync(r.runDir)].some((dir) => edit === absRule("Edit", dir))).toBe(true);
+      expect(edits).not.toContain(absRule("Edit", "/work/app"));
+    });
+
+    test("a symlinked repo or run folder is allowed under its real path as well", () => {
+      const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "tpc-link-")));
+      tmpDirs.push(root);
+      fs.mkdirSync(path.join(root, "real"));
+      fs.symlinkSync(path.join(root, "real"), path.join(root, "link"));
+      const { allowed } = allow({ cwd: path.join(root, "link") });
+      expect(allowed).toContain(absRule("Read", path.join(root, "link")));
+      expect(allowed).toContain(absRule("Read", path.join(root, "real")));
+    });
+
+    test("glob characters in a path are escaped so the rule cannot widen", () => {
+      const { allowed } = allow({ cwd: "/work/app[1]*" });
+      expect(allowed).toContain("Read(//work/app\\[1\\]\\*/**)");
+    });
+
+    test("Android: Bash is an enumerated list of `adb -s <this serial>` subcommands, never a blanket `adb -s X *`; push, pull, install and uninstall stay denied", () => {
+      const { allowed, denied } = allow();
+      const bash = allowed.filter((a) => a.startsWith("Bash"));
+      expect(bash).toEqual([
+        "Bash(adb -s emulator-5554 shell *)",
+        "Bash(adb -s emulator-5554 exec-out *)",
+        "Bash(adb -s emulator-5554 logcat *)",
+        "Bash(adb -s emulator-5554 get-state)",
+        "Bash(adb -s emulator-5554 wait-for-device)",
+      ]);
+      // A global option in front of the subcommand (`adb -s X -P 5037 push`) matches none of these.
+      for (const blanket of ["Bash(adb -s emulator-5554 *)", "Bash(adb *)"]) expect(bash).not.toContain(blanket);
+      for (const sub of ["bugreport", "backup", "sideload", "forward", "reverse", "sync", "tcpip", "root"]) expect(bash.some((b) => b.includes(` ${sub}`))).toBe(false);
+      for (const sub of ["push", "pull", "install", "install-multiple", "uninstall"]) expect(denied).toContain(`Bash(adb -s emulator-5554 ${sub} *)`);
+      expect(denied).toContain("Bash(adb -s emulator-5554 shell pm install *)");
+      expect(denied).toContain("Bash(adb -s emulator-5554 shell pm uninstall *)");
+      expect(denied.slice(0, 2)).toEqual(["Agent", "AskUserQuestion"]);
+      expect(allowed.some((a) => a.startsWith("Bash(xcrun"))).toBe(false);
+    });
+
+    test("iOS: Bash is simctl on this UDID only; `spawn` is limited to `log`, screenshots go only into the run folder, install and uninstall are denied", () => {
+      const udid = "A1B2C3D4-0000-4000-8000-ABCDEF012345";
+      const { r, allowed, denied } = allow({ device: { serial: udid, platform: "ios" } });
+      const bash = allowed.filter((a) => a.startsWith("Bash"));
+      for (const sub of ["launch", "terminate", "openurl", "privacy", "get_app_container"]) expect(bash).toContain(`Bash(xcrun simctl ${sub} ${udid} *)`);
+      expect(bash).toContain(`Bash(xcrun simctl spawn ${udid} log *)`);
+      expect(bash).not.toContain(`Bash(xcrun simctl spawn ${udid} *)`);
+      expect(bash).toContain("Bash(xcrun simctl list *)");
+      expect(bash).toContain(`Bash(xcrun simctl io ${udid} screenshot ${r.runDir}/*)`);
+      expect(bash.filter((b) => b.includes("screenshot") && !b.includes(r.runDir))).toEqual([]);
+      expect(bash.some((b) => b.startsWith("Bash(adb") || b === "Bash(xcrun simctl *)")).toBe(false);
+      for (const sub of ["install", "uninstall"]) expect(denied).toContain(`Bash(xcrun simctl ${sub} *)`);
+      expect(denied).toContain("Bash(xcrun simctl io * screenshot *..*)");
+    });
+
+    test("iOS runs may read the user's simulator crash reports (the persona prescribes them); Android runs may not", () => {
+      const crashDir = path.join(os.homedir(), "Library", "Logs", "DiagnosticReports");
+      const ios = allow({ device: { serial: "A1B2C3D4-0000-4000-8000-ABCDEF012345", platform: "ios" } });
+      expect(ios.allowed).toContain(absRule("Read", crashDir));
+      expect(ios.allowed.filter((a) => a.startsWith("Edit("))).not.toContain(absRule("Edit", crashDir));
+      expect(allow().allowed).not.toContain(absRule("Read", crashDir));
+    });
+
+    test("a device id that would change the meaning of a rule never starts claude", () => {
+      for (const serial of ["emulator-5554 *", "x) Bash(*", "emu*", "a b", "../x", ""]) {
+        expect(rig({ settings: { permissions: "allowlist" }, device: { serial, platform: "android" } }).spawned).toEqual([]);
+      }
+      for (const serial of ["emulator-5554", "192.168.1.20:5555", "R58M12ABCDE", "A1B2C3D4-0000-4000-8000-ABCDEF012345"]) {
+        expect(rig({ settings: { permissions: "allowlist" }, device: { serial, platform: "android" } }).spawned).toHaveLength(1);
+      }
+    });
+
+    test("bypass mode carries no allow or deny rules beyond the always-denied Agent and AskUserQuestion", () => {
+      const argv = rig().spawned[0].cmd;
+      expect(flagValues(argv, "--disallowedTools")).toEqual(["Agent", "AskUserQuestion"]);
+      expect(argv).not.toContain("--allowedTools");
+    });
   });
 
   test("permissions: allowlist lets the agent write into the run folder (screenshots live there); bypass adds no directories", () => {

@@ -45,6 +45,8 @@ export interface HubSyncOptions {
   liveThrottleMs: number;
   /** While a run is in progress its latest state is resent this often, so the hub keeps it alive. */
   liveHeartbeatMs: number;
+  /** Waits `ms`; verify and unpublish use it to sit out a 429. A test seam. */
+  sleep: (ms: number) => Promise<void>;
   /** Starts a timer (unref'd) and returns its canceller; a test seam. */
   liveTimers: (fn: () => void, ms: number) => () => void;
 }
@@ -148,6 +150,7 @@ function defaultOptions(): HubSyncOptions {
     pausePollMs: 30_000,
     liveThrottleMs: 3000,
     liveHeartbeatMs: LIVE_HEARTBEAT_MS,
+    sleep: (ms) => Bun.sleep(ms),
     liveTimers: (fn, ms) => {
       const timer = setTimeout(fn, ms);
       timer.unref();
@@ -240,6 +243,17 @@ async function putMissingBlobs(call: HubCall, host: string, hashes: string[], bl
     const res = await call(`/api/hub/v1/blobs/${hash}`, { method: "PUT", headers: { "content-type": blob.type, ...(gzip ? { "content-encoding": "gzip" } : {}) }, body: gzip ? Bun.gzipSync(blob.bytes) : blob.bytes });
     if (!res.ok) throw await failureOf(res, host);
   }
+}
+
+/** How often one request is retried after a 429, and the bounds of the wait (a missing or absurd Retry-After is clamped into them). */
+const RATE_LIMIT_RETRIES = 5;
+const RETRY_AFTER_MIN_MS = 1000;
+const RETRY_AFTER_MAX_MS = 60_000;
+
+/** Retry-After in seconds (a date is not used by the hub), as a bounded wait. */
+function retryAfterMs(res: Response): number {
+  const seconds = Number(res.headers.get("retry-after"));
+  return Math.min(RETRY_AFTER_MAX_MS, Math.max(RETRY_AFTER_MIN_MS, Number.isFinite(seconds) ? seconds * 1000 : RETRY_AFTER_MIN_MS));
 }
 
 /** An authenticated caller for a hub: bearer token plus the proxy headers; redirects are not followed (a login redirect is an answer). */
@@ -748,6 +762,20 @@ export class HubSyncWorker {
     return queued;
   }
 
+  /**
+   * A call to a per-run route (`state`, `DELETE`) that sits out the hub's per-token rate limit: on a 429 it waits for
+   * Retry-After and asks again, so a loop over hundreds of runs completes instead of dying midway. After
+   * `RATE_LIMIT_RETRIES` waits in a row the last 429 is returned for the caller to fail on.
+   */
+  private async patiently(call: HubCall, route: string, init: RequestInit): Promise<Response> {
+    let res = await call(route, init);
+    for (let waited = 0; res.status === 429 && waited < RATE_LIMIT_RETRIES; waited++) {
+      await this.opts.sleep(retryAfterMs(res));
+      res = await call(route, init);
+    }
+    return res;
+  }
+
   /** Asks the hub (`GET …/state`) which uploaded runs it still holds in the version recorded here, and re-queues the rest (after a hub restore from backup). */
   async verify(sel: { projectId?: string; since?: string } = {}): Promise<{ checked: number; requeued: number }> {
     const conn = this.connect();
@@ -758,7 +786,7 @@ export class HubSyncWorker {
       const run = this.opts.getRun(id);
       if (!run || (sel.projectId !== undefined && run.projectId !== sel.projectId) || (sel.since !== undefined && run.createdAt < sel.since)) continue;
       checked++;
-      const res = await call(`/api/hub/v1/runs/${id}/state`, { method: "GET" });
+      const res = await this.patiently(call, `/api/hub/v1/runs/${id}/state`, { method: "GET" });
       if (res.status === 404) {
         delete this.state.uploaded[id];
         // Gone because of the hub's retention is not lost: sending it again would only have it deleted again.
@@ -779,7 +807,7 @@ export class HubSyncWorker {
   /** Deletes this machine's copy of a run on the hub (an unknown copy counts as done) and forgets that it was uploaded. */
   async unpublish(runId: string): Promise<void> {
     const { call, host } = this.connect();
-    const res = await call(`/api/hub/v1/runs/${runId}`, { method: "DELETE" });
+    const res = await this.patiently(call, `/api/hub/v1/runs/${runId}`, { method: "DELETE" });
     if (!res.ok && res.status !== 404) throw await failureOf(res, host);
     delete this.state.uploaded[runId];
     this.forget(runId);

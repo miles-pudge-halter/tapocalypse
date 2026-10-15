@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { buildReport, type DoctorCheck, type DoctorEnv } from "../src/doctor";
 import { getHarness } from "../src/harness";
-import { HARNESS_IDS, type HarnessId } from "../src/harness/types";
+import { HARNESS_IDS, type HarnessId, MOBILE_MCP_VERSION } from "../src/harness/types";
 
 const MISSING = "/nonexistent/bin";
 
@@ -174,6 +174,16 @@ describe("omp sign-in", () => {
     const { checks } = await buildReport(envWith({ harnessBins: { omp: MISSING, claude: "claude", codex: "codex" }, run }));
     expect(byId(checks, "omp-auth").status).toBe("skip");
     expect(calls.some((c) => c[1] === "models")).toBe(false);
+  });
+});
+
+describe("node check", () => {
+  test("the fix names the pinned mobile-mcp version Tapocalypse really starts, not a moving tag", async () => {
+    const { checks } = await buildReport(envWith({ run: fakeRun(["npx"]) }));
+    const node = byId(checks, "node");
+    expect(node.status).toBe("error");
+    expect(node.fix).toContain(`@mobilenext/mobile-mcp@${MOBILE_MCP_VERSION}`);
+    expect(node.fix).not.toContain("@latest");
   });
 });
 

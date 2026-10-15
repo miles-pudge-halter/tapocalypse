@@ -1,7 +1,7 @@
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import path from "node:path";
-import { DATA_DIR } from "../config";
+import { DATA_DIR, ensurePrivateDir } from "../config";
 import { getHarness } from "../harness";
 import { legacyProgressActivity } from "../harness/omp/activity";
 import { normalizeUsage } from "../harness/omp/usage";
@@ -9,6 +9,7 @@ import { HarnessIdSchema, type ReplayContext } from "../harness/types";
 import type { Activity, CheckStatus, Run } from "./types";
 
 const RUNS_DIR = path.join(DATA_DIR, "runs");
+ensurePrivateDir(RUNS_DIR);
 
 export function runDir(id: string): string {
   return path.join(RUNS_DIR, id);

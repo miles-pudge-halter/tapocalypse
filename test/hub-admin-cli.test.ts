@@ -4,10 +4,11 @@ import path from "node:path";
 import { fetchHandler } from "../src/api";
 import { config } from "../src/config";
 import { hubAdminCommand } from "../src/hub/admin-cli";
-import { ingestRun, type Uploader } from "../src/hub/ingest";
+import { ingestLiveRun, ingestRun, type Uploader } from "../src/hub/ingest";
+import { deleteLiveRun } from "../src/hub/live";
 import { hubDir, setHubMode } from "../src/hub/mode";
 import { hubProjectByKey, installHubProjects } from "../src/hub/projects";
-import { HUB_PROTOCOL, type RunUploadBodyT } from "../src/hub/protocol";
+import { HUB_PROTOCOL, type LiveRunBodyT, type RunUploadBodyT } from "../src/hub/protocol";
 import { listTokens, revokeToken, verifyToken } from "../src/hub/tokens";
 import { setProjectSource } from "../src/projects/registry";
 import { deleteRun, getRun } from "../src/runs/store";
@@ -97,6 +98,69 @@ describe("hub project rename", () => {
     expect(hubProjectByKey(hubKey)?.name).toBe("Acme Storefront");
     expect((await run("project", "rename", "github.com/acme/unknown", "x")).code).toBe(2);
     expect((await run("project", "rename", hubKey)).code).toBe(3);
+  });
+});
+
+describe("hub project remove", () => {
+  test("removes a project with no runs, refuses one that still has stored or live runs, and an unknown one", async () => {
+    const hubKey = `github.com/acme/rm-${tag}`;
+    const id = upload(hubKey);
+    const refused = await run("project", "remove", hubKey);
+    expect(refused.code).toBe(2);
+    expect(refused.err.join(" ")).toMatch(/still has 1 run/);
+    expect(hubProjectByKey(hubKey)).toBeDefined();
+
+    expect((await run("unpublish", id)).code).toBe(0);
+    expect((await run("project", "remove", hubKey)).code).toBe(0);
+    expect(hubProjectByKey(hubKey)).toBeUndefined();
+    expect((await run("project", "remove", hubKey)).code).toBe(2);
+    expect((await run("project", "remove")).code).toBe(3);
+    expect((await run("project", "remove", hubKey, "extra")).code).toBe(3);
+  });
+
+  test("a project with a live run is not removed", async () => {
+    const hubKey = `github.com/acme/rm-live-${tag}`;
+    const liveId = `20260401-000099-${tag}-live`;
+    const stored = upload(hubKey);
+    const body = { protocol: HUB_PROTOCOL, clientVersion: "0.1.0", sentAt: new Date().toISOString(), project: { hubKey, name: "Acme Shop", remoteUrl: null, subpath: null, defaultBranch: null, defaultPlatform: "android", localId: "shop" }, run: { id: liveId, projectId: "shop", title: "Live", status: "running", createdAt: "2026-04-01T00:00:00.000Z", checks: [], testKey: null, brief: "b", deviceRequest: { platform: "android" } }, redaction: { replaced: {} } } as unknown as LiveRunBodyT;
+    ingestLiveRun(liveId, body, uploader);
+    try {
+      await run("unpublish", stored);
+      const refused = await run("project", "remove", hubKey);
+      expect(refused.code).toBe(2);
+      expect(hubProjectByKey(hubKey)).toBeDefined();
+    } finally {
+      deleteLiveRun(liveId);
+    }
+    expect((await run("project", "remove", hubKey)).code).toBe(0);
+  });
+});
+
+describe("hub project set-default-branch", () => {
+  test("pins a branch that uploads no longer change; --clear lets detection resume", async () => {
+    const hubKey = `github.com/acme/branch-${tag}`;
+    upload(hubKey);
+    expect((await run("project", "set-default-branch", hubKey, "release")).code).toBe(0);
+    expect(hubProjectByKey(hubKey)).toMatchObject({ defaultBranch: "release", defaultBranchSource: "explicit", defaultBranchLocked: true });
+
+    const id = `20260402-000001-${tag}-b`;
+    created.push(id);
+    const body = { protocol: HUB_PROTOCOL, clientVersion: "0.1.0", sentAt: new Date().toISOString(), project: { hubKey, name: "Acme Shop", remoteUrl: null, subpath: null, defaultBranch: "other", defaultBranchSource: "explicit", defaultPlatform: "android", localId: "shop" }, run: { id, projectId: "shop", title: "Checkout flow", status: "done", createdAt: "2026-04-02T00:00:00.000Z", checks: [], testKey: null, brief: "b", deviceRequest: { platform: "android" } }, batch: null, report: null, activity: null, screenshots: [], transcript: null, redaction: { replaced: {} } } as unknown as RunUploadBodyT;
+    ingestRun(id, body, uploader);
+    expect(hubProjectByKey(hubKey)?.defaultBranch).toBe("release");
+
+    expect((await run("project", "set-default-branch", hubKey, "--clear")).code).toBe(0);
+    expect(hubProjectByKey(hubKey)).toMatchObject({ defaultBranch: null, defaultBranchLocked: false });
+  });
+
+  test("an unknown project is an error; a missing or ambiguous branch is a usage error", async () => {
+    const hubKey = `github.com/acme/branch-usage-${tag}`;
+    upload(hubKey);
+    expect((await run("project", "set-default-branch", `github.com/acme/nope-${tag}`, "main")).code).toBe(2);
+    expect((await run("project", "set-default-branch", hubKey)).code).toBe(3);
+    expect((await run("project", "set-default-branch", hubKey, "main", "--clear")).code).toBe(3);
+    expect((await run("project", "set-default-branch")).code).toBe(3);
+    expect(hubProjectByKey(hubKey)?.defaultBranchLocked).toBe(false);
   });
 });
 

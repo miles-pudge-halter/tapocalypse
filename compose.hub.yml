@@ -33,7 +33,7 @@ services:
   oauth2-proxy:
     # Any login proxy works (nginx auth_request, a VPN, a tunnel...). Keep it >= 7.15.2: older releases trust a client-supplied
     # X-Forwarded-Uri when --reverse-proxy and a skip-auth rule are combined (GHSA-7x63-xv5r-3p2x, CVE-2026-40575).
-    image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.2
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.2@sha256:aa0bd8dd5ab0c78e4c91c92755ad573a5f92241f88138b4141b8ec803463b4fd
     restart: unless-stopped
     depends_on:
       hub:
@@ -62,7 +62,7 @@ services:
       # Deliberately no OAUTH2_PROXY_SKIP_AUTH_ROUTES: the upload routes are split off in nginx.
 
   nginx:
-    image: nginx:1.27-alpine
+    image: nginx:1.30-alpine@sha256:ed84151ed2d47ef93c0939eb9b9754c6990db6092cd2081e11988a47a83d47ea
     restart: unless-stopped
     depends_on:
       - hub

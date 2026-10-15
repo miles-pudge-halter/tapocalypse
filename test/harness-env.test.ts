@@ -20,4 +20,21 @@ describe("harnessEnv", () => {
     harnessEnv(input);
     expect(input).toEqual({ TAPOCALYPSE_HUB_TOKEN: "t", PATH: "/bin" });
   });
+
+  test("S3_* credentials are always dropped: the share upload reads them, an agent never needs them", () => {
+    const s3 = { S3_ACCESS_KEY_ID: "id", S3_SECRET_ACCESS_KEY: "secret", S3_SESSION_TOKEN: "tok" };
+    for (const s3Configured of [true, false]) {
+      expect(harnessEnv({ PATH: "/bin", ...s3 }, { s3Configured })).toEqual({ PATH: "/bin" });
+    }
+  });
+
+  test("AWS credentials are dropped when share.s3 is configured (Bun's S3 client reads them), and kept otherwise (an app under test may need them)", () => {
+    const aws = { AWS_ACCESS_KEY_ID: "id", AWS_SECRET_ACCESS_KEY: "secret", AWS_SESSION_TOKEN: "tok", AWS_REGION: "eu-west-1", AWS_PROFILE: "dev" };
+    expect(harnessEnv({ PATH: "/bin", ...aws }, { s3Configured: true })).toEqual({ PATH: "/bin", AWS_REGION: "eu-west-1", AWS_PROFILE: "dev" });
+    expect(harnessEnv({ PATH: "/bin", ...aws }, { s3Configured: false })).toEqual({ PATH: "/bin", ...aws });
+  });
+
+  test("without options it follows the loaded config (the test config has no share.s3)", () => {
+    expect(harnessEnv({ AWS_ACCESS_KEY_ID: "id", S3_ACCESS_KEY_ID: "id" })).toEqual({ AWS_ACCESS_KEY_ID: "id" });
+  });
 });

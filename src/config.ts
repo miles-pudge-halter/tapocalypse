@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
@@ -196,7 +196,23 @@ function deepFreeze<T>(o: T): T {
 
 export const config: Config = loadConfig();
 
+/**
+ * Creates `dir` (and missing parents, with the default mode) and makes it owner-only, tightening one that already exists: the
+ * data folder holds every run's report, screenshots, transcripts and the hub outbox. Only the directory itself is changed,
+ * never what is inside it. A directory that cannot be secured (not ours, read-only) is reported, not fatal.
+ */
+export function ensurePrivateDir(dir: string): void {
+  try {
+    mkdirSync(path.dirname(dir), { recursive: true });
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    chmodSync(dir, 0o700);
+  } catch (e) {
+    console.warn(`could not make ${dir} owner-only: ${(e as Error).message}`);
+  }
+}
+
 export const DATA_DIR = resolveDataDir();
+ensurePrivateDir(DATA_DIR);
 export const OMP_BIN = process.env.OMP_BIN ?? "omp";
 export const ADB_BIN = process.env.ADB_BIN ?? "adb";
 /** `xcrun` for simctl; overridable so tests and non-Xcode machines never start CoreSimulator. */

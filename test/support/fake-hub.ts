@@ -50,6 +50,8 @@ export interface FakeHub {
   /** The answer to live PUTs, unless `liveAnswers` names the run. */
   liveAnswer: LiveAnswer;
   liveAnswers: Map<string, LiveAnswer>;
+  /** The next `times` requests to the cheap token routes (blobs/check, runs/:id/state, DELETE runs/:id) answer 429 with this Retry-After (seconds; null sends none), then the hub answers normally. */
+  throttle: { times: number; retryAfter: string | null };
   /** The PUTs of run documents (not live progress, not blobs). */
   puts(): HubRequestLog[];
   /** The live PUTs. */
@@ -71,6 +73,7 @@ export function createFakeHub(token: string): FakeHub {
     liveRequests: [],
     liveAnswer: "live",
     liveAnswers: new Map(),
+    throttle: { times: 0, retryAfter: null },
     puts: () => hub.log.filter((l) => l.method === "PUT" && l.path.startsWith("/api/hub/v1/runs/") && !l.path.endsWith("/live")),
     livePuts: () => hub.log.filter((l) => l.method === "PUT" && l.path.endsWith("/live")),
     async fetch(req: Request): Promise<Response> {
@@ -91,6 +94,11 @@ export function createFakeHub(token: string): FakeHub {
         });
       }
       if (!authorised) return json({ error: "unauthorized" }, 401);
+      const meta = (req.method === "POST" && url.pathname === "/api/hub/v1/blobs/check") || (/^\/api\/hub\/v1\/runs\/[A-Za-z0-9-]+(\/state)?$/.test(url.pathname) && (req.method === "DELETE" || (req.method === "GET" && url.pathname.endsWith("/state"))));
+      if (meta && hub.throttle.times > 0) {
+        hub.throttle.times--;
+        return new Response(JSON.stringify({ error: "too many uploads from this token", code: "rate_limited" }), { status: 429, headers: { "content-type": "application/json", ...(hub.throttle.retryAfter === null ? {} : { "retry-after": hub.throttle.retryAfter }) } });
+      }
 
       if (url.pathname === "/api/hub/v1/blobs/check" && req.method === "POST") {
         const body = BlobCheckBody.parse(await req.json());

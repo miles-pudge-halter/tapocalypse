@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { config, DATA_DIR } from "../src/config";
@@ -11,6 +11,7 @@ interface Fake {
   files: Map<string, string>;
   removed: string[];
   dirs: string[];
+  warnings: string[];
 }
 
 function fake(overrides: Partial<ServiceDeps> = {}, answers: (cmd: string[]) => { code?: number; text?: string; stderr?: string } = () => ({})): Fake {
@@ -18,6 +19,7 @@ function fake(overrides: Partial<ServiceDeps> = {}, answers: (cmd: string[]) => 
   const files = new Map<string, string>();
   const removed: string[] = [];
   const dirs: string[] = [];
+  const warnings: string[] = [];
   const deps: ServiceDeps = {
     platform: "darwin",
     home: "/Users/tester",
@@ -36,9 +38,10 @@ function fake(overrides: Partial<ServiceDeps> = {}, answers: (cmd: string[]) => 
     remove: (file) => void removed.push(file),
     mkdir: (dir) => void dirs.push(dir),
     readLog: () => "",
+    warn: (message) => void warnings.push(message),
     ...overrides,
   };
-  return { deps, commands, files, removed, dirs };
+  return { deps, commands, files, removed, dirs, warnings };
 }
 
 describe("unitFile on macOS", () => {
@@ -96,6 +99,51 @@ describe("service environment", () => {
     expect(content).toContain("<string>&quot;q&quot;&apos;s</string>");
     expect(content).toContain("<string>/src/a&amp;b</string>");
     expect(content).not.toContain("/a&b");
+  });
+});
+
+describe("hub secrets never reach the unit", () => {
+  const env = {
+    PATH: "/usr/bin",
+    TAPOCALYPSE_PORT: "4400",
+    TAPOCALYPSE_HUB_TOKEN: "tpu_" + "a".repeat(20),
+    TAPOCALYPSE_HUB_HEADERS: '{"CF-Access-Client-Secret":"proxy-secret"}',
+    TAPOCALYPSE_HUB_HOSTS: "qa.example.com",
+  };
+
+  for (const platform of ["darwin", "linux"] as const) {
+    test(`${platform}: the upload token and proxy headers are left out, other settings are kept`, () => {
+      const { content } = unitFile(fake({ platform, env }).deps);
+      expect(content).not.toContain("TAPOCALYPSE_HUB_TOKEN");
+      expect(content).not.toContain("TAPOCALYPSE_HUB_HEADERS");
+      expect(content).not.toContain("tpu_");
+      expect(content).not.toContain("proxy-secret");
+      expect(content).toContain("TAPOCALYPSE_PORT");
+      expect(content).toContain("TAPOCALYPSE_HUB_HOSTS");
+    });
+
+    test(`${platform}: install warns on stderr that they were skipped and points to hub-credentials.json`, async () => {
+      const f = fake({ platform, env });
+      await serviceCommand("install", f.deps);
+      const warning = f.warnings.join("\n");
+      expect(warning).toContain("TAPOCALYPSE_HUB_TOKEN");
+      expect(warning).toContain("TAPOCALYPSE_HUB_HEADERS");
+      expect(warning).toContain("hub-credentials.json");
+      expect(warning).not.toContain("proxy-secret");
+    });
+
+    test(`${platform}: install without them does not warn`, async () => {
+      const f = fake({ platform, env: { PATH: "/usr/bin", TAPOCALYPSE_PORT: "4400" } });
+      await serviceCommand("install", f.deps);
+      expect(f.warnings).toEqual([]);
+    });
+  }
+
+  test("only the variable that is set is named in the warning", async () => {
+    const f = fake({ env: { PATH: "/usr/bin", TAPOCALYPSE_HUB_TOKEN: "tpu_x" } });
+    await serviceCommand("install", f.deps);
+    expect(f.warnings.join("\n")).toContain("TAPOCALYPSE_HUB_TOKEN");
+    expect(f.warnings.join("\n")).not.toContain("TAPOCALYPSE_HUB_HEADERS");
   });
 });
 
@@ -458,6 +506,27 @@ describe("defaultServiceDeps", () => {
       deps.remove(file);
       deps.remove(file);
       expect(existsSync(file)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("defaultServiceDeps write", () => {
+  test("the unit is written owner-only (0600), also over an existing world-readable file, and parents are created", async () => {
+    const deps = defaultServiceDeps();
+    const dir = mkdtempSync(path.join(os.tmpdir(), "tpc-service-"));
+    try {
+      const fresh = path.join(dir, "LaunchAgents", "x.plist");
+      deps.write(fresh, "a");
+      expect(statSync(fresh).mode & 0o777).toBe(0o600);
+
+      const old = path.join(dir, "old.service");
+      writeFileSync(old, "old", { mode: 0o644 });
+      chmodSync(old, 0o644);
+      deps.write(old, "new");
+      expect(statSync(old).mode & 0o777).toBe(0o600);
+      expect(await Bun.file(old).text()).toBe("new");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

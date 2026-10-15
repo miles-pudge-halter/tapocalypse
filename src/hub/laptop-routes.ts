@@ -58,9 +58,22 @@ async function saveConnection(req: Request): Promise<Response> {
   if (body.token && process.env.TAPOCALYPSE_HUB_TOKEN) throw new HttpError(400, "the upload token is set by TAPOCALYPSE_HUB_TOKEN; remove the environment variable to manage it here");
   if (body.headers && process.env.TAPOCALYPSE_HUB_HEADERS) throw new HttpError(400, "the proxy headers are set by TAPOCALYPSE_HUB_HEADERS; remove the environment variable to manage them here");
 
+  const previous = activeHubConfig();
+  const url = body.url.replace(/\/+$/, "");
+  // The saved token and proxy secrets belong to the hub they were entered for: a different origin gets none of them unless
+  // the form sends new ones, so a changed address (a typo, a hijacked settings page) cannot carry them to another host.
+  const originChanged = previous !== null && new URL(url).origin !== new URL(previous.url).origin;
+  if (originChanged && !body.token) {
+    const hint = process.env.TAPOCALYPSE_HUB_TOKEN ? "the saved token comes from TAPOCALYPSE_HUB_TOKEN, which this form cannot replace: point the environment variable at the new hub's token first, or use `tapocalypse hub login`" : "enter the upload token for the new hub";
+    throw new HttpError(400, `a different hub address needs its own upload token: ${hint}`, "token_required_for_new_hub");
+  }
+  if (originChanged && body.headers && Object.values(body.headers).includes(null)) {
+    throw new HttpError(400, "a different hub address cannot keep the saved proxy header values: enter them again", "token_required_for_new_hub");
+  }
+
   const saved = readSavedHubCredentials();
   const token = body.token ?? saved?.token;
-  let headers = saved?.headers;
+  let headers = originChanged ? undefined : saved?.headers;
   if (body.headers) {
     headers = {};
     for (const [name, value] of Object.entries(body.headers)) {
@@ -71,11 +84,11 @@ async function saveConnection(req: Request): Promise<Response> {
   if (token) writeHubCredentials({ token, headers }, {});
   else if (headers && Object.keys(headers).length > 0) throw new HttpError(400, "enter the upload token before saving proxy headers");
 
-  const previous = activeHubConfig();
+  const keptHeaders = originChanged ? undefined : previous?.headers;
   const hub = {
-    url: body.url.replace(/\/+$/, ""),
+    url,
     ...((body.screenshots ?? previous?.screenshots) ? { screenshots: body.screenshots ?? previous?.screenshots } : {}),
-    ...(previous?.headers ? { headers: previous.headers } : {}),
+    ...(keptHeaders ? { headers: keptHeaders } : {}),
     ...(previous?.live !== undefined ? { live: previous.live } : {}),
   };
   writeHubConfig(hubPaths.configFile, hub);

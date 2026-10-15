@@ -3,7 +3,7 @@ import path from "node:path";
 import { ADB_BIN, CONFIG_PATH, config, DATA_DIR, EMULATOR_BIN, GH_BIN, GIT_BIN } from "./config";
 import { type ExecResult, exec, parseAdbDevices } from "./devices/devices";
 import { getHarness, type HarnessReadiness, harnessBin, pickDefaultHarness, readinessOf } from "./harness";
-import { HARNESS_IDS, type Harness, type HarnessId } from "./harness/types";
+import { HARNESS_IDS, type Harness, type HarnessId, MOBILE_MCP_PACKAGE, MOBILE_MCP_VERSION } from "./harness/types";
 import { hubChecks } from "./hub/laptop-doctor";
 import { hubHosts, HUB_STORE_WARN_RUNS, hubIdentityHeader, hubRetention, isHub } from "./hub/mode";
 import { hubMachines, type HubMachine } from "./hub/status";
@@ -173,7 +173,7 @@ function checkNode(env: DoctorEnv): Promise<DoctorCheck> {
       return {
         status: "error",
         detail: notFound(r.code) ? "`npx` not found on PATH" : `\`npx --version\` failed: ${lastLines(r.stderr || r.text)}`,
-        fix: "Install Node.js 18+ from https://nodejs.org — agents start mobile-mcp with `npx -y @mobilenext/mobile-mcp@latest`",
+        fix: `Install Node.js 18+ from https://nodejs.org — agents start mobile-mcp with \`npx -y ${MOBILE_MCP_PACKAGE}@${MOBILE_MCP_VERSION}\``,
       };
     }
     return { status: "ok", detail: `npx ${firstLine(r.text)}` };

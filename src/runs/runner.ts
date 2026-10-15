@@ -449,6 +449,12 @@ export function createRunner(scheduler: RunnerScheduler, deps: RunnerDeps = {}):
   async function execute(ctx: RunContext, target: StartTarget): Promise<void> {
     const { run, project, harness } = ctx;
     if (!(await preflight(ctx, target))) return;
+    // `preflight` assigned the device; the agent is scoped to it, so there is no starting without one.
+    const serial = run.deviceSerial;
+    if (!serial) {
+      finalize(ctx, failure("no device was assigned to the run"));
+      return;
+    }
 
     const dir = runDir(run.id);
     const persona = loadPersona(resolvePersonaPath(project));
@@ -497,6 +503,7 @@ export function createRunner(scheduler: RunnerScheduler, deps: RunnerDeps = {}):
       runDir: dir,
       persona: persona.body,
       personaFile,
+      device: { serial, platform: run.deviceRequest.platform },
       model,
       effort,
       mcpServers: buildMcpServers(ctx, token),

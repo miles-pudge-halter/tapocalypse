@@ -130,6 +130,21 @@ function rewriteLinks(md: string, swap: (link: string) => string | null): string
 
 const clamp = (s: string, max: number): string => (s.length > max ? `${s.slice(0, max - 1)}…` : s);
 
+/** The ids the run was given or assigned a device by: serial/UDID, the requested one and the label tools were told (AVD name, UDID). They never leave the machine. */
+const deviceIdsOf = (run: Run): string[] => [run.deviceSerial, run.deviceRequest.serial, run.deviceLabel].filter((id): id is string => Boolean(id));
+
+/** Every machine fact a run's text may contain: shared by the hub upload and the standalone / shared report, so they redact alike. */
+export function localRedactContext(run: Run, project: Pick<Project, "repoPath"> | null, worktrees: string[] = []): RedactContext {
+  return {
+    home: os.homedir(),
+    user: os.userInfo().username,
+    repos: [project?.repoPath, run.source?.path, ...worktrees].filter((p): p is string => Boolean(p)).flatMap(withRealpath),
+    dataDir: DATA_DIR,
+    tmpDirs: [...withRealpath(os.tmpdir()), "/tmp", "/private/tmp"],
+    devices: deviceIdsOf(run),
+  };
+}
+
 /** Where a project lives on the hub and what its redactor must know; asked from git, so `packageLive` remembers it per run. */
 interface HubContext {
   identity: HubIdentity & { hubKey: string };
@@ -149,13 +164,7 @@ async function hubContextFor(run: Run, project: Project, git: GitRunner | undefi
     identity: { ...identity, hubKey: identity.hubKey },
     defaultBranch,
     defaultBranchSource: project.defaultBranch ? "explicit" : "detected",
-    redact: {
-      home: os.homedir(),
-      user: os.userInfo().username,
-      repos: [project.repoPath, run.source?.path, ...worktrees].filter((p): p is string => Boolean(p)).flatMap(withRealpath),
-      dataDir: DATA_DIR,
-      tmpDirs: [...withRealpath(os.tmpdir()), "/tmp", "/private/tmp"],
-    },
+    redact: localRedactContext(run, project, worktrees),
   };
 }
 
@@ -212,7 +221,8 @@ export async function packageLive(run: Run, project: Project, opts: Pick<Package
     }
   }
   const { context } = known;
-  const redact = createRedactor(context.redact);
+  // The device is assigned after the context was first remembered, so its ids are taken from this snapshot of the run.
+  const redact = createRedactor({ ...context.redact, devices: deviceIdsOf(run) });
   const checks: Check[] = run.checks.map(({ screenshot: _screenshot, ...c }) => ({ ...c, title: clamp(c.title, 2000), ...(c.note ? { note: clamp(c.note, LIVE_NOTE_MAX) } : {}) }));
   const body = {
     protocol: HUB_PROTOCOL,

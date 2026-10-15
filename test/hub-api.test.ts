@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { gzipSync } from "node:zlib";
 import { fetchHandler } from "../src/api";
+import { checkHistoryUrl, releaseUrl, runCheckHistoryUrl } from "../web/lib/api";
 import { config } from "../src/config";
 import { hubDir, setHubMode } from "../src/hub/mode";
 import { installHubProjects, hubProjectByKey } from "../src/hub/projects";
@@ -228,6 +229,73 @@ describe("host guard", () => {
     expect(refused.status).toBe(403);
     const ok = await call("DELETE", `/api/hub/v1/runs/${runId(90)}`, { headers: { host: "qa.example.com", origin: "https://qa.example.com", ...m.auth } });
     expect(ok.status).toBe(404);
+  });
+});
+
+describe("ambiguous paths", () => {
+  const refused = async (res: Response): Promise<void> => {
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ code: "ambiguous_path" });
+  };
+
+  test("an encoded slash, dot or backslash in the path is refused on the hub, whatever the case", async () => {
+    for (const p of [
+      "/api/runs/x/files/screenshots%2fa.webp",
+      "/api/runs/x/files/screenshots%2Fa.webp",
+      "/api/runs/x%2e/report",
+      "/api/runs/x%2Ey/report",
+      "/api/runs/x/files/screenshots%5ca.webp",
+      "/api/runs/x/files/screenshots%5Ca.webp",
+      "/files/x/a%2fb.png",
+      "/api/hub/v1/blobs/a%2eb",
+    ]) {
+      await refused(await get(p));
+    }
+  });
+
+  test("a raw backslash is refused too", async () => {
+    // `new Request` rewrites a backslash to a slash itself; a raw one can only be modelled by overriding what the handler reads.
+    const req = new Request(`${base}/api/runs/x/files/a.webp`, { headers: { host: HOST } });
+    Object.defineProperty(req, "url", { value: `${base}/api/runs/x/files/a\\b.webp` });
+    await refused(await fetchHandler(req));
+  });
+
+  test("an unambiguous path and an encoded query string still work, and a laptop is not affected", async () => {
+    expect((await get("/api/health?next=%2fa%5cb%2e")).status).toBe(200);
+    expect((await get("/api/runs/x%20y/report")).status).toBe(404);
+    expect((await get("/api/runs/x%20y/report")).headers.get("content-type")).toContain("application/json");
+    setHubMode(false);
+    const laptop = await get("/api/runs/x/files/screenshots%2fa.webp");
+    expect(laptop.status).toBe(404);
+    expect(await laptop.json()).not.toHaveProperty("code", "ambiguous_path");
+  });
+});
+
+describe("URLs the web client builds", () => {
+  const branch = { kind: "branch", name: "release/2.4" } as const;
+
+  test("a name with slashes is encoded per segment, so no %2f reaches the hub", () => {
+    expect(releaseUrl("shop", branch, null)).toBe("/api/projects/shop/releases/branch/release/2.4");
+    expect(releaseUrl("shop", { kind: "branch", name: "feat/a b" }, "version:1.0")).toBe("/api/projects/shop/releases/branch/feat/a%20b?against=version%3A1.0");
+    expect(releaseUrl("shop", { kind: "version", name: "2.4.0" }, null)).toBe("/api/projects/shop/releases/version/2.4.0");
+    expect(checkHistoryUrl("shop", "s:suite/x:C1", { limit: 5 })).toBe("/api/projects/shop/checks/s%3Asuite/x%3AC1/history?limit=5");
+    expect(runCheckHistoryUrl("run-1", "A/1", {})).toBe("/api/runs/run-1/checks/A/1/history");
+  });
+
+  test("the hub answers a release branch and a check id with slashes, built the way the client builds them", async () => {
+    const m = machine("slashes");
+    const id = runId(30);
+    const source = { path: "/Users/you/shop", branch: "release/2.4", commit: null, commitSubject: null, dirty: false, remoteUrl: null, pr: null, prStatus: "none", tickets: [], labels: {} };
+    const checks = [{ id: "A/1", title: "Cart total", status: "pass", updatedAt: "2026-02-01T00:00:00.000Z" }];
+    expect((await putRun(id, docFor(id, { source, checks }), m.auth)).status).toBe(201);
+    const projectId = hubProjectByKey(hubKey)!.id;
+
+    const release = await get(releaseUrl(projectId, branch, null));
+    expect(release.status).toBe(200);
+    expect(await release.json()).toMatchObject({ ref: branch });
+    expect((await get(`/api/projects/${projectId}/releases/branch/release%2F2.4`)).status).toBe(400);
+
+    expect((await get(runCheckHistoryUrl(id, "A/1", {}))).status).toBe(200);
   });
 });
 

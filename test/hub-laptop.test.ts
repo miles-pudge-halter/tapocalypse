@@ -47,6 +47,8 @@ let dir: string;
 let restorePaths: () => void;
 let projectId: string;
 let shared = true;
+/** Every request the sync worker sent, whatever hub it was addressed to. */
+let sent: Request[] = [];
 
 beforeEach(async () => {
   // Another test file may have created the process-wide worker (a run view asks for its sync state): start from a clean one.
@@ -57,11 +59,15 @@ beforeEach(async () => {
   restorePaths = setHubPaths({ configFile: path.join(dir, "config.json"), configDir: dir });
   refreshHubConfig();
   hub = createFakeHub(TOKEN);
+  sent = [];
   shared = true;
   projectId = `route-${randomBytes(4).toString("hex")}`;
   worker = startHubSync({
     stateFile: path.join(dir, "hub-outbox.json"),
-    fetch: (req) => hub.fetch(req),
+    fetch: (req) => {
+      sent.push(req.clone());
+      return hub.fetch(req);
+    },
     getProject: (id) => (id === projectId ? ({ id, name: "Acme Shop", repoPath: dir, personaFile: null, defaultPackage: "com.example.app", defaultPlatform: "android", share: shared } satisfies Project) : undefined),
     packageRun: fakePackage,
     debounceMs: 0,
@@ -177,6 +183,65 @@ describe("PUT /api/hub/connection", () => {
 
     await ok("PUT", "/api/hub/connection", { url: "https://hub.example.com" });
     expect(readHubConfig(configFile)).toMatchObject({ url: "https://hub.example.com", live: false });
+  });
+
+  describe("a different hub address", () => {
+    const credFile = (): string => path.join(dir, "hub-credentials.json");
+    const savedCredentials = (): { token: string; headers?: Record<string, string> } => JSON.parse(fs.readFileSync(credFile(), "utf8"));
+
+    test("without a token it is refused: nothing is written and the saved token and headers are not sent to the new host", async () => {
+      await ok("PUT", "/api/hub/connection", { url: "https://hub.example.com", token: TOKEN, headers: { "X-Proxy-Secret": "s3cr3t" } });
+      const before = fs.readFileSync(credFile(), "utf8");
+      const requests = sent.length;
+
+      for (const url of ["https://hub.attacker.example", "https://hub.example.com:8443", "http://127.0.0.1:4311"]) {
+        const res = await call("PUT", "/api/hub/connection", { url });
+        expect(res?.status).toBe(400);
+        expect(await res?.json()).toMatchObject({ code: "token_required_for_new_hub" });
+      }
+      expect(readHubConfig(path.join(dir, "config.json"))?.url).toBe("https://hub.example.com");
+      expect(fs.readFileSync(credFile(), "utf8")).toBe(before);
+      expect(sent.length).toBe(requests);
+    });
+
+    test("with a token the saved proxy headers (credentials file and config) are dropped, and only the new values reach the new host", async () => {
+      await ok("PUT", "/api/hub/connection", { url: "https://hub.example.com", token: TOKEN, headers: { "X-Proxy-Secret": "s3cr3t" } });
+      writeHubConfig(path.join(dir, "config.json"), { url: "https://hub.example.com", headers: { "X-Static": "static-value" } });
+      refreshHubConfig();
+      sent = [];
+
+      await ok("PUT", "/api/hub/connection", { url: "https://hub.other.example", token: TOKEN });
+      expect(savedCredentials()).toEqual({ token: TOKEN });
+      expect(readHubConfig(path.join(dir, "config.json"))).toEqual({ url: "https://hub.other.example" });
+      expect(sent.length).toBeGreaterThan(0);
+      for (const req of sent) {
+        expect(new URL(req.url).host).toBe("hub.other.example");
+        expect(req.headers.get("x-proxy-secret")).toBeNull();
+        expect(req.headers.get("x-static")).toBeNull();
+        expect(req.headers.get("authorization")).toBe(`Bearer ${TOKEN}`);
+      }
+
+      await ok("PUT", "/api/hub/connection", { url: "https://hub.third.example", token: TOKEN, headers: { "X-Proxy-Id": "fresh" } });
+      expect(savedCredentials().headers).toEqual({ "X-Proxy-Id": "fresh" });
+    });
+
+    test("keeping a saved header value with null is refused across origins and works within one", async () => {
+      await ok("PUT", "/api/hub/connection", { url: "https://hub.example.com", token: TOKEN, headers: { "X-Proxy-Secret": "s3cr3t" } });
+      const res = await call("PUT", "/api/hub/connection", { url: "https://hub.other.example", token: TOKEN, headers: { "X-Proxy-Secret": null } });
+      expect(res?.status).toBe(400);
+      expect(readHubConfig(path.join(dir, "config.json"))?.url).toBe("https://hub.example.com");
+      expect(savedCredentials().headers).toEqual({ "X-Proxy-Secret": "s3cr3t" });
+
+      await ok("PUT", "/api/hub/connection", { url: "https://hub.example.com/qa/", headers: { "X-Proxy-Secret": null } });
+      expect(savedCredentials().headers).toEqual({ "X-Proxy-Secret": "s3cr3t" });
+    });
+
+    test("another path on the same origin keeps the saved token and headers", async () => {
+      await ok("PUT", "/api/hub/connection", { url: "https://hub.example.com", token: TOKEN, headers: { "X-Proxy-Secret": "s3cr3t" } });
+      await ok("PUT", "/api/hub/connection", { url: "https://hub.example.com/team-qa" });
+      expect(savedCredentials()).toEqual({ token: TOKEN, headers: { "X-Proxy-Secret": "s3cr3t" } });
+      expect(readHubConfig(path.join(dir, "config.json"))?.url).toBe("https://hub.example.com/team-qa");
+    });
   });
 
   test("a token set by the environment locks the field", async () => {

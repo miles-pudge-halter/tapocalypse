@@ -6,7 +6,7 @@
 import { z } from "zod";
 import type { ExecResult } from "../devices/devices";
 import type { DoctorCheck } from "../doctor";
-import type { Activity, RunUsage } from "../runs/types";
+import type { Activity, Platform, RunUsage } from "../runs/types";
 
 export const HARNESS_IDS = ["omp", "claude", "codex"] as const;
 export type HarnessId = (typeof HARNESS_IDS)[number];
@@ -18,6 +18,12 @@ export const PROGRESS_SERVER = "tpc";
 export const MOBILE_MCP_SERVER = "mobile_mcp";
 /** npm package of the mobile-mcp device driver every harness mounts through `npx`. */
 export const MOBILE_MCP_PACKAGE = "@mobilenext/mobile-mcp";
+/**
+ * The mobile-mcp release every child runs. Exact on purpose: `@latest` would run whatever npm serves at that moment, with the
+ * server's environment and the lease's device, so an update (or a hijacked publish) would take effect on the next call. Bump it
+ * deliberately, after checking the tools the gateway serves (`DROPPED_TOOLS`, `servableTools`) still match.
+ */
+export const MOBILE_MCP_VERSION = "1.0.11";
 
 export type McpServerSpec =
   | { name: string; transport: "stdio"; command: string; args: string[]; env?: Record<string, string> }
@@ -49,6 +55,8 @@ export interface SpawnOptions {
   /** Persona body, frontmatter stripped. Already written to `<runDir>/persona.md` by the runner. */
   persona: string;
   personaFile: string;
+  /** The device this run drives: its adb serial or simulator UDID, and platform. Adapters that restrict shell access scope it to this device. */
+  device: { serial: string; platform: Platform };
   /** Harness-native model id (omp `provider/model`, Claude alias or id, Codex `gpt-…`); null = the harness default. */
   model: string | null;
   /** Harness-native reasoning level (omp thinking, Claude/Codex effort); null = default. */

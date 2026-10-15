@@ -534,6 +534,41 @@ describe("push (backfill, retry, verify, unpublish)", () => {
     expect(r.hub.puts().map((l) => l.detail).sort()).toEqual([lost.id, stale.id].sort());
   });
 
+  test("a 429 from the hub's token limit is waited out (Retry-After, then the same run again): verify and unpublish complete", async () => {
+    const waits: number[] = [];
+    const r = rig({ sleep: async (ms) => void waits.push(ms) });
+    const runs = [r.make({ at: 1 }), r.make({ at: 2 }), r.make({ at: 3 })];
+    for (const run of runs) r.worker.enqueue(run.id);
+    await r.worker.drain();
+    r.hub.runs.delete(runs[2]!.id);
+
+    r.hub.throttle = { times: 3, retryAfter: "7" };
+    expect(await r.worker.verify({ projectId: r.projectId })).toEqual({ checked: 3, requeued: 1 });
+    expect(waits).toEqual([7000, 7000, 7000]);
+    // every run was asked exactly once successfully: 3 throttled + 3 answered
+    expect(r.hub.log.filter((l) => l.method === "GET" && l.path.endsWith("/state")).length).toBe(6);
+
+    waits.length = 0;
+    r.hub.throttle = { times: 2, retryAfter: null };
+    await r.worker.unpublish(runs[0]!.id);
+    expect(r.hub.runs.has(runs[0]!.id)).toBe(false);
+    expect(r.worker.syncState(runs[0]!.id, runs[0]!)?.state).toBe("local");
+    expect(waits.length).toBe(2);
+    expect(waits.every((ms) => ms >= 1000 && ms <= 60_000)).toBe(true);
+  });
+
+  test("a hub that keeps answering 429 is given up on after a few waits, as an error", async () => {
+    const waits: number[] = [];
+    const r = rig({ sleep: async (ms) => void waits.push(ms) });
+    const run = r.make();
+    r.worker.enqueue(run.id);
+    await r.worker.drain();
+    r.hub.throttle = { times: 1000, retryAfter: "1" };
+    await expect(r.worker.verify()).rejects.toMatchObject({ message: expect.stringContaining("429") });
+    expect(waits.length).toBeGreaterThan(0);
+    expect(waits.length).toBeLessThan(20);
+  });
+
   test("unpublish deletes the hub copy and forgets the upload; an unknown copy is fine", async () => {
     const r = rig();
     const run = r.make();

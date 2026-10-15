@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DATA_DIR, HttpError } from "../config";
 import type { Project } from "../projects/registry";
-import { realpathLoose, resolveUnder } from "../reports/reports";
+import { legacyReportsRoot, realpathLoose, resolveUnder } from "../reports/reports";
 import { runDir } from "./store";
 import type { Run } from "./types";
 
@@ -72,7 +72,47 @@ export function readHead(file: string): Buffer | null {
   }
 }
 
+/**
+ * Content types of the files the app serves from run folders and repo report folders, keyed by the lowercase extension of the
+ * RESOLVED file (symlinks followed). The server states the type itself; nothing is left to be inferred from a path or the bytes.
+ */
+const ARTEFACT_TYPES: Record<string, string> = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+  ".txt": "text/plain; charset=utf-8",
+  ".json": "application/json",
+};
+
+/** Served artefacts are inert: nothing but their own bytes (and `data:` images) may load, and the sandbox gives them an opaque origin. */
+const ARTEFACT_CSP = "default-src 'none'; img-src 'self' data:; sandbox";
+
 export const isImagePath = (p: string): boolean => IMAGE_EXTENSIONS.has(path.extname(p).slice(1).toLowerCase());
+
+/**
+ * The Content-Type to serve `file` (an already resolved path, so a symlink named `x.png` that points at `x.html` is judged as
+ * `.html`) with; null when its extension is not served or it is an image whose first bytes are not an image's.
+ */
+export function artefactType(file: string): string | null {
+  const type = ARTEFACT_TYPES[path.extname(file).toLowerCase()];
+  if (!type) return null;
+  if (type.startsWith("image/")) {
+    const head = readHead(file);
+    if (!head || !hasImageMagic(head)) return null;
+  }
+  return type;
+}
+
+/** Streams a resolved artefact with an explicit type, `nosniff` and a sandboxing CSP; 404 unless it is an existing file of a served type. */
+export function artefactResponse(file: string | null): Response {
+  const type = file && isFile(file) ? artefactType(file) : null;
+  if (!file || !type) throw new HttpError(404, "not found");
+  return new Response(Bun.file(file), {
+    headers: { "Content-Type": type, "X-Content-Type-Options": "nosniff", "Content-Security-Policy": ARTEFACT_CSP },
+  });
+}
 
 /**
  * Absolute path of a run screenshot, or null when it is outside the run's screenshots folder (data runs: `rel` is
@@ -87,12 +127,13 @@ export function screenshotFile(run: Run, project: Project | null, rel: string): 
     file &&= resolveUnder(screenshotsDir(run.id), file);
   } else {
     if (!project) return null;
+    const root = legacyReportsRoot(project);
+    if (!root) return null;
     file = resolveUnder(project.repoPath, rel);
-    file &&= resolveUnder(path.join(project.repoPath, project.reportsDir ?? LEGACY_REPORTS_DIR), file);
+    file &&= resolveUnder(root, file);
   }
-  if (!file || !isFile(file)) return null;
-  const head = readHead(file);
-  return head && hasImageMagic(head) ? file : null;
+  // `file` is symlink-resolved: a `.png` that links to an `.html` is judged by its target.
+  return file && isFile(file) && isImagePath(file) && artefactType(file) ? file : null;
 }
 
 export interface RunImage {
@@ -114,9 +155,10 @@ export function runImages(run: Run, project: Project | null): RunImage[] {
     folder = screenshotsDir(run.id);
     prefix = "screenshots";
   } else {
-    if (!project) return [];
+    const root = project ? legacyReportsRoot(project) : null;
+    if (!project || !root) return [];
     const reportsDir = posix(project.reportsDir ?? LEGACY_REPORTS_DIR);
-    folder = path.join(project.repoPath, reportsDir, "screenshots", run.id);
+    folder = path.join(root, "screenshots", run.id);
     prefix = path.posix.join(reportsDir, "screenshots", run.id);
   }
   const candidates = new Set<string>();

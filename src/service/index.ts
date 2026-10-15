@@ -1,4 +1,4 @@
-import { closeSync, mkdirSync, openSync, readSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, mkdirSync, openSync, readSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { config, DATA_DIR } from "../config";
@@ -17,7 +17,10 @@ export interface ServiceDeps {
   run: (cmd: string[]) => Promise<ExecResult>;
   /** GET /api/mcp/status answered ok. */
   probe: () => Promise<boolean>;
+  /** Writes the unit file (owner-only, 0600) and creates its parent directories. */
   write: (file: string, text: string) => void;
+  /** Prints a warning on stderr. */
+  warn: (message: string) => void;
   remove: (file: string) => void;
   /** Creates `dir` and missing parents; throws when it cannot. */
   mkdir: (dir: string) => void;
@@ -28,6 +31,12 @@ const LABEL = "dev.tapocalypse.server";
 const UNIT = "tapocalypse";
 const PASSTHROUGH = /^(TAPOCALYPSE_.+|ANDROID_HOME|ANDROID_SDK_ROOT|OMP_BIN|CLAUDE_BIN|CODEX_BIN|ADB_BIN|XCRUN_BIN|EMULATOR_BIN)$/;
 
+/**
+ * Secrets the unit must never carry: it is a plain-text file next to the user's other launch agents, and a copy there outlives
+ * the token's rotation. The server reads them from `hub-credentials.json` (mode 600) instead.
+ */
+const SECRET_VARS = ["TAPOCALYPSE_HUB_TOKEN", "TAPOCALYPSE_HUB_HEADERS"];
+
 /** Environment baked into the unit: a service manager starts with an empty one. */
 function serviceEnv(deps: ServiceDeps): [string, string][] {
   const out: [string, string][] = [["NODE_ENV", "production"]];
@@ -35,9 +44,20 @@ function serviceEnv(deps: ServiceDeps): [string, string][] {
   out.push(["HOME", deps.home]);
   for (const key of Object.keys(deps.env).sort()) {
     const value = deps.env[key];
-    if (value !== undefined && PASSTHROUGH.test(key)) out.push([key, value]);
+    if (value !== undefined && PASSTHROUGH.test(key) && !SECRET_VARS.includes(key)) out.push([key, value]);
   }
   return out;
+}
+
+/** Writes the unit, and says on stderr which secrets of the environment were deliberately not copied into it. */
+function writeUnit(deps: ServiceDeps, unit: { path: string; content: string }): void {
+  deps.write(unit.path, unit.content);
+  const skipped = SECRET_VARS.filter((name) => deps.env[name] !== undefined);
+  if (skipped.length > 0) {
+    deps.warn(
+      `warning: ${skipped.join(" and ")} ${skipped.length > 1 ? "were" : "was"} not written into the service unit (a plain-text file); the service reads the hub token and headers from hub-credentials.json next to its config (mode 600), so run \`tapocalypse hub login\` if that file does not exist yet`,
+    );
+  }
 }
 
 function logFile(deps: ServiceDeps): string {
@@ -149,7 +169,7 @@ async function installDarwin(deps: ServiceDeps): Promise<Result> {
   } catch (err) {
     return { ok: false, lines: [`could not create the log directory ${path.dirname(logFile(deps))}: ${err instanceof Error ? err.message : String(err)}`] };
   }
-  deps.write(unit.path, unit.content);
+  writeUnit(deps, unit);
   const domain = `gui/${deps.uid}`;
   const r = await bootstrap(deps, domain, `${domain}/${LABEL}`, unit.path);
   if (r.code !== 0) return { ok: false, lines: [`could not load ${unit.path}: ${detail(r)}`] };
@@ -225,7 +245,7 @@ const systemctl = (deps: ServiceDeps, ...args: string[]): Promise<ExecResult> =>
 
 async function installLinux(deps: ServiceDeps): Promise<Result> {
   const unit = unitFile(deps);
-  deps.write(unit.path, unit.content);
+  writeUnit(deps, unit);
   const reload = await systemctl(deps, "daemon-reload");
   if (reload.code !== 0) return { ok: false, lines: [`systemctl daemon-reload failed: ${detail(reload)}`] };
   const enabled = await systemctl(deps, "enable", "--now", UNIT);
@@ -350,8 +370,11 @@ export function defaultServiceDeps(): ServiceDeps {
     },
     write: (file, text) => {
       mkdirSync(path.dirname(file), { recursive: true });
-      writeFileSync(file, text);
+      writeFileSync(file, text, { mode: 0o600 });
+      // `mode` only applies to a new file; an older, world-readable unit is tightened too.
+      chmodSync(file, 0o600);
     },
+    warn: (message) => console.error(message),
     remove: (file) => rmSync(file, { force: true }),
     mkdir: (dir) => void mkdirSync(dir, { recursive: true }),
     readLog: tailFile,

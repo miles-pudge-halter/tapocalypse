@@ -134,6 +134,11 @@ const CheckStatusZ = z.enum(["pending", "running", "pass", "fail", "blocked", "s
 const KeyKindZ = z.enum(["suite", "lineage", "carried", "title", "inferred", "manual"]);
 const text = (max: number) => z.string().max(max);
 const nullableText = (max: number) => text(max).nullable().catch(null);
+/** An ISO datetime or null (absent reads as null). Anything else refuses the document: retention trusts these values. */
+const isoTime = z.iso
+  .datetime({ offset: true })
+  .nullish()
+  .transform((v) => v ?? null);
 
 const HubCheck = z.object({
   id: text(64),
@@ -183,8 +188,8 @@ const RunFields = z
     verdict: z.enum(VERDICTS).nullable().catch(null),
     summary: nullableText(50_000),
     error: nullableText(50_000),
-    startedAt: nullableText(40),
-    endedAt: nullableText(40),
+    startedAt: isoTime,
+    endedAt: isoTime,
     source: z
       .object({
         path: text(1000).catch(""),
@@ -324,6 +329,8 @@ function originKeysOf(checks: Check[], testKey: string | null, hints: CheckHints
 interface RunDoc {
   fields: z.infer<typeof RunFields>;
   checks: Check[];
+  /** The run's creation time as the hub trusts it: the uploader's, unless it lies in the future (see `sane`). */
+  createdAt: string;
 }
 
 /** What `parseRunDoc` and `buildRun` read of an upload or of a live update (which has no batch and no report). */
@@ -336,13 +343,34 @@ interface RunSource {
   report: RunUploadBodyT["report"];
 }
 
-/** The whitelisted fields and checks of the sent run; `failStatus` (400 for uploads, 422 for live updates) when they are malformed. Runs before anything is stored, the project registry included. */
-function parseRunDoc(run: UploadedRunT | LiveRunT, failStatus: 400 | 422 = 400): RunDoc {
+/**
+ * An uploader's clock is not trusted: a time later than `receivedAt` plus the usual skew allowance is replaced by `receivedAt`
+ * (the skew itself is still recorded in `clockSkewMs`), so retention, ordering and the default branch only ever see times
+ * that cannot outrank a run that really happened later. Returned as canonical UTC ISO so string order is time order.
+ */
+function sane(at: string, now: Date): string {
+  const ms = Date.parse(at);
+  return new Date(ms > now.getTime() + CLOCK_SKEW_NOTE_MS ? now.getTime() : ms).toISOString();
+}
+
+/**
+ * The whitelisted fields and checks of the sent run; `failStatus` (400 for uploads, 422 for live updates) when they are malformed.
+ * A start or end time that is not an ISO datetime is a 422 `invalid_run` either way. Runs before anything is stored, the project registry included.
+ */
+function parseRunDoc(run: UploadedRunT | LiveRunT, now: Date, failStatus: 400 | 422 = 400): RunDoc {
   const parsed = RunFields.safeParse(run);
-  if (!parsed.success) throw new HttpError(failStatus, "the run document is malformed", "invalid_run");
+  if (!parsed.success) {
+    const badTime = parsed.error.issues.some((i) => i.path[0] === "startedAt" || i.path[0] === "endedAt");
+    throw new HttpError(badTime ? 422 : failStatus, badTime ? "startedAt and endedAt must be ISO datetimes or null" : "the run document is malformed", "invalid_run");
+  }
   const checkList = z.array(HubCheck).safeParse(run.checks);
   if (!checkList.success) throw new HttpError(failStatus, "a check in the run document is malformed", "invalid_run");
-  return { fields: parsed.data, checks: checkList.data as unknown as Check[] };
+  const { startedAt, endedAt } = parsed.data;
+  return {
+    fields: { ...parsed.data, startedAt: startedAt && sane(startedAt, now), endedAt: endedAt && sane(endedAt, now) },
+    checks: checkList.data as unknown as Check[],
+    createdAt: sane(run.createdAt, now),
+  };
 }
 
 /** `live` is set for a run still in progress: it carries when the laptop last sent it and has no content hash. */
@@ -374,7 +402,7 @@ function buildRun(body: RunSource, doc: RunDoc, projectId: string, uploader: Upl
     projectId,
     title: body.run.title,
     status: body.run.status,
-    createdAt: body.run.createdAt,
+    createdAt: doc.createdAt,
     checks,
     testKey: null,
     checkHints: null,
@@ -498,25 +526,59 @@ function keyHubRun(run: Run, groups: ManualGroups, lookup: KeyLookup = keyLookup
 
 const keysSignature = (run: Run): string => JSON.stringify([run.testKey, run.checks.map((c) => [c.id, c.checkKey, c.keyKind]), run.checkHints]);
 
-const rekeyTimers = new Map<string, NodeJS.Timeout>();
+/** A re-key walks the whole project: one pass per project per 5 minutes is the most a token's uploads can cause. */
+const REKEY_MIN_INTERVAL_MS = 5 * 60 * 1000;
+
+/** The clock and timer behind `scheduleRekey`; a test seam, like the delay. `start` returns its canceller. */
+export interface RekeyTimers {
+  now(): number;
+  start(fn: () => void, ms: number): () => void;
+}
+const realRekeyTimers: RekeyTimers = {
+  now: () => Date.now(),
+  start: (fn, ms) => {
+    const timer = setTimeout(fn, ms);
+    timer.unref();
+    return () => clearTimeout(timer);
+  },
+};
+let rekeyClock: RekeyTimers = realRekeyTimers;
+
+/** Test hook: replaces the clock and timer of the re-key schedule (null restores the real ones). */
+export function setRekeyTimers(timers: RekeyTimers | null): void {
+  rekeyClock = timers ?? realRekeyTimers;
+}
+
+const rekeyTimers = new Map<string, () => void>();
 /** The last re-key queued per project: passes of one project run one after the other, never interleaved. */
 const rekeyChains = new Map<string, Promise<number>>();
+/** When each project's latest pass was started (the schedule's clock), and how many passes were started. */
+const rekeyStarted = new Map<string, { at: number; count: number }>();
 
-/** Re-keys the project on a debounce: a backfill that delivers 500 older runs causes one pass. */
+/** How many re-key passes of the project have been started since this process began. */
+export function rekeyPassCount(projectId: string): number {
+  return rekeyStarted.get(projectId)?.count ?? 0;
+}
+
+/**
+ * Re-keys the project on a debounce: a backfill that delivers 500 older runs causes one pass. Passes are also at least 5
+ * minutes apart: a change that arrives sooner waits for the interval to end, and one trailing pass then covers all of them.
+ */
 export function scheduleRekey(projectId: string): void {
-  clearTimeout(rekeyTimers.get(projectId));
-  const timer = setTimeout(() => {
+  rekeyTimers.get(projectId)?.();
+  const last = rekeyStarted.get(projectId);
+  const wait = Math.max(rekeyDelayMs, last ? last.at + REKEY_MIN_INTERVAL_MS - rekeyClock.now() : 0);
+  const cancel = rekeyClock.start(() => {
     rekeyTimers.delete(projectId);
     void rekeyProject(projectId).catch((e: unknown) => console.error(`hub re-key of ${projectId} failed:`, e));
-  }, rekeyDelayMs);
-  timer.unref();
-  rekeyTimers.set(projectId, timer);
+  }, wait);
+  rekeyTimers.set(projectId, cancel);
 }
 
 /** Runs every pending re-key now. */
 export async function flushRekeys(): Promise<void> {
   const pending = [...rekeyTimers.keys()];
-  for (const id of pending) clearTimeout(rekeyTimers.get(id));
+  for (const id of pending) rekeyTimers.get(id)?.();
   rekeyTimers.clear();
   for (const id of pending) await rekeyProject(id);
 }
@@ -591,6 +653,7 @@ async function rekeyPass(projectId: string): Promise<number> {
  * upload replaced in the meantime is left to that upload (and a follow-up pass). Returns how many runs changed.
  */
 export function rekeyProject(projectId: string): Promise<number> {
+  rekeyStarted.set(projectId, { at: rekeyClock.now(), count: rekeyPassCount(projectId) + 1 });
   const previous = rekeyChains.get(projectId) ?? Promise.resolve(0);
   const next = previous.catch(() => 0).then(() => rekeyPass(projectId));
   rekeyChains.set(projectId, next);
@@ -639,7 +702,7 @@ export function ingestRun(id: string, raw: unknown, uploader: Uploader, now: Dat
   }
   validateArtefacts(body);
   verifyBlobs(body);
-  const doc = parseRunDoc(body.run);
+  const doc = parseRunDoc(body.run, now);
 
   const contentHash = contentHashOf(body);
   const url = `/#/runs/${encodeURIComponent(id)}`;
@@ -649,11 +712,11 @@ export function ingestRun(id: string, raw: unknown, uploader: Uploader, now: Dat
     return { result: { runId: id, status: "unchanged", contentHash, url }, run: existing };
   }
 
-  const project = touchHubProject(body.project, { machine: uploader.machine, uploader: uploader.identity }, body.run.createdAt, now);
+  const project = touchHubProject(body.project, { machine: uploader.machine, uploader: uploader.identity }, doc.createdAt, now);
   const shots = new Set(body.screenshots.map((s) => s.path));
   const run = buildRun(body, doc, project.id, uploader, contentHash, shots, now);
   if (body.batch && run.batchId && !getBatchMeta(run.batchId)) {
-    saveBatchMeta({ id: body.batch.id, projectId: project.id, title: body.batch.title, createdAt: body.batch.createdAt });
+    saveBatchMeta({ id: body.batch.id, projectId: project.id, title: body.batch.title, createdAt: sane(body.batch.createdAt, now) });
   }
   const others = listRuns({ projectId: project.id }).filter((r) => r.id !== id);
   const newest = others[0]?.createdAt ?? "";
@@ -702,9 +765,9 @@ export function ingestLiveRun(id: string, raw: unknown, uploader: Uploader, now:
   const prior = getLiveRun(id);
   if (prior && prior.hub?.machine !== uploader.machine) throw new HubHttpError(409, `run ${id} is already being sent live by another machine`, "id_conflict");
   if (!liveRoomFor(uploader.machine, id)) throw new HubHttpError(429, "too many runs are being sent live; finished uploads are unaffected", "too_many_live_runs");
-  const doc = parseRunDoc(body.run, 422);
+  const doc = parseRunDoc(body.run, now, 422);
 
-  const project = hubProjectByKey(body.project.hubKey) ?? touchHubProject(body.project, { machine: uploader.machine, uploader: uploader.identity }, body.run.createdAt, now);
+  const project = hubProjectByKey(body.project.hubKey) ?? touchHubProject(body.project, { machine: uploader.machine, uploader: uploader.identity }, doc.createdAt, now);
   const run = buildRun({ ...body, batch: null, report: null }, doc, project.id, uploader, "", new Set(), now, { lastSeenAt: now.toISOString() });
   putLiveRun(run);
   hubEvents.emit("run", run);

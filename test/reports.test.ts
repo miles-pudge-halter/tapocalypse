@@ -16,6 +16,9 @@ import { runArtefactDir } from "../src/runs/artefacts";
 import { createRun, deleteRun } from "../src/runs/store";
 import type { Run } from "../src/runs/types";
 
+/** Eight PNG signature bytes: all the magic-byte check of a served image looks at. */
+const PNG_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+
 let tmp: string;
 let root: string;
 let outside: string;
@@ -30,7 +33,7 @@ beforeAll(() => {
   fs.mkdirSync(outside);
   fs.writeFileSync(path.join(outside, "secret.txt"), "secret");
   fs.writeFileSync(path.join(root, "secret.md"), "# Secret\n");
-  fs.writeFileSync(path.join(root, "qa", "screenshots", "a.png"), "png");
+  fs.writeFileSync(path.join(root, "qa", "screenshots", "a.png"), PNG_BYTES);
   fs.writeFileSync(path.join(root, "qa", "notes.sh"), "echo");
   fs.symlinkSync(outside, path.join(root, "qa", "link"));
   fs.writeFileSync(path.join(root, "qa", "old.md"), "# Old report\n\nNo verdict here.\n");
@@ -351,7 +354,7 @@ describe("reports of runs stored in the data dir", () => {
 describe("reportFilePath", () => {
   test("serves allowlisted existing files only", () => {
     expect(reportFilePath(project, "screenshots/a.png")).toBe(path.join(root, "qa", "screenshots", "a.png"));
-    fs.writeFileSync(path.join(root, "qa", "screenshots", "b.PNG"), "png");
+    fs.writeFileSync(path.join(root, "qa", "screenshots", "b.PNG"), PNG_BYTES);
     expect(reportFilePath(project, "screenshots/b.PNG")).toBe(path.join(root, "qa", "screenshots", "b.PNG"));
   });
 
@@ -361,5 +364,34 @@ describe("reportFilePath", () => {
     expect(reportFilePath(project, "../secret.md")).toBeNull();
     expect(reportFilePath(project, "link/secret.txt")).toBeNull();
     expect(reportFilePath(project, "screenshots/missing.png")).toBeNull();
+  });
+
+  test("an image name needs image bytes, and a link is judged by its target's extension", () => {
+    fs.writeFileSync(path.join(root, "qa", "screenshots", "not-an-image.png"), "<html></html>");
+    expect(reportFilePath(project, "screenshots/not-an-image.png")).toBeNull();
+    fs.writeFileSync(path.join(root, "qa", "screenshots", "page.html"), PNG_BYTES);
+    fs.symlinkSync("page.html", path.join(root, "qa", "screenshots", "linked.png"));
+    expect(reportFilePath(project, "screenshots/linked.png")).toBeNull();
+    fs.symlinkSync("a.png", path.join(root, "qa", "screenshots", "alias.png"));
+    expect(reportFilePath(project, "screenshots/alias.png")).toBe(path.join(root, "qa", "screenshots", "a.png"));
+  });
+});
+
+describe("a reports folder that leaves the repo", () => {
+  test("is neither listed, rendered nor served", () => {
+    const linked = path.join(tmp, "linked-repo");
+    fs.mkdirSync(linked);
+    fs.symlinkSync(outside, path.join(linked, "qa"));
+    fs.writeFileSync(path.join(outside, "leak.md"), "# Leaked\n");
+    fs.writeFileSync(path.join(outside, "leak.png"), PNG_BYTES);
+    const escaped: Project = { ...project, id: "pid-escape", repoPath: linked };
+    expect(listReports(escaped)).toEqual([]);
+    expect(() => renderReport(escaped, "leak.md")).toThrow();
+    expect(reportFilePath(escaped, "leak.png")).toBeNull();
+  });
+
+  test("a normal repo still lists and renders its reports", () => {
+    expect(listReports(project).map((r) => r.name)).toContain("new.md");
+    expect(renderReport(project, "new.md").verdict).toBe("PASS WITH ISSUES");
   });
 });

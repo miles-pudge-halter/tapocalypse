@@ -8,6 +8,9 @@ import sanitizeHtml from "sanitize-html";
 import { z } from "zod";
 import pkg from "../../package.json";
 import { CONFIG_PATH, config, HttpError } from "../config";
+import { isHub } from "../hub/mode";
+import { localRedactContext } from "../hub/package";
+import { createRedactor } from "../hub/redact";
 import { getProject, type Project } from "../projects/registry";
 import { readHead, reportFile, runImages, screenshotFile } from "../runs/artefacts";
 import { getRun } from "../runs/store";
@@ -90,17 +93,18 @@ function duration(run: Run): string | null {
   return m < 60 ? `${m}m${String(s % 60).padStart(2, "0")}s` : `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`;
 }
 
-function metaRows(run: Run, project: Project | null): [string, string][] {
-  const rows: [string, string][] = [["Project", esc(project?.name ?? run.projectId)]];
+/** `redact` is applied to every string that comes from the run or the machine, before it is escaped. */
+function metaRows(run: Run, project: Project | null, redact: (s: string) => string): [string, string][] {
+  const rows: [string, string][] = [["Project", esc(redact(project?.name ?? run.projectId))]];
   const src = run.source;
-  if (src?.branch) rows.push(["Branch", `<span class="mono">${esc(src.branch)}</span>`]);
-  if (src?.commit) rows.push(["Commit", `<span class="mono">${esc(src.commit.slice(0, 10))}</span>${src.commitSubject ? ` ${esc(src.commitSubject)}` : ""}`]);
-  if (src?.pr) rows.push(["Pull request", `#${src.pr.number}${src.pr.title ? ` ${esc(src.pr.title)}` : ""}`]);
-  if (src?.tickets.length) rows.push(["Tickets", src.tickets.map((t) => `<span class="mono">${esc(t)}</span>`).join(", ")]);
+  if (src?.branch) rows.push(["Branch", `<span class="mono">${esc(redact(src.branch))}</span>`]);
+  if (src?.commit) rows.push(["Commit", `<span class="mono">${esc(src.commit.slice(0, 10))}</span>${src.commitSubject ? ` ${esc(redact(src.commitSubject))}` : ""}`]);
+  if (src?.pr) rows.push(["Pull request", `#${src.pr.number}${src.pr.title ? ` ${esc(redact(src.pr.title))}` : ""}`]);
+  if (src?.tickets.length) rows.push(["Tickets", src.tickets.map((t) => `<span class="mono">${esc(redact(t))}</span>`).join(", ")]);
   const device = run.deviceName ?? run.deviceSerial;
-  rows.push(["Device", `${device ? esc(device) : "unknown"} (${esc(run.deviceRequest.platform)})`]);
+  rows.push(["Device", `${device ? esc(redact(device)) : "unknown"} (${esc(run.deviceRequest.platform)})`]);
   const model = run.model ?? run.usage?.model ?? null;
-  rows.push(["Agent", `${esc(run.harness)}${model ? ` · <span class="mono">${esc(model)}</span>` : ""}`]);
+  rows.push(["Agent", `${esc(redact(run.harness))}${model ? ` · <span class="mono">${esc(redact(model))}</span>` : ""}`]);
   rows.push(["Started", esc(utc(run.startedAt ?? run.createdAt))]);
   const took = duration(run);
   if (took) rows.push(["Duration", took]);
@@ -108,8 +112,8 @@ function metaRows(run: Run, project: Project | null): [string, string][] {
   return rows;
 }
 
-const checkRow = (c: Check, thumb: string): string =>
-  `<tr><td class="mono">${esc(c.id)}</td><td>${esc(c.title)}</td><td><span class="badge ${STATUS_CLASS[c.status]}">${c.status}</span></td><td class="note">${c.note ? esc(c.note) : ""}</td><td>${thumb}</td></tr>`;
+const checkRow = (c: Check, thumb: string, redact: (s: string) => string): string =>
+  `<tr><td class="mono">${esc(redact(c.id))}</td><td>${esc(redact(c.title))}</td><td><span class="badge ${STATUS_CLASS[c.status]}">${c.status}</span></td><td class="note">${c.note ? esc(redact(c.note)) : ""}</td><td>${thumb}</td></tr>`;
 
 const DEFAULT_MAX_INLINE_BYTES = 25 * 1024 * 1024;
 const OMITTED = `<span class="omitted">screenshot omitted (size limit)</span>`;
@@ -197,44 +201,55 @@ async function reportBody(md: string, run: Run, project: Project | null, inliner
 }
 
 /**
+ * The redactor's placeholders (`<repo>`, `<device>`) look like HTML tags to the markdown renderer, and the sanitizer would drop
+ * them. They travel as private-use characters through it and are escaped text afterwards.
+ */
+const PLACEHOLDER = /<(repo|data|tmp|user|device)>/g;
+const protectPlaceholders = (md: string): string => md.replace(PLACEHOLDER, "\uE000$1\uE001");
+const unprotectPlaceholders = (html: string): string => html.replace(/\uE000(\w+)\uE001/g, "&lt;$1&gt;");
+
+/**
  * One self-contained HTML document for a run: header, summary, checks and the report, with no scripts and no network requests
  * (a CSP meta forbids both). Everything agent-written is escaped or sanitized.
  */
 export async function renderStandaloneReport(run: Run, project: Project | null, opts: StandaloneOptions = {}): Promise<{ html: string; inlined: number; omitted: number }> {
   const inliner = new Inliner(opts.maxInlineBytes ?? DEFAULT_MAX_INLINE_BYTES);
   const file = reportFile(run, project);
+  // A run on a hub was redacted on the uploader's laptop; this machine's home, account and temp dirs say nothing about it.
+  const redact = createRedactor(run.hub || isHub() ? {} : localRedactContext(run, project)).text;
   const md = file ? await Bun.file(file).text() : null;
   const images = runImages(run, project);
   const gallery = new Map(images.map((im, i) => [im.rel, i]));
   const label = run.verdict ?? run.status;
-  const meta = metaRows(run, project)
+  const title = redact(run.title);
+  const meta = metaRows(run, project, redact)
     .map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`)
     .join("");
   const checkRows: string[] = [];
   for (const c of run.checks) {
     const rel = c.screenshot ? path.posix.normalize(c.screenshot.replace(/\\/g, "/")) : null;
     const abs = rel ? screenshotFile(run, project, rel) : null;
-    const shot = abs ? await inliner.img(abs, `${c.id} screenshot`, "thumb") : "";
+    const shot = abs ? await inliner.img(abs, `${redact(c.id)} screenshot`, "thumb") : "";
     const index = rel === null ? undefined : gallery.get(rel);
-    checkRows.push(checkRow(c, index === undefined || !shot ? shot : `<a href="#shot-${index}">${shot}</a>`));
+    checkRows.push(checkRow(c, index === undefined || !shot ? shot : `<a href="#shot-${index}">${shot}</a>`, redact));
   }
   const checks = run.checks.length
     ? `<h2>Checks</h2><div class="table-wrap"><table><thead><tr><th>ID</th><th>Check</th><th>Status</th><th>Note</th><th>Screenshot</th></tr></thead><tbody>${checkRows.join("")}</tbody></table></div>`
     : "";
-  const body = md === null ? "" : `<h2>Report</h2><article class="report">${await reportBody(md, run, project, inliner, gallery)}</article>`;
+  const body = md === null ? "" : `<h2>Report</h2><article class="report">${unprotectPlaceholders(await reportBody(protectPlaceholders(redact(md)), run, project, inliner, gallery))}</article>`;
   const figures: string[] = [];
   for (const [i, im] of images.entries()) {
-    figures.push(`<figure id="shot-${i}">${await inliner.img(im.abs, im.name)}<figcaption>${im.checkId ? `${esc(im.checkId)} · ` : ""}${esc(im.name)}</figcaption></figure>`);
+    figures.push(`<figure id="shot-${i}">${await inliner.img(im.abs, redact(im.name))}<figcaption>${im.checkId ? `${esc(redact(im.checkId))} · ` : ""}${esc(redact(im.name))}</figcaption></figure>`);
   }
   const shots = figures.length ? `<h2>Screenshots</h2><div class="gallery">${figures.join("")}</div>` : "";
   const html = `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${CSP}"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(run.title)} · Tapocalypse</title><style>${STYLE}</style></head>
+<html lang="en"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${CSP}"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)} · Tapocalypse</title><style>${STYLE}</style></head>
 <body><main>
 <div class="brand">${MARK}${WORDMARK}</div>
-<h1>${esc(run.title)}</h1>
+<h1>${esc(title)}</h1>
 <span class="badge ${verdictClass(label)}">${esc(label)}</span>
 <dl class="meta">${meta}</dl>
-${run.summary ? `<div class="summary">${esc(run.summary)}</div>` : ""}
+${run.summary ? `<div class="summary">${esc(redact(run.summary))}</div>` : ""}
 ${checks}
 ${body}
 ${shots}

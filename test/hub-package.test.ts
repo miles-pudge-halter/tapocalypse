@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { deflateSync } from "node:zlib";
 import { makeBatchId, pruneBatchMeta, saveBatchMeta } from "../src/batches";
-import { packageRun } from "../src/hub/package";
+import { packageLive, packageRun } from "../src/hub/package";
 import { hasImageMagic, RunUploadBody } from "../src/hub/protocol";
 import type { Project } from "../src/projects/registry";
 import { type GitRunner, setDefaultBranchDeps } from "../src/regression/baseline";
@@ -350,5 +350,50 @@ describe("packageRun: identity of the content", () => {
     await expect(packageRun(done, project(repo), { git: fakeGit(repo, null) })).rejects.toThrow(/hubKey/);
     const keyed = await packageRun(done, project(repo, { hubKey: "local/acme-app" }), { git: fakeGit(repo, null) });
     expect(keyed.doc.project).toMatchObject({ hubKey: "local/acme-app", remoteUrl: null });
+  });
+});
+
+describe("packageRun and packageLive: device ids", () => {
+  const SERIAL = "emulator-5554";
+  const LABEL = "Pixel_8_API_35";
+  const UDID = "00008110-001A2B3C4D5E801E";
+
+  /** A run whose activity, report, notes and errors mention its device the way tools do. */
+  function deviceRun(over: Partial<NewRun> = {}) {
+    const made = dataRun({
+      deviceRequest: { platform: "android", serial: UDID },
+      checks: [check("C1", { note: `adb -s ${SERIAL} shell dumpsys on ${LABEL}` })],
+      error: `device ${SERIAL} went offline`,
+      ...over,
+    });
+    appendEvent(made.run.id, { type: "_activity", kind: "tool", tool: "mobile_tap", text: JSON.stringify({ device: SERIAL, avd: LABEL, args: ["-s", SERIAL, UDID.toLowerCase()] }) });
+    appendEvent(made.run.id, { type: "_activity", kind: "say", text: `Booting ${LABEL} (${SERIAL})` });
+    fs.writeFileSync(path.join(runArtefactDir(made.run.id), "report.md"), `Ran on ${SERIAL} (${LABEL}), simulator ${UDID}`);
+    saveRun(made.run);
+    return made;
+  }
+
+  test("an upload carries no serial, UDID or AVD name anywhere", async () => {
+    const { run, repo } = deviceRun();
+    const { doc, blobs } = await packageRun(run, project(repo), { git: fakeGit(repo), transcript: false });
+    const everything = JSON.stringify(doc) + allBlobText(blobs);
+    for (const id of [SERIAL, LABEL, UDID, UDID.toLowerCase()]) expect(everything.toLowerCase()).not.toContain(id.toLowerCase());
+    expect(everything).toContain("<device>");
+    expect(text(blobs.get(doc.report!.sha256)!.bytes)).toBe("Ran on <device> (<device>), simulator <device>");
+    expect(doc.run.checks[0]!.note).toBe("adb -s <device> shell dumpsys on <device>");
+    expect(doc.run.error).toBe("device <device> went offline");
+  });
+
+  test("live progress carries none either, even when the device is assigned after the first update", async () => {
+    const { run, repo } = deviceRun({ status: "running", deviceSerial: null, deviceLabel: null, deviceRequest: { platform: "android" }, checks: [check("C1", { note: `adb -s ${SERIAL} shell` })] });
+    const first = await packageLive(run, project(repo), { git: fakeGit(repo) });
+    expect(JSON.stringify(first)).toContain(SERIAL); // nothing known yet to hide: the serial was not assigned
+    const assigned = { ...run, deviceSerial: SERIAL, deviceLabel: LABEL, error: `device ${SERIAL} went offline on ${LABEL}` };
+    const live = await packageLive(assigned, project(repo), { git: fakeGit(repo) });
+    const json = JSON.stringify(live);
+    expect(json).not.toContain(SERIAL);
+    expect(json).not.toContain(LABEL);
+    expect(live.run.error).toBe("device <device> went offline on <device>");
+    expect(live.run.checks[0]!.note).toBe("adb -s <device> shell");
   });
 });

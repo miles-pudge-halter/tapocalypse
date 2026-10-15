@@ -740,6 +740,24 @@ function historyQuery(query: HistoryQuery): string {
   return qs ? `?${qs}` : "";
 }
 
+/**
+ * Encodes each `/`-separated segment of a name that may contain slashes (`release/2.4`) and keeps the slashes. The team hub refuses
+ * an encoded slash (`%2f`) in a path, and the server joins the trailing segments of these routes back into the name.
+ */
+const encodeSegments = (name: string): string => name.split("/").map(encodeURIComponent).join("/");
+
+export function checkHistoryUrl(projectId: string, checkKey: string, query: HistoryQuery): string {
+  return `/api/projects/${encodeURIComponent(projectId)}/checks/${encodeSegments(checkKey)}/history${historyQuery(query)}`;
+}
+
+export function runCheckHistoryUrl(runId: string, checkId: string, query: HistoryQuery): string {
+  return `/api/runs/${encodeURIComponent(runId)}/checks/${encodeSegments(checkId)}/history${historyQuery(query)}`;
+}
+
+export function releaseUrl(projectId: string, ref: Ref, against: string | null): string {
+  return `/api/projects/${encodeURIComponent(projectId)}/releases/${ref.kind}/${encodeSegments(ref.name)}${against ? `?against=${encodeURIComponent(against)}` : ""}`;
+}
+
 async function sendCheckLink(method: "POST" | "DELETE", projectId: string, a: CheckRef, b: CheckRef): Promise<void> {
   await ensureOk(
     await fetch("/api/check-links", {
@@ -803,13 +821,9 @@ export const api = {
       `/api/runs/${encodeURIComponent(id)}/baseline-candidates${q.trim() ? `?q=${encodeURIComponent(q.trim())}` : ""}`,
     ),
   projectCheckHistory: (projectId: string, checkKey: string, query: HistoryQuery = {}) =>
-    request<CheckHistory>(
-      `/api/projects/${encodeURIComponent(projectId)}/checks/${encodeURIComponent(checkKey)}/history${historyQuery(query)}`,
-    ),
+    request<CheckHistory>(checkHistoryUrl(projectId, checkKey, query)),
   runCheckHistory: (runId: string, checkId: string, query: HistoryQuery = {}) =>
-    request<CheckHistory>(
-      `/api/runs/${encodeURIComponent(runId)}/checks/${encodeURIComponent(checkId)}/history${historyQuery(query)}`,
-    ),
+    request<CheckHistory>(runCheckHistoryUrl(runId, checkId, query)),
   flakyChecks: (projectId: string, platform?: Platform) =>
     request<FlakyResponse>(`/api/projects/${encodeURIComponent(projectId)}/flaky${platform ? `?platform=${platform}` : ""}`),
   /** Ties check `b` (newer) to check `a` (older): same check from now on. */
@@ -886,10 +900,7 @@ export const api = {
   refs: async (projectId: string) => (await request<{ refs: RefSummary[] }>(`/api/projects/${encodeURIComponent(projectId)}/refs`)).refs,
   overview: (projectId: string, ref: Ref | null) =>
     request<ProjectOverview>(`/api/projects/${encodeURIComponent(projectId)}/overview?ref=${encodeURIComponent(refParam(ref))}`),
-  release: (projectId: string, ref: Ref, against: string | null) =>
-    request<ReleaseView>(
-      `/api/projects/${encodeURIComponent(projectId)}/releases/${ref.kind}/${encodeURIComponent(ref.name)}${against ? `?against=${encodeURIComponent(against)}` : ""}`,
-    ),
+  release: (projectId: string, ref: Ref, against: string | null) => request<ReleaseView>(releaseUrl(projectId, ref, against)),
   hubStatus: () => request<HubStatus>("/api/hub/status"),
   hubConnect: (input: HubConnectionInput) =>
     request<HubStatus>("/api/hub/connection", {
